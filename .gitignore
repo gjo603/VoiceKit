@@ -2,3 +2,8 @@
 logs/installed.flag
 logs/created.log
 logs/recording.autosave
+
+# MCP server (optional add-on) — Python venv and caches are per-machine.
+mcp/.venv/
+__pycache__/
+*.pyc

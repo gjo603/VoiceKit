@@ -50,6 +50,16 @@ Say **"open workflow studio"** (or New Automation → Step Workflow). It's a Pow
 
 Workflows stay editable: reopen the Studio and pick one from the dropdown. The `macros\` file is generated — edit steps in the Studio, not Notepad. If a workflow stops mid-run, the popup names the failing step; usually the fix is a longer wait or a looser window title.
 
+## Create automations with Claude (MCP) — optional
+
+Prefer to *describe* an automation instead of recording it? There's an optional
+**MCP server** in `mcp\` that lets Claude (Desktop or Claude Code) build any of the
+four types for you from natural language — "make a workflow that opens Notepad and
+types my address" — writing the exact same files the recorder does. It's an add-on,
+not a replacement: recording and New Automation still work unchanged. Setup and the
+tool list are in **`mcp\README.md`** (needs Python 3.10+). Every script it generates
+is load-checked before it's kept.
+
 ## Hard limits — know these, don't fight them
 
 - **Voice Access shortcuts cannot be created programmatically.** No API, no PowerShell, no registry path. This is why Path 1 exists and why Path 2 keeps a 30-second manual step.

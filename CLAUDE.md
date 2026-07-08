@@ -47,7 +47,9 @@ Get-Process AutoHotkey64 -ErrorAction SilentlyContinue |
 
 **A saved workflow is three artifacts**: `workflows\<Base>.steps.txt` (the single source of truth), `macros\<Base>.ahk` (a generated stub that just calls `RunWorkflow`; contains the marker text "Workflow Studio", which save/delete checks before overwriting or removing so hand-written macros are never clobbered), and the Start Menu `.lnk` named by the spoken phrase.
 
-`lib\_Common.ahk` holds shared helpers (`EnsureDir`, `Notify`, `RunOrActivate`, `CleanPhrase`, `Log`). Standalone macros include it via `#Include "%A_ScriptDir%\..\lib\_Common.ahk"`.
+`lib\_Common.ahk` holds shared helpers (`EnsureDir`, `Notify`, `RunOrActivate`, `CleanPhrase`, `Log`, plus `RunAhk`/`MakeAhkShortcut`/`IsReservedName` — the last three make launching/shortcuts association-proof by targeting `A_AhkPath` with the script as an argument). Standalone macros include it via `#Include "%A_ScriptDir%\..\lib\_Common.ahk"`.
+
+**The MCP server** (`mcp\`, optional add-on — the repo's only Python) is a third automation-creation path alongside the scaffolder and recorder: a FastMCP `server.py` exposing create/list/run/delete tools so Claude can build automations from natural language. `mcp\voicekit_writer.py` is a **deliberate second implementation** of the AHK write-side (`CleanPhrase`, `WfEncode`, the bridge allocator, the stub/steps formats, `.lnk` creation, reload). This duplicates format knowledge that otherwise lives only in AHK — the tradeoff was accepted because `mcp\test_conformance.py` mechanically enforces parity: it feeds the writer's output through the **real** engine (`lib\Workflow.ahk` `WorkflowLoad`) and byte-compares, and diffs a generated stub against a committed one. **If you change any on-disk format (encoding, stub text, the `Workflow Studio` marker, file naming, BOM/LF), update `voicekit_writer.py` in lockstep and re-run the conformance test.** Newly created files are UTF-8 **with BOM** and **LF** endings (matching AHK `FileOpen`); the writer reproduces that exactly.
 
 ## AutoHotkey v2 traps specific to this codebase
 
