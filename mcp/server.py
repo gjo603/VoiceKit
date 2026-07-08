@@ -13,6 +13,7 @@ Run:  python server.py         (stdio)   — or:  fastmcp run server.py
 
 from __future__ import annotations
 
+import subprocess
 from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
@@ -110,10 +111,12 @@ def _need(value, step_type, field):
 def _guard(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
-    except vk.VoiceKitError as e:
+    except (vk.VoiceKitError, ValueError) as e:
         raise ToolError(str(e))
-    except ValueError as e:
-        raise ToolError(str(e))
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ToolError(
+            f"Couldn't run AutoHotkey/PowerShell: {e}. Is AutoHotkey v2 installed at "
+            f"{vk.AHK_EXE}? Set the VOICEKIT_AHK env var if it's somewhere else.")
 
 
 # ---------------------------------------------------------------------------

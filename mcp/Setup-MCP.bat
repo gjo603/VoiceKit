@@ -20,7 +20,7 @@ python -m venv .venv
 call ".venv\Scripts\activate.bat"
 echo  Installing FastMCP ...
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet fastmcp
+python -m pip install --quiet -r requirements.txt
 if errorlevel 1 ( echo  pip install failed. & pause & exit /b 1 )
 
 echo  Verifying ...
