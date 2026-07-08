@@ -720,16 +720,21 @@ SaveWorkflow(*) {
     f.Write(stub)
     f.Close()
 
+    ; Name the shortcut by SpaceOut(base) — the same name the dropdown,
+    ; DeleteWorkflow and first-run reinstall all use — so they never drift
+    ; apart (they did for names with a digit right after a letter, which
+    ; orphaned the .lnk on delete).
+    disp := SpaceOut(base)
     vmDir := A_Programs "\Voice Macros"
     EnsureDir(vmDir)
-    if !FileExist(vmDir "\" phrase ".lnk")
-        MakeAhkShortcut(vmDir "\" phrase ".lnk", macroFile)
+    if !FileExist(vmDir "\" disp ".lnk")
+        MakeAhkShortcut(vmDir "\" disp ".lnk", macroFile)
 
     Log(root, "workflow | " phrase " | workflows\" base ".steps.txt")
-    currentPhrase := phrase
+    currentPhrase := disp
     dirty := false
-    RefreshWorkflowList(SpaceOut(base))
-    MsgBox("Saved. Run it any time by saying:`n`n        open " phrase
+    RefreshWorkflowList(disp)
+    MsgBox("Saved. Run it any time by saying:`n`n        open " disp
         . "`n`n(First time only: give Windows a few seconds to index the new Start Menu entry.)", "Workflow Studio", "Owner" g.Hwnd)
 }
 
