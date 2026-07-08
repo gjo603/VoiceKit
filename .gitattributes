@@ -1,0 +1,13 @@
+# VoiceKit is a Windows-only AutoHotkey project. Normalize every text file
+# to CRLF in the working tree on checkout, so .ahk scripts, .bat files
+# (which can misbehave with LF), and pipe-delimited data land consistently
+# on any machine - even one with core.autocrlf disabled. Git still stores
+# LF internally, so history stays clean.
+* text=auto eol=crlf
+
+# Known binary types (none tracked today, but future-proof the shortcuts,
+# icons and any recordings/screenshots that might get added).
+*.lnk binary
+*.ico binary
+*.png binary
+*.gif binary

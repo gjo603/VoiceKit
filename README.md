@@ -19,6 +19,10 @@ If you have bridge hotkeys from your old machine, re-create the Voice Access sho
 
 Test: say **"open new automation"**. If the chooser window appears, you're done. (Give Windows a few seconds to index new Start Menu entries the first time.)
 
+## Uninstalling
+
+**Double-click `Uninstall.bat`.** It stops the VoiceKit tray app, removes the `Voice Macros` Start Menu group and the login shortcut, and resets the first-run flag. It does **not** delete this folder or remove AutoHotkey — do those yourself if you want them gone. To reinstall afterward, run `Setup.bat` again. (Voice Access shortcuts you paired for bridge hotkeys are managed inside Voice Access; remove them there.)
+
 ## How triggering works — two paths
 
 **Path 1 — Launch macros (default, zero Voice Access config).** Each macro is a file in `macros\` with a Start Menu shortcut. Voice Access natively opens anything in the Start Menu, so "open meeting notes" just works the moment the file exists. Best for: run-some-steps-now automations (open layouts, tabs, file cleanups).
