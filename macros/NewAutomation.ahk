@@ -21,7 +21,7 @@ else if (choice = 2)
 else if (choice = 3)
     NewSnippet(root, masterPath)
 else if (choice = 4)
-    Run('"' root '\macros\WorkflowStudio.ahk"')
+    RunAhk(root "\macros\WorkflowStudio.ahk")
 ExitApp()
 
 ; ------------------------------------------------------------
@@ -64,6 +64,10 @@ NewLaunchMacro(root) {
         return
     phrase := CleanPhrase(ib.Value)
     fileBase := StrReplace(phrase, " ")
+    if (fileBase = "" || IsReservedName(fileBase)) {
+        MsgBox("'" Trim(ib.Value) "' isn't a usable name (empty after cleanup, or a reserved Windows name). Pick another.", "New Automation")
+        return
+    }
     newFile := root "\macros\" fileBase ".ahk"
     if FileExist(newFile) {
         MsgBox("A macro named '" fileBase "' already exists. Pick another name.", "New Automation")
@@ -78,7 +82,7 @@ NewLaunchMacro(root) {
     vmDir := A_Programs "\Voice Macros"
     if !DirExist(vmDir)
         DirCreate(vmDir)
-    FileCreateShortcut(newFile, vmDir "\" phrase ".lnk", root "\macros")
+    MakeAhkShortcut(vmDir "\" phrase ".lnk", newFile)
 
     Log(root, "launch | " phrase " | macros\" fileBase ".ahk")
     Run('notepad.exe "' newFile '"')
@@ -97,6 +101,10 @@ NewHotkeyModule(root, masterPath) {
         return
     phrase := CleanPhrase(ib.Value)
     fileBase := StrReplace(phrase, " ")
+    if (fileBase = "" || IsReservedName(fileBase)) {
+        MsgBox("'" Trim(ib.Value) "' isn't a usable name (empty after cleanup, or a reserved Windows name). Pick another.", "New Automation")
+        return
+    }
     newFile := root "\hotkeys\" fileBase ".ahk"
     if FileExist(newFile) {
         MsgBox("A module named '" fileBase "' already exists. Pick another name.", "New Automation")
@@ -119,7 +127,7 @@ NewHotkeyModule(root, masterPath) {
     FileAppend('`n#Include "%A_ScriptDir%\hotkeys\' fileBase '.ahk"', root "\hotkeys\_index.ahk", "UTF-8")
     FileAppend("Ctrl+Alt+Shift+" key "|" phrase "|hotkeys\" fileBase ".ahk|" FormatTime(A_Now, "yyyy-MM-dd") "`n", mapFile, "UTF-8")
 
-    Run('"' masterPath '"')          ; reload VoiceKit so the hotkey is live now
+    RunAhk(masterPath)               ; reload VoiceKit so the hotkey is live now
     Log(root, "hotkey | " phrase " | Ctrl+Alt+Shift+" key " | hotkeys\" fileBase ".ahk")
     Run('notepad.exe "' newFile '"')
     MsgBox("Created and loaded. Trigger key:  Ctrl+Alt+Shift+" key
@@ -139,6 +147,10 @@ NewSnippet(root, masterPath) {
     if (ib1.Result != "OK" || Trim(ib1.Value) = "")
         return
     abbrev := RegExReplace(Trim(ib1.Value), "\s", "")
+    if (abbrev = "" || InStr(abbrev, ":")) {
+        MsgBox("The abbreviation can't be empty or contain a colon (:) — a colon breaks the hotstring format and would disable every snippet. Pick another.", "New Automation")
+        return
+    }
 
     ib2 := InputBox("Text it should expand to (single line):", "New Snippet — step 2 of 2", "w440 h150")
     if (ib2.Result != "OK" || ib2.Value = "")
@@ -146,7 +158,7 @@ NewSnippet(root, masterPath) {
     expansion := StrReplace(ib2.Value, "``", "````")   ; escape literal backticks
 
     FileAppend("`n:*:" abbrev "::" expansion, root "\hotkeys\Snippets.ahk", "UTF-8")
-    Run('"' masterPath '"')          ; reload VoiceKit so it works immediately
+    RunAhk(masterPath)               ; reload VoiceKit so it works immediately
     Log(root, "snippet | " abbrev)
     MsgBox("Done and loaded. Type  " abbrev "  anywhere to expand it.", "New Automation")
 }

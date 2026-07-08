@@ -1,7 +1,7 @@
-﻿#Requires AutoHotkey v2.0
+#Requires AutoHotkey v2.0
 ; ============================================================
 ;  Toggle Timer   (created 2026-07-07)
-;  Loaded by VoiceKit.ahk â€” do not run this file directly.
+;  Loaded by VoiceKit.ahk — do not run this file directly.
 ;
 ;  Trigger key:  Ctrl+Alt+Shift+A
 ;
@@ -13,6 +13,6 @@
 ; ============================================================
 
 ^!+A:: {
-    ; ==== YOUR STEPS BELOW â€” delete the MsgBox once it works ====
+    ; ==== YOUR STEPS BELOW — delete the MsgBox once it works ====
     MsgBox("'Toggle Timer' is wired up! Now edit this file:`n" A_LineFile)
 }

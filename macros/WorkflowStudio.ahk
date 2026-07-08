@@ -686,6 +686,10 @@ SaveWorkflow(*) {
     if (phrase = "")
         return
     base := StrReplace(phrase, " ")
+    if IsReservedName(base) {
+        MsgBox("'" base "' is a reserved Windows name and can't be used as a file. Pick another.", "Workflow Studio", "Owner" g.Hwnd)
+        return
+    }
     macroFile := root "\macros\" base ".ahk"
     if (FileExist(macroFile) && !InStr(FileRead(macroFile, "UTF-8"), "Workflow Studio")) {
         MsgBox("A hand-written macro named '" base "' already exists. Pick another name.", "Workflow Studio", "Owner" g.Hwnd)
@@ -719,7 +723,7 @@ SaveWorkflow(*) {
     vmDir := A_Programs "\Voice Macros"
     EnsureDir(vmDir)
     if !FileExist(vmDir "\" phrase ".lnk")
-        FileCreateShortcut(macroFile, vmDir "\" phrase ".lnk", root "\macros")
+        MakeAhkShortcut(vmDir "\" phrase ".lnk", macroFile)
 
     Log(root, "workflow | " phrase " | workflows\" base ".steps.txt")
     currentPhrase := phrase
@@ -804,5 +808,5 @@ EnsureStudioShortcut() {
     vmDir := A_Programs "\Voice Macros"
     EnsureDir(vmDir)
     if !FileExist(vmDir "\Workflow Studio.lnk")
-        FileCreateShortcut(A_ScriptFullPath, vmDir "\Workflow Studio.lnk", A_ScriptDir)
+        MakeAhkShortcut(vmDir "\Workflow Studio.lnk", A_ScriptFullPath)
 }

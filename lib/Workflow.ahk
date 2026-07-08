@@ -38,7 +38,14 @@ WorkflowLoad(stepsFile) {
 ; Run steps in order; stop and explain if one fails.
 RunWorkflowSteps(steps) {
     for i, s in steps {
-        err := WfRunStep(s)
+        ; WfRunStep converts expected failures into a returned message,
+        ; but a few ops (e.g. WinGetPos on a window that closed mid-step)
+        ; can THROW. Catch those so the run stops with the same friendly
+        ; popup instead of a raw unhandled-exception dialog.
+        try
+            err := WfRunStep(s)
+        catch as e
+            err := "Unexpected error: " e.Message
         if (err != "") {
             MsgBox("Workflow stopped at step " i " of " steps.Length ".`n`n"
                 . WfDesc(s) "`n`n" err, "VoiceKit workflow", "Icon! 262144")   ; 262144 = always-on-top

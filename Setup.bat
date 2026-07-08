@@ -28,9 +28,11 @@ if exist "%ProgramFiles%\AutoHotkey\v2\AutoHotkey64.exe" (
 :: Remove first-run flag so shortcuts are created fresh on this machine
 if exist "%~dp0logs\installed.flag" del "%~dp0logs\installed.flag"
 
-:: Launch VoiceKit
+:: Launch VoiceKit through the v2 interpreter directly. Do NOT rely on
+:: the .ahk file association here: on a machine migrated from an old PC
+:: it may open .ahk in an editor, which would silently skip setup.
 echo  Starting VoiceKit...
-start "" "%~dp0VoiceKit.ahk"
+start "" "%ProgramFiles%\AutoHotkey\v2\AutoHotkey64.exe" "%~dp0VoiceKit.ahk"
 
 echo.
 echo  Done! VoiceKit is running.

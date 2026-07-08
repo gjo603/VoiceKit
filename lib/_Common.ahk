@@ -44,3 +44,29 @@ Log(root, text) {
     EnsureDir(root "\logs")
     FileAppend(FormatTime(A_Now, "yyyy-MM-dd HH:mm") " | " text "`n", root "\logs\created.log", "UTF-8")
 }
+
+; Launch an .ahk through the AutoHotkey interpreter explicitly, instead
+; of relying on the .ahk file association (which a machine migrated from
+; an old PC may have pointed at VS Code / Notepad++ / Notepad). A_AhkPath
+; is the exe running the current script — always the v2 interpreter here.
+RunAhk(ahkFile) {
+    Run('"' A_AhkPath '" "' ahkFile '"')
+}
+
+; Create a Start Menu / Startup shortcut that runs an .ahk through the
+; interpreter (association-proof). Voice Access "open <name>" opens the
+; .lnk, which runs the exe with the script as its quoted argument — so
+; it works even if .ahk is associated with something else. Defaults the
+; working dir to the script's own folder.
+MakeAhkShortcut(linkFile, ahkFile, workingDir := "") {
+    if (workingDir = "")
+        workingDir := RegExReplace(ahkFile, "\\[^\\]+$")
+    FileCreateShortcut(A_AhkPath, linkFile, workingDir, '"' ahkFile '"')
+}
+
+; True if a bare filename (no extension) is a reserved Windows device
+; name. Writing "<name>.ahk" for these silently hits the device instead
+; of creating a file, producing a broken automation with no error.
+IsReservedName(name) {
+    return name ~= "i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$"
+}

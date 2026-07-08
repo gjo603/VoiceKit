@@ -20,7 +20,7 @@ A_IconTip := "VoiceKit — say `"open voice kit help`""
 
 InstallIfFirstRun()
 
-^!+n:: Run('"' A_ScriptDir '\macros\NewAutomation.ahk"')
+^!+n:: RunAhk(A_ScriptDir "\macros\NewAutomation.ahk")
 ^!+r:: Reload
 ^!+e:: Run('explorer.exe "' A_ScriptDir '"')
 
@@ -38,16 +38,22 @@ InstallIfFirstRun() {
     vmDir := A_Programs "\Voice Macros"
     EnsureDir(vmDir)
 
-    FileCreateShortcut(A_ScriptDir "\macros\NewAutomation.ahk",    vmDir "\New Automation.lnk",    A_ScriptDir "\macros")
-    FileCreateShortcut(A_ScriptDir "\macros\WorkflowStudio.ahk",   vmDir "\Workflow Studio.lnk",   A_ScriptDir "\macros")
-    FileCreateShortcut(A_ScriptDir "\macros\VoiceKitHelp.ahk",     vmDir "\Voice Kit Help.lnk",    A_ScriptDir "\macros")
-    FileCreateShortcut(A_ScriptDir "\macros\WorkLayout.ahk",       vmDir "\Work Layout.lnk",       A_ScriptDir "\macros")
-    FileCreateShortcut(A_ScriptDir "\macros\MorningTabs.ahk",      vmDir "\Morning Tabs.lnk",      A_ScriptDir "\macros")
-    FileCreateShortcut(A_ScriptDir "\macros\CleanScreenshots.ahk", vmDir "\Clean Screenshots.lnk", A_ScriptDir "\macros")
+    ; A voice-launchable Start Menu entry for every macro in macros\ —
+    ; the built-ins, plus anything carried over from another machine.
+    ; The .lnk is named by the spoken phrase (SpaceOut of the filename).
+    Loop Files A_ScriptDir "\macros\*.ahk"
+        MakeAhkShortcut(vmDir "\" SpaceOut(StrReplace(A_LoopFileName, ".ahk")) ".lnk", A_LoopFileFullPath)
 
     if MsgBox("Start VoiceKit automatically when you log in?`n(Recommended — you can delete the shortcut from shell:startup later.)", "VoiceKit setup", "YesNo") = "Yes"
-        FileCreateShortcut(A_ScriptFullPath, A_Startup "\VoiceKit.lnk", A_ScriptDir)
+        MakeAhkShortcut(A_Startup "\VoiceKit.lnk", A_ScriptFullPath)
 
     FileAppend("installed " FormatTime(A_Now, "yyyy-MM-dd HH:mm") "`n", marker, "UTF-8")
     MsgBox("VoiceKit is set up.`n`nTry saying:  open new automation`n(Give Windows a few seconds to index the new Start Menu entries.)", "VoiceKit")
+}
+
+; "MorningTabs" -> "Morning Tabs" (the spoken phrase). Matches the names
+; New Automation / Workflow Studio create, so shortcuts regenerate the
+; same way when cloned to another machine.
+SpaceOut(camel) {
+    return Trim(RegExReplace(camel, "([a-z0-9])([A-Z])", "$1 $2"))
 }
