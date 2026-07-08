@@ -1,3 +1,4 @@
 # Per-machine runtime state — regenerated on each computer, never shared.
 logs/installed.flag
 logs/created.log
+logs/recording.autosave

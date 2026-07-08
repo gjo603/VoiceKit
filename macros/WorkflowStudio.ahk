@@ -117,6 +117,7 @@ g.OnEvent("Close", CloseStudio)
 RefreshWorkflowList()
 NewWorkflowState()
 g.Show()
+OfferRecovery()          ; restore an interrupted recording, if any
 
 ; ============================================================
 ;  Workflow list / load / new
@@ -447,12 +448,62 @@ RecPush(step, note) {
     steps.Push(step)
     dirty := true
     UpdateRecBar(note)
+    WriteAutosave()
 }
 
 UpdateRecBar(note) {
     global recNote, recCount, steps
     recNote.Text := Abbrev(note, 52)
     recCount.Text := steps.Length " steps"
+}
+
+; ---- crash-safe autosave of an in-progress recording ----
+; #SingleInstance Force means re-launching the Studio kills this instance;
+; if that happens mid-recording the steps would be lost. Mirror them to a
+; recovery file after each captured step (same format as a saved workflow,
+; via the engine's WfEncode) and offer to restore on the next launch. The
+; file lives in logs\ so it never shows up in the workflow dropdown, and is
+; cleared on a clean save or a clean close — so its presence means "an
+; interrupted session left unsaved steps".
+AutosaveFile() {
+    global root
+    return root "\logs\recording.autosave"
+}
+WriteAutosave() {
+    global steps
+    if !steps.Length
+        return
+    content := "; VoiceKit recording autosave`n"
+    for s in steps
+        content .= s[1] "|" WfEncode(s[2]) "|" WfEncode(s[3]) "|" WfEncode(s.Length >= 4 ? s[4] : "") "`n"
+    try {
+        EnsureDir(RegExReplace(AutosaveFile(), "\\[^\\]+$"))
+        f := FileOpen(AutosaveFile(), "w", "UTF-8")
+        f.Write(content)
+        f.Close()
+    }
+}
+ClearAutosave() {
+    try FileDelete(AutosaveFile())
+}
+OfferRecovery() {
+    global steps, dirty, g
+    if !FileExist(AutosaveFile())
+        return
+    recovered := WorkflowLoad(AutosaveFile())   ; reuse the engine's parser
+    if !recovered.Length {
+        ClearAutosave()
+        return
+    }
+    if (MsgBox("A recording from an interrupted session was found ("
+        recovered.Length " steps). Recover it?", "Workflow Studio", "YesNo Icon? Owner" g.Hwnd) = "Yes") {
+        steps := recovered
+        dirty := true
+        RefreshLV()
+        SB("Recovered " steps.Length " steps — review them, then Save Workflow.")
+    } else {
+        ClearAutosave()
+    }
 }
 
 RecTick() {
@@ -501,6 +552,7 @@ RecClick(btn) {
         } else {
             UpdateRecBar("Double-click " steps[lastClick.idx][3])
         }
+        WriteAutosave()
         lastClick := {tick: 0, x: 0, y: 0, idx: 0}
         return
     }
@@ -733,6 +785,7 @@ SaveWorkflow(*) {
     Log(root, "workflow | " phrase " | workflows\" base ".steps.txt")
     currentPhrase := disp
     dirty := false
+    ClearAutosave()          ; the take is safely persisted now
     RefreshWorkflowList(disp)
     MsgBox("Saved. Run it any time by saying:`n`n        open " disp
         . "`n`n(First time only: give Windows a few seconds to index the new Start Menu entry.)", "Workflow Studio", "Owner" g.Hwnd)
@@ -786,6 +839,7 @@ CloseStudio(*) {
     StopRecording()
     if (dirty && !ConfirmDiscard())
         return true
+    ClearAutosave()          ; clean exit — nothing to recover
     ExitApp()
 }
 
