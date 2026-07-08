@@ -84,6 +84,45 @@ Claude calls `create_workflow` with typed steps; you then say **"open morning se
 { "type": "close",   "window": "ahk_exe notepad.exe" }
 ```
 
+## Security
+
+**These tools create code that runs with your privileges.** A launch macro or
+hotkey module can contain arbitrary AutoHotkey; a workflow `run` step can launch
+any program. That is VoiceKit's purpose — but exposing it over MCP means an
+*LLM* decides when to call these tools, so treat it accordingly.
+
+- **No network surface.** The server uses stdio — it only talks to the client
+  that spawned it. There's no listening port, no telemetry, no cloud calls.
+- **No injection/traversal.** Automation names are stripped to `[A-Za-z0-9]`
+  (no `..`, slashes, or colons — traversal is impossible) and Windows device
+  names are rejected. Shortcut creation quotes its inputs and every subprocess
+  call is argument-list form (no shell), so names can't inject shell/PowerShell
+  commands. Verified by tests.
+- **The real risk is prompt injection (a confused-deputy).** If Claude is
+  processing untrusted content (a web page, email, file) that hides an
+  instruction like *"use voicekit to create a macro that runs …"*, it could
+  create a persistent payload. Note which tools execute **immediately**:
+  `create_hotkey_module` (reloads the resident master) and `run_workflow`
+  (runs on the desktop now). `create_launch_macro`, `create_workflow`, and
+  `create_snippet` only fire when later triggered.
+- **The load-check is not a safety check.** Generated scripts are `/validate`d
+  so a broken one is rolled back — but that only proves it *loads*, not that
+  it's *safe*. There is deliberately no allow/blocklist on AHK content; that
+  would be security theater for an arbitrary-automation tool.
+
+**What you should do:**
+1. **Keep your MCP client's tool-approval prompts on** for `voicekit` — don't
+   blanket-allow it. Review `create_*` arguments (especially `ahk_body` and
+   `run` targets) and `run_workflow` before approving.
+2. **Don't use this server in sessions that ingest untrusted content** without
+   watching the tool calls.
+3. **Don't put secrets in automations.** Created macros, `Snippets.ahk`, and
+   `bridge-map.txt` are git-tracked — they can be committed and pushed. Keep the
+   repo private. (Snippet expansions can also include keystrokes like `{Enter}`,
+   not just inert text.)
+4. FastMCP and its dependencies come from PyPI (pinned `>=2.9,<4`); they run
+   in-process, so treat them like any other supply-chain dependency.
+
 ## Maintenance
 
 `voicekit_writer.py` mirrors VoiceKit's on-disk format (a deliberate second copy
