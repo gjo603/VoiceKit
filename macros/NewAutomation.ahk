@@ -9,6 +9,7 @@
 ; ============================================================
 
 #Include "%A_ScriptDir%\..\lib\_Common.ahk"
+#Include "%A_ScriptDir%\..\lib\Theme.ahk"
 
 root := RegExReplace(A_ScriptDir, "\\[^\\]+$")   ; parent of \macros
 masterPath := root "\VoiceKit.ahk"
@@ -28,25 +29,38 @@ ExitApp()
 ChooseType() {
     state := {choice: 0}
     g := Gui("+AlwaysOnTop", "New Automation")
-    g.SetFont("s11")
-    g.AddText("w440", "What kind of automation? (buttons are voice-clickable)")
+    g.SetFont("s11", "Segoe UI")
+    g.MarginX := 18, g.MarginY := 16
+    g.AddText("xm w460", "What do you want to create?")
+    g.SetFont("s9")
+    subtitle := g.AddText("xm y+2 w460", "Every button below is voice-clickable — say “click” plus its name.")
 
-    b1 := g.AddButton("w440 h36", "Launch Macro — runs steps once. Say: open <its name>")
-    b1.OnEvent("Click", (*) => (state.choice := 1, g.Destroy()))
+    ; Each choice is a title button with a dim one-line description beneath,
+    ; so the window scans top-to-bottom instead of packing a sentence into a
+    ; caption. The short caption ("Launch Macro") stays the voice target.
+    descs := []
+    MakeCard(title, desc, choiceNum) {
+        g.SetFont("s10 bold")
+        b := g.AddButton("xm y+14 w460 h38", title)
+        b.OnEvent("Click", (*) => (state.choice := choiceNum, g.Destroy()))
+        g.SetFont("s9 norm")
+        descs.Push(g.AddText("xm y+3 w460", desc))
+    }
+    MakeCard("Launch Macro",  "Runs a set of steps once. Voice-ready instantly — say “open <name>”.", 1)
+    MakeCard("Hotkey Module", "An always-on key; pair a voice phrase to it once (~30 seconds).", 2)
+    MakeCard("Text Snippet",  "Type a short abbreviation anywhere and it expands to full text.", 3)
+    MakeCard("Step Workflow", "Record or build a multi-step automation in a dialog — no code.", 4)
 
-    b2 := g.AddButton("w440 h36", "Hotkey Module — always-on key, pair a voice phrase once")
-    b2.OnEvent("Click", (*) => (state.choice := 2, g.Destroy()))
-
-    b3 := g.AddButton("w440 h36", "Text Snippet — type an abbreviation, get full text")
-    b3.OnEvent("Click", (*) => (state.choice := 3, g.Destroy()))
-
-    b4 := g.AddButton("w440 h36", "Step Workflow — record / build multi-step in a dialog, no code")
-    b4.OnEvent("Click", (*) => (state.choice := 4, g.Destroy()))
-
-    b5 := g.AddButton("w440 h30", "Cancel")
+    g.SetFont("s10")
+    b5 := g.AddButton("xm y+20 w120 h32", "Cancel")
     b5.OnEvent("Click", (*) => g.Destroy())
 
     g.OnEvent("Close", (*) => g.Destroy())
+    ThemeApply(g)
+    pal := ThemePalette()
+    descs.Push(subtitle)
+    for d in descs                      ; dim the descriptions (ThemeApply makes all text primary)
+        d.Opt("c" Format("{:06X}", pal.dim))
     hwnd := g.Hwnd
     g.Show()
     WinWaitClose("ahk_id " hwnd)

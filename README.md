@@ -41,12 +41,13 @@ Your library will grow from real friction. That's the only kind worth having.
 
 ## Workflow Studio — multi-step workflows, no code
 
-Say **"open workflow studio"** (or New Automation → Step Workflow). It's a Power-Automate-style builder for linear step lists:
+Say **"open workflow studio"** (or New Automation → Step Workflow). It's a Power-Automate-style builder for linear step lists. The window (like every VoiceKit window) follows your Windows light/dark setting, and every button is voice-clickable — say "click" plus its word:
 
-- **Start Recording** — the Studio hides, a small REC bar floats top-right, and you just do the thing. Stop with the bar's Stop button, by voice ("click stop"), or with **Ctrl+Alt+Shift+X** (works even if something covers the bar). It captures window switches, clicks (double- and right-clicks too) and typing. Clicks are stored by the **name of what you clicked** (button caption, link, file name) and replayed by finding that name again — raw position is kept only as a silent fallback, so recordings survive windows moving. Double-clicking a file in Explorer is recorded as **Open \<full path\>** automatically, and folder windows are recorded with their full path so playback reopens them if they've been closed. Typed keystrokes become visible, editable Type/Press steps — so don't type passwords while recording. Drags and scrolling aren't captured.
-- **Add Step** — for anything recording can't see or you want to tweak: focus a window (launching it if needed), open an app/file/site (with a Browse button — no path typing), wait for a window, pause, type text, press keys, click by element name, position (left/right/top/bottom/max) or close a window. "Grab a Window" fills in window identities for you — no Window Spy needed.
-- **Test Run** — plays the steps immediately; a failing step stops the run and names itself.
-- **Save Workflow** — writes the step list to `workflows\<Name>.steps.txt`, generates a stub in `macros\`, and creates the Start Menu entry. Saying **"open \<name\>"** runs it — zero Voice Access setup.
+- **Record** — the Studio hides, a small REC bar floats top-right, and you just do the thing. Stop with the bar's Stop button, by voice ("click stop"), or with **Ctrl+Alt+Shift+X** (works even if something covers the bar). It captures window switches, clicks (double- and right-clicks too) and typing. Clicks are stored by the **name of what you clicked** (button caption, link, file name) and replayed by finding that name again — raw position is kept only as a silent fallback, so recordings survive windows moving. Double-clicking a file in Explorer is recorded as **Open \<full path\>** automatically, and folder windows are recorded with their full path so playback reopens them if they've been closed. Typed keystrokes become visible, editable Type/Press steps — so don't type passwords while recording. Drags and scrolling aren't captured.
+- **Close browser tabs before recording** (checkbox, off by default) — tick it and clicking Record first closes every open browser window (Chrome, Edge, Firefox, Brave, Opera), so the recording starts from a fresh browser instead of whatever tabs were already open (leftover tabs shift positions and break playback). It closes gracefully: any window that pops an "unsaved changes / leave site?" warning is **left open** (nothing is discarded) and you're told how many — deal with those yourself for a fully clean start. The setting is remembered between sessions.
+- **Add** — for anything recording can't see or you want to tweak: focus a window (launching it if needed), open an app/file/site (with a Browse button — no path typing), wait for a window, pause, type text, press keys, click by element name, position (left/right/top/bottom/max) or close a window. "Grab a Window" fills in window identities for you — no Window Spy needed.
+- **Test** — plays the steps immediately; a failing step stops the run and names itself.
+- **Save** — writes the step list to `workflows\<Name>.steps.txt`, generates a stub in `macros\`, and creates the Start Menu entry. Saying **"open \<name\>"** runs it — zero Voice Access setup.
 
 Workflows stay editable: reopen the Studio and pick one from the dropdown. The `macros\` file is generated — edit steps in the Studio, not Notepad. If a workflow stops mid-run, the popup names the failing step; usually the fix is a longer wait or a looser window title.
 
@@ -81,7 +82,7 @@ is load-checked before it's kept.
 2. Create a Launch Macro named "Test Ping" → file opens; say "open test ping" → the placeholder MsgBox fires.
 3. Create a Snippet `/hi` → "hello world" → typing `/hi` in Notepad expands it.
 4. Create a Hotkey Module "Test Bridge" → pressing the assigned Ctrl+Alt+Shift key fires the placeholder; register the phrase in Voice Access and repeat by voice.
-5. Say "open workflow studio" → Start Recording, open Notepad and type a few words, click Stop → Test Run replays it; Save as "Test Flow" → say "open test flow".
+5. Say "open workflow studio" → click Record, open Notepad and type a few words, click Stop → click Test replays it; Save as "Test Flow" → say "open test flow".
 
 ## Out of scope, on purpose
 

@@ -7,7 +7,7 @@
 ;  Open it by voice:  "open workflow studio"
 ;  (or: New Automation -> Step Workflow)
 ;
-;  Start Recording captures what you actually do:
+;  Record captures what you actually do:
 ;    - window switches            -> Focus steps
 ;    - clicks (double/right too)  -> Click steps, stored by the
 ;      clicked element's on-screen NAME (button caption, link,
@@ -19,14 +19,15 @@
 ;  top-right; finish with its Stop button, by voice ("click
 ;  stop"), or with Ctrl+Alt+Shift+X.
 ;
-;  Then Test Run plays it, and Save Workflow makes it a voice
-;  command: "open <name>". Reopen the Studio any time to edit.
+;  Then Test plays it, and Save makes it a voice command:
+;  "open <name>". Reopen the Studio any time to edit.
 ;
 ;  Don't type passwords while recording — keystrokes become
 ;  visible steps (that's the point, but remember it).
 ; ============================================================
 #Include "%A_ScriptDir%\..\lib\_Common.ahk"
 #Include "%A_ScriptDir%\..\lib\Workflow.ahk"
+#Include "%A_ScriptDir%\..\lib\Theme.ahk"
 
 CoordMode("Mouse", "Screen")
 
@@ -70,35 +71,51 @@ typeLabels := ["Focus window (launch it if needed)"
 #HotIf
 
 ; ---- main window ----
+; Layout: a header (which workflow), the step list, a compact toolbar
+; for editing steps, then a prominent row for the three actions that
+; matter (Record / Test / Save). Every button keeps a real word in its
+; caption so Voice Access can still click it ("click record", etc.);
+; the leading glyph is decoration only. See lib\Theme.ahk for the look.
 g := Gui("+AlwaysOnTop", "Workflow Studio")
 g.SetFont("s10", "Segoe UI")
-g.AddText("xm ym+4", "Workflow:")
-ddl := g.AddDropDownList("x+8 yp-4 w340", [])
-btnDel := g.AddButton("x+8 yp-1 w140", "Delete Workflow")
-lv := g.AddListView("xm y+12 w700 r14 -Multi Grid NoSortHdr NoSort", ["#", "Step"])
-btnAdd  := g.AddButton("xm y+10 w110", "Add Step")
-btnEdit := g.AddButton("x+8 w110", "Edit Step")
-btnRem  := g.AddButton("x+8 w110", "Remove Step")
-btnUp   := g.AddButton("x+8 w110", "Move Up")
-btnDown := g.AddButton("x+8 w110", "Move Down")
-btnRec  := g.AddButton("xm y+8 w170 h34", "Start Recording")
-btnTest := g.AddButton("x+8 w140 h34", "Test Run")
-btnSave := g.AddButton("x+8 w170 h34", "Save Workflow")
-btnHelp := g.AddButton("x+8 w110 h34", "Studio Help")
-statusBar := g.AddStatusBar()
+g.MarginX := 16, g.MarginY := 14
+g.AddText("xm ym+6", "Workflow:")
+ddl := g.AddDropDownList("x+10 yp-4 w468", [])
+btnDel := g.AddButton("x+10 yp-1 w120", "Delete")
+
+lv := g.AddListView("xm y+14 w720 r13 -Multi Grid NoSortHdr NoSort", ["#", "Step"])
+
+g.SetFont("s9")
+btnAdd  := g.AddButton("xm y+10 w96 h30",  "＋  Add")
+btnEdit := g.AddButton("x+6 w96 h30",      "✎  Edit")
+btnRem  := g.AddButton("x+6 w112 h30",     "✕  Remove")
+btnUp   := g.AddButton("x+22 w96 h30",     "↑  Up")
+btnDown := g.AddButton("x+6 w96 h30",      "↓  Down")
+
+g.SetFont("s10")
+chkCloseTabs := g.AddCheckBox("xm y+14", "Close browser tabs before recording")
+
+g.SetFont("s11")
+btnRec  := g.AddButton("xm y+8 w214 h44", "●  Record")
+btnTest := g.AddButton("x+12 w150 h44",   "▶  Test")
+btnSave := g.AddButton("x+12 w214 h44",   "🖫  Save")
+
+g.SetFont("s9")
+statusBar := g.AddText("xm y+14 w648 h30", "")
+btnHelp := g.AddButton("x+8 yp w64 h30", "Help")
 
 ; ---- floating REC bar (shown while recording) ----
 recBar := Gui("+AlwaysOnTop +ToolWindow -Caption +Border")
-recBar.SetFont("s10", "Segoe UI")
-recBar.MarginX := 12
-recBar.MarginY := 10
-recBar.SetFont("s10 bold cRed")
-recBar.AddText("ym", "REC")
-recBar.SetFont("s10 norm cDefault")
+recBar.MarginX := 14
+recBar.MarginY := 11
+recBar.SetFont("s10 bold cRed", "Segoe UI")
+recBar.AddText("ym", "●  REC")
+recBar.SetFont("s10 norm", "Segoe UI")
 recNote := recBar.AddText("x+12 yp w360", "Recording...")
 recCount := recBar.AddText("x+8 yp w70 Right", "0 steps")
 btnStop := recBar.AddButton("x+12 yp-6 w90", "Stop")
 btnStop.OnEvent("Click", (*) => StopRecording())
+ThemeRecBar()
 
 ddl.OnEvent("Change", PickWorkflow)
 btnDel.OnEvent("Click", DeleteWorkflow)
@@ -112,10 +129,13 @@ btnRec.OnEvent("Click", (*) => StartRecording())
 btnTest.OnEvent("Click", TestRun)
 btnSave.OnEvent("Click", SaveWorkflow)
 btnHelp.OnEvent("Click", ShowHelp)
+chkCloseTabs.OnEvent("Click", SaveSettings)
 g.OnEvent("Close", CloseStudio)
 
 RefreshWorkflowList()
 NewWorkflowState()
+LoadSettings()
+ThemeApply(g, statusBar)
 g.Show()
 OfferRecovery()          ; restore an interrupted recording, if any
 
@@ -173,7 +193,7 @@ NewWorkflowState() {
     currentPhrase := ""
     dirty := false
     RefreshLV()
-    SB("New workflow — click Start Recording and just do the thing, or build with Add Step.")
+    SB("New workflow — click Record and just do the thing, or build it up with Add.")
 }
 
 ; ============================================================
@@ -184,8 +204,8 @@ RefreshLV() {
     lv.Delete()
     for i, s in steps
         lv.Add(, i, WfDesc(s))
-    lv.ModifyCol(1, 40)
-    lv.ModifyCol(2, 640)
+    lv.ModifyCol(1, 44)
+    lv.ModifyCol(2, 656)
 }
 
 SelectedRow() {
@@ -395,6 +415,7 @@ StepDialog(existing := "") {
     }
 
     hwnd := d.Hwnd
+    ThemeApply(d)                   ; match the Studio's look
     d.Show()                        ; show and activate first...
     g.Opt("+Disabled")              ; ...then disable the Studio behind it
     WinActivate("ahk_id " hwnd)     ; make sure the dialog has focus
@@ -411,9 +432,17 @@ StepDialog(existing := "") {
 ;  only as fallback); keystrokes become visible, editable steps.
 ; ============================================================
 StartRecording() {
-    global recording, recLastHwnd, recLastCrit, typedBuf, lastClick, g, recBar
+    global recording, recLastHwnd, recLastCrit, typedBuf, lastClick, g, recBar, chkCloseTabs
     if recording
         return
+    ; Optional clean slate: close existing browser windows first, so the
+    ; recording starts from a fresh browser instead of whatever tabs were
+    ; already open (which shift positions and break playback). Done before
+    ; we start capturing, so none of this closing is recorded as steps.
+    if chkCloseTabs.Value {
+        g.Hide()                     ; so the always-on-top Studio can't hide a browser's prompt
+        CloseBrowserTabs()
+    }
     recording := true
     typedBuf := ""
     recLastHwnd := 0
@@ -440,7 +469,7 @@ StopRecording() {
     WinActivate("ahk_id " g.Hwnd)
     if steps.Length
         lv.Modify(steps.Length, "Select Focus Vis")
-    SB("Recorded — now trim/edit steps, add waits if needed, Test Run, then Save Workflow.")
+    SB("Recorded — trim or edit steps, add waits if needed, then click Test and Save.")
 }
 
 RecPush(step, note) {
@@ -500,7 +529,7 @@ OfferRecovery() {
         steps := recovered
         dirty := true
         RefreshLV()
-        SB("Recovered " steps.Length " steps — review them, then Save Workflow.")
+        SB("Recovered " steps.Length " steps — review them, then click Save.")
     } else {
         ClearAutosave()
     }
@@ -818,19 +847,21 @@ DeleteWorkflow(*) {
 ; ============================================================
 ShowHelp(*) {
     MsgBox("Recording (the easy way):`n"
-        . "  1.  Click Start Recording — the Studio hides, a REC bar floats top-right.`n"
+        . "  1.  Click Record — the Studio hides, a REC bar floats top-right.`n"
         . "  2.  Just do the thing. Window switches, clicks and typing are captured.`n"
         . "       Clicks are remembered by the NAME of what you clicked, so they`n"
         . "       keep working when windows move. Double-clicking a file in`n"
         . "       Explorer records `"Open <that file>`" with its full path.`n"
         . "  3.  Stop with the REC bar's Stop button, by saying `"click stop`",`n"
         . "       or by pressing Ctrl+Alt+Shift+X. Then trim or edit the steps —`n"
-        . "       double-click a row to edit, and add pauses with Add Step if an`n"
-        . "       app needs time to load.`n"
-        . "  4.  Test Run plays it. Save Workflow makes it a voice command:`n"
-        . "       say  `"open <name>`".`n`n"
+        . "       double-click a row to edit, and click Add to insert a pause if`n"
+        . "       an app needs time to load.`n"
+        . "  4.  Test plays it. Save makes it a voice command: say `"open <name>`".`n`n"
+        . "Tip: tick `"Close browser tabs before recording`" to start from a fresh`n"
+        . "browser — handy when leftover tabs shift things and break playback.`n`n"
         . "Notes: don't type passwords while recording; drags and scrolling`n"
-        . "aren't captured. Every button is voice-clickable (`"click add step`").",
+        . "aren't captured. Every button is voice-clickable — say `"click`" plus`n"
+        . "its word: `"click record`", `"click add`", `"click test`", `"click save`".",
         "Workflow Studio — help", "Owner" g.Hwnd)
 }
 
@@ -848,9 +879,68 @@ ConfirmDiscard() {
     return MsgBox("Discard unsaved changes to this workflow?", "Workflow Studio", "YesNo Icon? Owner" g.Hwnd) = "Yes"
 }
 
+; ---- "Close browser tabs before recording" toggle ----
+; Close every open window of the common browsers, so a recording starts from
+; a clean browser. WinGetList (hidden-window detection off) returns only the
+; real, visible top-level windows. WinClose is graceful (WM_CLOSE): a window
+; with nothing unsaved closes on its own. If a window is STILL up after a few
+; seconds, a browser prompt is holding it open — almost always the "Leave
+; site? / Changes you made may not be saved" (beforeunload) dialog. We must
+; NOT blindly confirm that: its default button discards the user's unsaved
+; work, and session restore only brings back URLs, not typed-but-unsaved
+; content. So we leave any such window open and report the count, letting the
+; user decide. Returns the number of windows that refused to close.
+CloseBrowserTabs() {
+    exes := ["chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "opera_gx.exe"]
+    ToolTip("Closing browser tabs...")
+    stuck := 0
+    for exe in exes {
+        for hwnd in WinGetList("ahk_exe " exe) {
+            if !WinExist("ahk_id " hwnd)
+                continue
+            try WinClose(hwnd)
+            if !WinWaitClose("ahk_id " hwnd, , 3)   ; blocked by an unsaved-changes prompt
+                stuck++
+        }
+    }
+    ToolTip()
+    if stuck
+        Notify(stuck " browser window(s) look like they have unsaved changes, so they were "
+             . "left open (nothing was discarded). Close them yourself for a clean recording.")
+    Sleep(300)                       ; let focus settle before recording
+    return stuck
+}
+
+; The checkbox state persists across sessions in logs\settings.ini.
+SettingsFile() {
+    global root
+    return root "\logs\settings.ini"
+}
+LoadSettings() {
+    global chkCloseTabs
+    chkCloseTabs.Value := (IniRead(SettingsFile(), "Studio", "CloseBrowserTabs", "0") = "1")
+}
+SaveSettings(*) {
+    global chkCloseTabs
+    EnsureDir(RegExReplace(SettingsFile(), "\\[^\\]+$"))
+    IniWrite(chkCloseTabs.Value ? 1 : 0, SettingsFile(), "Studio", "CloseBrowserTabs")
+}
+
 SB(text) {
     global statusBar
-    statusBar.SetText("  " text)
+    statusBar.Text := text          ; status is a themed Text control, not a StatusBar
+}
+
+; The REC bar is a separate, caption-less window; theme it by hand so
+; its background matches and its text stays readable in dark mode (but
+; keep the "REC" label red — that's the whole point of it).
+ThemeRecBar() {
+    global recBar, recNote, recCount, btnStop
+    pal := ThemePalette()
+    recBar.BackColor := pal.win
+    recNote.Opt("c" Format("{:06X}", pal.text))
+    recCount.Opt("c" Format("{:06X}", pal.dim))
+    ThemeClass(btnStop.Hwnd, pal.dark ? "DarkMode_Explorer" : "Explorer")
 }
 
 Abbrev(s, n) {
