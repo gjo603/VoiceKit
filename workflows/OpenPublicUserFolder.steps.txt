@@ -1,0 +1,11 @@
+﻿; Open Public User Folder — VoiceKit workflow. Edit it by saying: open workflow studio
+focus|Home ahk_class CabinetWClass|explorer.exe "::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}"|
+click|Home ahk_class CabinetWClass|This PC|151,1004
+focus|This PC ahk_class CabinetWClass|explorer.exe "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"|
+run|C:\||
+focus|Windows-SSD (C:) ahk_class CabinetWClass|explorer.exe "C:\"|
+run|C:\Users||
+focus|Users ahk_class CabinetWClass|explorer.exe "C:\Users"|
+run|C:\Users\Public||
+focus|Public ahk_class CabinetWClass|explorer.exe "C:\Users\Public"|
+run|C:\Users\Public\Music||
