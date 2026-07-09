@@ -5,7 +5,7 @@
 ;  workflows in a dialog. No code required.
 ;
 ;  Open it by voice:  "open workflow studio"
-;  (or: New Automation -> Step Workflow)
+;  (or: New Automation -> Step Workflow Recording)
 ;
 ;  Record captures what you actually do:
 ;    - window switches            -> Focus steps
@@ -16,7 +16,7 @@
 ;    - typing                     -> editable Type-text steps
 ;    - special keys / shortcuts   -> Press-keys steps
 ;  While recording, the Studio hides and a small REC bar floats
-;  top-right; finish with its Stop button, by voice ("click
+;  bottom-left; finish with its Stop button, by voice ("click
 ;  stop"), or with Ctrl+Alt+Shift+X.
 ;
 ;  Then Test plays it, and Save makes it a voice command:
@@ -50,18 +50,30 @@ typedBuf := ""          ; keystrokes waiting to become a Type step
 lastCharTick := 0
 lastClick := {tick: 0, x: 0, y: 0, idx: 0}
 
-typeIds    := ["focus", "run", "waitwin", "wait", "text", "keys", "click", "dblclick", "rclick", "move", "close"]
+; Advanced if/else/endif entries live at the END so they're never the default
+; and don't clutter ordinary recording. The four "if" rows all save as type
+; "if"; typeConds carries the condition kind (paramC of the step).
+typeIds    := ["focus", "run", "waitwin", "wait", "text", "keys", "click", "dblclick", "rclick", "move", "close"
+             , "if", "if", "if", "if", "else", "endif"]
+typeConds  := ["", "", "", "", "", "", "", "", "", "", ""
+             , "winexists", "winnotexists", "elementexists", "elementnotexists", "", ""]
 typeLabels := ["Focus window (launch it if needed)"
              , "Open app / file / website"
              , "Wait for a window to appear"
              , "Wait (pause for milliseconds)"
              , "Type text"
              , "Press keys (e.g. {Enter}, ^s)"
-             , "Click something in a window (by its name)"
+             , "Left-click something in a window (by its name)"
              , "Double-click something in a window"
              , "Right-click something in a window"
              , "Position window (left / right / top / bottom / max)"
-             , "Close window"]
+             , "Close window"
+             , "— If a window IS open …"
+             , "— If a window is NOT open …"
+             , "— If something IS on screen …"
+             , "— If something is NOT on screen …"
+             , "— Otherwise (else) …"
+             , "— End if"]
 
 ; ---- click capture + stop hotkey (active only while recording) ----
 #HotIf recording
@@ -96,7 +108,7 @@ g.SetFont("s10")
 chkCloseTabs := g.AddCheckBox("xm y+14", "Close browser tabs before recording")
 
 g.SetFont("s11")
-btnRec  := g.AddButton("xm y+8 w214 h44", "●  Record")
+btnRec  := g.AddButton("xm y+8 w214 h44 Default", "●  Record (F9)")   ; Default: Enter starts recording
 btnTest := g.AddButton("x+12 w150 h44",   "▶  Test")
 btnSave := g.AddButton("x+12 w214 h44",   "🖫  Save")
 
@@ -111,11 +123,13 @@ recBar.MarginY := 11
 recBar.SetFont("s10 bold cRed", "Segoe UI")
 recBar.AddText("ym", "●  REC")
 recBar.SetFont("s10 norm", "Segoe UI")
-recNote := recBar.AddText("x+12 yp w360", "Recording...")
+recNote := recBar.AddText("x+12 yp w340", "Recording...")
 recCount := recBar.AddText("x+8 yp w70 Right", "0 steps")
-btnStop := recBar.AddButton("x+12 yp-6 w90", "Stop")
+recBar.SetFont("s11 bold", "Segoe UI")
+btnStop := recBar.AddButton("x+12 yp-8 w120 h36 Default", "■  Stop Recording")
 btnStop.OnEvent("Click", (*) => StopRecording())
-ThemeRecBar()
+recBar.SetFont("s10 norm", "Segoe UI")
+ThemeBar(recBar, recNote, recCount, btnStop)   ; keep the "REC" label red — set at build time above
 
 ddl.OnEvent("Change", PickWorkflow)
 btnDel.OnEvent("Click", DeleteWorkflow)
@@ -132,11 +146,18 @@ btnHelp.OnEvent("Click", ShowHelp)
 chkCloseTabs.OnEvent("Click", SaveSettings)
 g.OnEvent("Close", CloseStudio)
 
+; ---- F9 starts recording while the main Studio window is active ----
+; (scoped by hwnd so it never fires on a dialog, MsgBox, or edit field)
+#HotIf WinActive("ahk_id " g.Hwnd)
+F9:: StartRecording()
+#HotIf
+
 RefreshWorkflowList()
 NewWorkflowState()
 LoadSettings()
 ThemeApply(g, statusBar)
 g.Show()
+btnRec.Focus()           ; land on Record so pressing Enter starts recording
 OfferRecovery()          ; restore an interrupted recording, if any
 
 ; ============================================================
@@ -202,8 +223,19 @@ NewWorkflowState() {
 RefreshLV() {
     global lv, steps
     lv.Delete()
-    for i, s in steps
-        lv.Add(, i, WfDesc(s))
+    depth := 0
+    for i, s in steps {
+        t := s[1]
+        shown := (t = "else" || t = "endif") ? Max(0, depth - 1) : depth   ; dedent else/endif
+        indent := ""
+        Loop shown
+            indent .= "      "
+        lv.Add(, i, indent WfDesc(s))
+        if (t = "if")
+            depth += 1
+        else if (t = "endif")
+            depth := Max(0, depth - 1)
+    }
     lv.ModifyCol(1, 44)
     lv.ModifyCol(2, 656)
 }
@@ -293,7 +325,7 @@ MoveDown(*) {
 ;  Add / Edit step dialog
 ; ============================================================
 StepDialog(existing := "") {
-    global g, dialogOpen, typeIds, typeLabels
+    global g, dialogOpen, typeIds, typeLabels, typeConds
     dialogOpen := true
     result := ""
     preservedC := (IsObject(existing) && existing.Length >= 4) ? existing[4] : ""
@@ -306,13 +338,32 @@ StepDialog(existing := "") {
     edA := d.AddEdit("xm w480")
     laB := d.AddText("xm y+10 w480", "")
     edB := d.AddEdit("xm w480")
-    btnGrab := d.AddButton("xm y+12 w220", "Grab a Window (3 sec)")
-    btnBrowse := d.AddButton("x+8 w180", "Browse for File...")
+    btnGrab := d.AddButton("xm y+12 w210", "Grab a Window (3 sec)")
+    btnPick := d.AddButton("x+8 w210", "Pick element (3 sec)")
+    btnBrowse := d.AddButton("xm yp w180", "Browse for File...")   ; same row; shown only for 'run'
     btnOK := d.AddButton("xm y+14 w120 Default", "OK")
     btnCancel := d.AddButton("x+8 w120", "Cancel")
 
     UpdateFields(*) {
-        t := typeIds[dt.Value]
+        t := typeIds[dt.Value], cond := typeConds[dt.Value]
+        ; else / endif are block markers — no fields at all.
+        if (t = "else" || t = "endif") {
+            laA.Visible := edA.Visible := laB.Visible := edB.Visible := false
+            btnGrab.Visible := btnPick.Visible := btnBrowse.Visible := false
+            return
+        }
+        ; if: a window to check for, plus an element name for the "on screen" tests.
+        if (t = "if") {
+            needElem := (cond = "elementexists" || cond = "elementnotexists")
+            laA.Text := "Window to check for — 'ahk_exe app.exe' or part of its title:"
+            laA.Visible := edA.Visible := true
+            laB.Text := "Name of the thing to check for, exactly as shown on screen:"
+            laB.Visible := edB.Visible := needElem
+            btnGrab.Visible := true          ; Grab fills in the window for you
+            btnPick.Visible := needElem      ; Pick fills in the element (and its window)
+            btnBrowse.Visible := false
+            return
+        }
         labels := Map(
             "focus",    ["Window to focus — 'ahk_exe app.exe' or part of its title:",
                          "If it isn't running, launch this (path or command) — optional:"],
@@ -329,10 +380,12 @@ StepDialog(existing := "") {
             "close",    ["Window to close:", ""])
         needB := (labels[t][2] != "")
         laA.Text := labels[t][1]
+        laA.Visible := edA.Visible := true
         laB.Text := labels[t][2]
         laB.Visible := needB
         edB.Visible := needB
         btnGrab.Visible := (t != "run" && t != "wait" && t != "text" && t != "keys")
+        btnPick.Visible := (t = "click" || t = "dblclick" || t = "rclick")   ; element-name steps
         btnBrowse.Visible := (t = "run")
     }
 
@@ -353,6 +406,37 @@ StepDialog(existing := "") {
         WinActivate("ahk_id " d.Hwnd)
     }
 
+    ; Point at an on-screen element and capture its accessible NAME (the same
+    ; name playback matches on) into the element box — and its window into the
+    ; window box. The dialog hides during the countdown so it isn't in the way.
+    Pick(*) {
+        d.Hide()
+        g.Hide()                                   ; the always-on-top Studio would cover the target
+        Loop 3 {
+            ToolTip("Point the mouse at the thing, then wait...  " (4 - A_Index))
+            Sleep(1000)
+        }
+        ToolTip()
+        MouseGetPos(&mx, &my, &winHwnd)
+        el := AccFromPoint(mx, my)                 ; query while the windows are hidden
+        info := ClassifyWindow(winHwnd)            ; "" for VoiceKit's own window / desktop / shell
+        g.Show()
+        d.Show()
+        WinActivate("ahk_id " d.Hwnd)
+        if !IsObject(info) {
+            MsgBox("Point at your app's window — not VoiceKit or the desktop. Try again.", "Pick element", "Owner" d.Hwnd)
+            return
+        }
+        name := IsObject(el) ? AccName(el.acc, el.child) : ""
+        if (name = "") {
+            MsgBox("Couldn't read a name there. Point at a button, link, menu item or other labeled control — or type its name.", "Pick element", "Owner" d.Hwnd)
+            return
+        }
+        edB.Value := name
+        if (edA.Value = "")                         ; also capture the window it's in, if not set yet
+            edA.Value := info.crit
+    }
+
     Browse(*) {
         f := FileSelect(3, , "Pick the file to open")
         if (f != "")
@@ -360,9 +444,30 @@ StepDialog(existing := "") {
     }
 
     OK(*) {
-        t := typeIds[dt.Value]
+        t := typeIds[dt.Value], cond := typeConds[dt.Value]
+        ; else / endif: block markers with no params.
+        if (t = "else" || t = "endif") {
+            result := [t, "", "", ""]
+            d.Destroy()
+            return
+        }
         a := Trim(edA.Value)
         b := Trim(edB.Value)
+        ; if: window required; element required for the "on screen" conditions.
+        if (t = "if") {
+            if (a = "") {
+                MsgBox("Give the window to check for.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            needElem := (cond = "elementexists" || cond = "elementnotexists")
+            if (needElem && b = "") {
+                MsgBox("Give the name of the thing to check for, as shown on screen.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            result := ["if", a, (needElem ? b : ""), cond]     ; if|window|element|condType
+            d.Destroy()
+            return
+        }
         if (a = "") {
             MsgBox("Fill in the first box.", "Add Step", "Owner" d.Hwnd)
             return
@@ -395,6 +500,7 @@ StepDialog(existing := "") {
 
     dt.OnEvent("Change", UpdateFields)
     btnGrab.OnEvent("Click", Grab)
+    btnPick.OnEvent("Click", Pick)
     btnBrowse.OnEvent("Click", Browse)
     btnOK.OnEvent("Click", OK)
     btnCancel.OnEvent("Click", (*) => d.Destroy())
@@ -402,9 +508,16 @@ StepDialog(existing := "") {
 
     if IsObject(existing) {
         idx := 1
-        for i, id in typeIds
-            if (id = existing[1])
+        exCond := (existing.Length >= 4) ? existing[4] : ""
+        for i, id in typeIds {
+            if (id != existing[1])
+                continue
+            if (id = "if") {                 ; pick the if-row whose condition matches
+                if (typeConds[i] = exCond)
+                    idx := i
+            } else
                 idx := i
+        }
         dt.Choose(idx)
         UpdateFields()
         edA.Value := existing[2]
@@ -414,16 +527,54 @@ StepDialog(existing := "") {
         UpdateFields()
     }
 
-    hwnd := d.Hwnd
-    ThemeApply(d)                   ; match the Studio's look
-    d.Show()                        ; show and activate first...
-    g.Opt("+Disabled")              ; ...then disable the Studio behind it
-    WinActivate("ahk_id " hwnd)     ; make sure the dialog has focus
-    WinWaitClose("ahk_id " hwnd)
-    g.Opt("-Disabled")
-    WinActivate("ahk_id " g.Hwnd)
+    RunOwnedDialog(d)               ; show modally over the Studio, then refocus it
     dialogOpen := false
     return result
+}
+
+; ============================================================
+;  Save-name dialog — themed replacement for InputBox.
+; ============================================================
+SaveNameDialog(defaultName := "") {
+    global g
+    result := ""
+
+    d := Gui("+AlwaysOnTop +Owner" g.Hwnd, "Save Workflow")
+    d.SetFont("s10", "Segoe UI")
+    d.AddText("xm ym w420", "Name this workflow — the name becomes its voice phrase:")
+    d.SetFont("s10 italic", "Segoe UI")
+    d.AddText("xm y+6 w420", "`"open <name>`"")
+    d.SetFont("s10 norm", "Segoe UI")
+    edName := d.AddEdit("xm y+12 w420", defaultName)
+    btnOK := d.AddButton("xm y+14 w120 Default", "OK")
+    btnCancel := d.AddButton("x+8 w120", "Cancel")
+
+    OK(*) {
+        v := Trim(edName.Value)
+        if (v = "")
+            return
+        result := CleanPhrase(v)
+        d.Destroy()
+    }
+    btnOK.OnEvent("Click", OK)
+    btnCancel.OnEvent("Click", (*) => d.Destroy())
+    d.OnEvent("Close", (*) => d.Destroy())
+
+    RunOwnedDialog(d)
+    return result
+}
+
+; Show an owned dialog modally over the Studio: theme it, show and focus it,
+; disable the Studio behind it, wait for it to close, then re-enable + refocus.
+RunOwnedDialog(d) {
+    global g
+    ThemeApply(d)
+    d.Show()
+    g.Opt("+Disabled")
+    WinActivate("ahk_id " d.Hwnd)
+    WinWaitClose("ahk_id " d.Hwnd)
+    g.Opt("-Disabled")
+    WinActivate("ahk_id " g.Hwnd)
 }
 
 ; ============================================================
@@ -432,8 +583,16 @@ StepDialog(existing := "") {
 ;  only as fallback); keystrokes become visible, editable steps.
 ; ============================================================
 StartRecording() {
-    global recording, recLastHwnd, recLastCrit, typedBuf, lastClick, g, recBar, chkCloseTabs
+    global recording, recLastHwnd, recLastCrit, typedBuf, lastClick, g, recBar, chkCloseTabs, steps
     if recording
+        return
+    ; Recording APPENDS to the current step list, so an accidental start
+    ; (Enter on the Default button, F9, a stray click) on a loaded or
+    ; in-progress workflow would tack junk on — and Save could then overwrite
+    ; the saved file. Confirm when there's already something to append to.
+    if (steps.Length > 0
+        && MsgBox("Add recorded steps to the end of this workflow (" steps.Length " so far)?",
+                  "Record", "YesNo Icon? Owner" g.Hwnd) != "Yes")
         return
     ; Optional clean slate: close existing browser windows first, so the
     ; recording starts from a fresh browser instead of whatever tabs were
@@ -451,7 +610,7 @@ StartRecording() {
     StartKeyHook()
     g.Hide()
     UpdateRecBar("Recording — stop: Stop button or Ctrl+Alt+Shift+X")
-    recBar.Show("NoActivate x" (A_ScreenWidth - 640) " y10")
+    ShowBottomLeft(recBar)                    ; bottom-left, clear of the taskbar
     SetTimer(RecTick, 250)
 }
 
@@ -734,11 +893,37 @@ ClassifyWindow(hwnd) {
 ; ============================================================
 ;  Test run / save / delete
 ; ============================================================
+
+; "" if the if/else/endif blocks are balanced, else a message naming the first
+; problem. Unbalanced blocks silently skip the rest of a run (a false-positive
+; "all steps ran"), so Test and Save refuse until it's fixed.
+BlockBalanceError(steps) {
+    depth := 0
+    for i, s in steps {
+        switch s[1] {
+            case "if":    depth += 1
+            case "else":  if (depth = 0)
+                              return "Step " i ": 'Otherwise (else)' has no matching 'If' above it."
+            case "endif": if (depth = 0)
+                              return "Step " i ": 'End if' has no matching 'If' above it."
+                          else
+                              depth -= 1
+        }
+    }
+    if (depth > 0)
+        return depth " 'If' step" (depth > 1 ? "s are" : " is") " missing a matching 'End if'."
+    return ""
+}
+
 TestRun(*) {
     global steps, g
     StopRecording()
     if !steps.Length {
         SB("Nothing to run — record or add steps first.")
+        return
+    }
+    if (berr := BlockBalanceError(steps)) {
+        MsgBox(berr, "Workflow Studio", "Icon! Owner" g.Hwnd)
         return
     }
     g.Hide()
@@ -756,14 +941,11 @@ SaveWorkflow(*) {
         SB("Nothing to save — record or add steps first.")
         return
     }
-    ; InputBox can't be owned, so it would land behind the
-    ; always-on-top Studio — drop topmost while it's up.
-    g.Opt("-AlwaysOnTop")
-    ib := InputBox("Name this workflow — the name becomes its voice phrase:`n`n        `"open <name>`"", "Save Workflow", "w440 h170", currentPhrase)
-    g.Opt("+AlwaysOnTop")
-    if (ib.Result != "OK" || Trim(ib.Value) = "")
+    if (berr := BlockBalanceError(steps)) {
+        MsgBox(berr, "Workflow Studio", "Icon! Owner" g.Hwnd)
         return
-    phrase := CleanPhrase(ib.Value)
+    }
+    phrase := SaveNameDialog(currentPhrase)
     if (phrase = "")
         return
     base := StrReplace(phrase, " ")
@@ -810,14 +992,16 @@ SaveWorkflow(*) {
     EnsureDir(vmDir)
     if !FileExist(vmDir "\" disp ".lnk")
         MakeAhkShortcut(vmDir "\" disp ".lnk", macroFile)
+    MakeLoopShortcut(root, base, disp)     ; companion "loop <disp>" entry (repeats until stopped)
 
     Log(root, "workflow | " phrase " | workflows\" base ".steps.txt")
     currentPhrase := disp
     dirty := false
     ClearAutosave()          ; the take is safely persisted now
     RefreshWorkflowList(disp)
-    MsgBox("Saved. Run it any time by saying:`n`n        open " disp
-        . "`n`n(First time only: give Windows a few seconds to index the new Start Menu entry.)", "Workflow Studio", "Owner" g.Hwnd)
+    MsgBox("Saved.`n`nRun it once:   open " disp
+        . "`nRepeat it:     open loop " disp "   (then click Stop Looping to end)"
+        . "`n`n(First time only: give Windows a few seconds to index the new Start Menu entries.)", "Workflow Studio", "Owner" g.Hwnd)
 }
 
 DeleteWorkflow(*) {
@@ -827,7 +1011,7 @@ DeleteWorkflow(*) {
         SB("Pick a saved workflow in the dropdown first.")
         return
     }
-    if (MsgBox("Delete workflow '" sel "'?`n`nRemoves its steps file, its macro, and its Start Menu entry.",
+    if (MsgBox("Delete workflow '" sel "'?`n`nRemoves its steps file, its macro, and its Start Menu entries (including the loop one).",
         "Workflow Studio", "YesNo Icon! Owner" g.Hwnd) != "Yes")
         return
     base := ddlMap[sel]
@@ -836,6 +1020,7 @@ DeleteWorkflow(*) {
     if (FileExist(macroFile) && InStr(FileRead(macroFile, "UTF-8"), "Workflow Studio"))
         try FileDelete(macroFile)
     try FileDelete(A_Programs "\Voice Macros\" sel ".lnk")
+    try FileDelete(A_Programs "\Voice Macros\loop " sel ".lnk")
     Log(root, "deleted workflow | " sel)
     NewWorkflowState()
     RefreshWorkflowList()
@@ -847,7 +1032,7 @@ DeleteWorkflow(*) {
 ; ============================================================
 ShowHelp(*) {
     MsgBox("Recording (the easy way):`n"
-        . "  1.  Click Record — the Studio hides, a REC bar floats top-right.`n"
+        . "  1.  Click Record (or press F9) — the Studio hides, a REC bar floats bottom-left.`n"
         . "  2.  Just do the thing. Window switches, clicks and typing are captured.`n"
         . "       Clicks are remembered by the NAME of what you clicked, so they`n"
         . "       keep working when windows move. Double-clicking a file in`n"
@@ -931,24 +1116,8 @@ SB(text) {
     statusBar.Text := text          ; status is a themed Text control, not a StatusBar
 }
 
-; The REC bar is a separate, caption-less window; theme it by hand so
-; its background matches and its text stays readable in dark mode (but
-; keep the "REC" label red — that's the whole point of it).
-ThemeRecBar() {
-    global recBar, recNote, recCount, btnStop
-    pal := ThemePalette()
-    recBar.BackColor := pal.win
-    recNote.Opt("c" Format("{:06X}", pal.text))
-    recCount.Opt("c" Format("{:06X}", pal.dim))
-    ThemeClass(btnStop.Hwnd, pal.dark ? "DarkMode_Explorer" : "Explorer")
-}
-
 Abbrev(s, n) {
     return StrLen(s) > n ? SubStr(s, 1, n) "..." : s
-}
-
-SpaceOut(camel) {
-    return Trim(RegExReplace(camel, "([a-z0-9])([A-Z])", "$1 $2"))
 }
 
 ; Self-heal the Start Menu entry so "open workflow studio" works

@@ -35,9 +35,32 @@ WorkflowLoad(stepsFile) {
     return steps
 }
 
-; Run steps in order; stop and explain if one fails.
+; Run steps in order; stop and explain if one fails. The `if`/`else`/`endif`
+; steps add optional branching: an `if` whose condition is false skips its
+; block (to the matching `else`, or past `endif`); everything else runs
+; straight through, so ordinary (recorded) workflows behave exactly as before.
 RunWorkflowSteps(steps) {
-    for i, s in steps {
+    i := 1, n := steps.Length
+    while (i <= n) {
+        s := steps[i], t := s[1]
+        if (t = "if") {
+            res := WfEvalCond(s)
+            if (res.err != "") {
+                MsgBox("Workflow stopped at step " i " of " n ".`n`n"
+                    . WfDesc(s) "`n`n" res.err, "VoiceKit workflow", "Icon! 262144")
+                return false
+            }
+            i := res.val ? i + 1 : WfSkipToElseOrEndif(steps, i) + 1
+            continue
+        }
+        if (t = "else") {                       ; reached while running the true branch — skip to endif
+            i := WfSkipToEndif(steps, i) + 1
+            continue
+        }
+        if (t = "endif") {
+            i += 1
+            continue
+        }
         ; WfRunStep converts expected failures into a returned message,
         ; but a few ops (e.g. WinGetPos on a window that closed mid-step)
         ; can THROW. Catch those so the run stops with the same friendly
@@ -47,12 +70,80 @@ RunWorkflowSteps(steps) {
         catch as e
             err := "Unexpected error: " e.Message
         if (err != "") {
-            MsgBox("Workflow stopped at step " i " of " steps.Length ".`n`n"
+            MsgBox("Workflow stopped at step " i " of " n ".`n`n"
                 . WfDesc(s) "`n`n" err, "VoiceKit workflow", "Icon! 262144")   ; 262144 = always-on-top
             return false
         }
+        i += 1
     }
     return true
+}
+
+; Evaluate an `if` step. Format: if|<window>|<element>|<condType>.
+; Returns {err, val}: a non-empty err (unknown condition) stops the run;
+; otherwise val is the boolean result. Conditions are deterministic state
+; tests only (window present / accessible element present), no guessing.
+WfEvalCond(s) {
+    win := s[2], name := s[3], cond := (s.Length >= 4) ? s[4] : ""
+    ; An empty window would make WinExist("") match the LAST-FOUND window
+    ; (whatever the previous step touched) and silently take the wrong branch.
+    if (Trim(win) = "")
+        return {err: "This 'if' step has no window to check.", val: false}
+    switch cond {
+        case "winexists":        return {err: "", val: (WinExist(win) != 0)}
+        case "winnotexists":     return {err: "", val: (WinExist(win) = 0)}
+        case "elementexists":    return {err: "", val: WfElementPresent(win, name)}
+        case "elementnotexists": return {err: "", val: !WfElementPresent(win, name)}
+    }
+    return {err: "Unknown 'if' condition: " cond, val: false}
+}
+
+; True if an accessible element named `name` is present in window `win`.
+; A condition is a point-in-time snapshot, so use a short Acc budget — not
+; the click path's 3 s wait-for-late-render budget, which would stall every
+; absent-element check (painful inside a loop) for ~3 s per pass.
+WfElementPresent(win, name) {
+    hwnd := WinExist(win)
+    if !hwnd
+        return false
+    return IsObject(AccFindByName(hwnd, name, 700))
+}
+
+; From an `if` at fromIdx, index of its matching `else` (if one precedes the
+; matching `endif`) or that `endif`, honoring nesting. Unterminated -> past end.
+WfSkipToElseOrEndif(steps, fromIdx) {
+    depth := 0, i := fromIdx + 1
+    while (i <= steps.Length) {
+        t := steps[i][1]
+        if (t = "if")
+            depth += 1
+        else if (t = "endif") {
+            if (depth = 0)
+                return i
+            depth -= 1
+        } else if (t = "else" && depth = 0)
+            return i
+        i += 1
+    }
+    return i                                     ; steps.Length + 1: fall off the end
+}
+
+; From an `if`/`else` at fromIdx, index of the matching `endif` (honoring
+; nesting), or past the end if the block is never closed.
+WfSkipToEndif(steps, fromIdx) {
+    depth := 0, i := fromIdx + 1
+    while (i <= steps.Length) {
+        t := steps[i][1]
+        if (t = "if")
+            depth += 1
+        else if (t = "endif") {
+            if (depth = 0)
+                return i
+            depth -= 1
+        }
+        i += 1
+    }
+    return i
 }
 
 ; Execute one step. Returns "" on success, or the reason it failed.
@@ -172,8 +263,23 @@ WfDesc(s) {
         case "rclick":   return "Right-click  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a
         case "move":     return "Position  " a "  ->  " b
         case "close":    return "Close  " a
+        case "if":       return "If  " WfCondDesc(c, a, b)     ; a=window, b=element, c=condType
+        case "else":     return "Otherwise:"
+        case "endif":    return "End if"
     }
     return t "  " a "  " b
+}
+
+; Human-readable form of an `if` condition. cond = condType, win = window,
+; name = element name (used only by the element conditions).
+WfCondDesc(cond, win, name) {
+    switch cond {
+        case "winexists":        return "window  " win "  is open"
+        case "winnotexists":     return "window  " win "  is NOT open"
+        case "elementexists":    return "`"" name "`"  is on screen in  " win
+        case "elementnotexists": return "`"" name "`"  is NOT on screen in  " win
+    }
+    return cond "  " win "  " name
 }
 
 ; Percent-encode / decode params so they survive the pipe format.

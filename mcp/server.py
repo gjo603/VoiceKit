@@ -41,10 +41,17 @@ class WorkflowStep(BaseModel):
       click/dblclick/rclick -> window + element (name on screen)   [or xy]
       move     -> window + position (left/right/top/bottom/max)
       close    -> window
+      if       -> window + condition (+ element for the *element* conditions)
+      else     -> (no fields)   branch to run when the `if` was false
+      endif    -> (no fields)   closes the `if` block
+
+    Branching is optional. An `if` runs its following steps only when the
+    condition holds; pair it with an optional `else` and a closing `endif`.
     """
 
     type: Literal["run", "focus", "waitwin", "wait", "text", "keys",
-                  "click", "dblclick", "rclick", "move", "close"]
+                  "click", "dblclick", "rclick", "move", "close",
+                  "if", "else", "endif"]
     window: Optional[str] = Field(
         None, description="Window criterion: 'ahk_exe notepad.exe', 'ahk_class CabinetWClass', "
         "or a partial title. For focus/waitwin/click/dblclick/rclick/move/close.")
@@ -65,6 +72,11 @@ class WorkflowStep(BaseModel):
         None, description="click/dblclick/rclick: fallback window-relative 'x,y' when there's no name.")
     position: Optional[Literal["left", "right", "top", "bottom", "max"]] = Field(
         None, description="move: where to snap the window.")
+    condition: Optional[Literal["winexists", "winnotexists",
+                                "elementexists", "elementnotexists"]] = Field(
+        None, description="if: which check to run. winexists/winnotexists test whether 'window' is "
+        "open; elementexists/elementnotexists test whether 'element' (an on-screen name) is present "
+        "in 'window'.")
 
     def to_abc(self) -> tuple:
         t = self.type
@@ -100,6 +112,16 @@ class WorkflowStep(BaseModel):
         if t == "close":
             _need(self.window, "close", "window")
             return (t, self.window, "", "")
+        if t == "if":
+            _need(self.condition, "if", "condition")
+            _need(self.window, "if", "window")
+            needs_elem = self.condition in ("elementexists", "elementnotexists")
+            if needs_elem and not self.element:
+                raise ValueError("if with an element condition needs 'element'")
+            # on disk: if|window|element|condType
+            return (t, self.window, self.element or "" if needs_elem else "", self.condition)
+        if t in ("else", "endif"):
+            return (t, "", "", "")
         raise ValueError(f"unknown step type '{t}'")
 
 

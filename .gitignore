@@ -7,3 +7,6 @@ logs/recording.autosave
 mcp/.venv/
 __pycache__/
 *.pyc
+
+# Distribution build artifacts (bundled installer zip/exe) — generated, not source.
+dist/

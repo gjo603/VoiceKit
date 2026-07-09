@@ -35,7 +35,8 @@ if exist "%~dp0logs\installed.flag" (
 
 echo.
 echo  Done. VoiceKit has been unregistered from this machine.
-echo  You can delete this folder now. To reinstall later, run Setup.bat again.
+echo  You can delete this folder now. To reinstall later, run your installer
+echo  again (Install-VoiceKit.cmd for the bundled package, or Setup.bat from source).
 echo.
 pause
 goto :eof

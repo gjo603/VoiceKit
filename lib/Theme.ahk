@@ -154,3 +154,30 @@ ThemeOnColor(wParam, lParam, msg, hwnd) {
     DllCall("gdi32\SetBkColor",  "ptr", wParam, "uint", ThemeBGR(_themePal.card))
     return _themeBrush
 }
+
+; ------------------------------------------------------------
+;  Small floating-bar helpers (shared by the REC bar and the
+;  loop bar — both are caption-less +AlwaysOnTop ToolWindows).
+; ------------------------------------------------------------
+
+; Position a floating bar at the bottom-left of the primary monitor's
+; WORK area (i.e. clear of the taskbar — A_ScreenHeight would sit over it).
+; The bar is realized hidden first so its auto-sized height is known.
+ShowBottomLeft(bar, margin := 12) {
+    MonitorGetWorkArea(MonitorGetPrimary(), &l, &t, &r, &b)
+    bar.Show("NoActivate Hide")
+    bar.GetPos( , , , &h)
+    bar.Show("NoActivate x" (l + margin) " y" (b - h - margin))
+}
+
+; Theme a caption-less status bar: window background, a primary-color text
+; control, a dim text control, and a native button (kept native so it stays
+; voice-clickable). ThemeTitleBar is a no-op on a -Caption window.
+ThemeBar(bar, textCtrl, dimCtrl, btnCtrl) {
+    pal := ThemePalette()
+    bar.BackColor := pal.win
+    textCtrl.Opt("c" Format("{:06X}", pal.text))
+    dimCtrl.Opt("c" Format("{:06X}", pal.dim))
+    ThemeClass(btnCtrl.Hwnd, pal.dark ? "DarkMode_Explorer" : "Explorer")
+    ThemeTitleBar(bar.Hwnd, pal.dark)
+}

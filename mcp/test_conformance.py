@@ -27,6 +27,14 @@ STEPS = [
     ("run", r'C:\Program Files\App "x".exe', "", ""),
     ("keys", "^s", "", ""),
     ("wait", "800", "", ""),
+    # if/else/endif branching (condType in paramC): must round-trip too.
+    ("if", "ahk_exe notepad.exe", "", "winexists"),
+    ("text", "then branch", "", ""),
+    ("else", "", "", ""),
+    ("text", "else branch", "", ""),
+    ("endif", "", "", ""),
+    ("if", "Untitled - Notepad", "File | Save", "elementexists"),
+    ("endif", "", "", ""),
 ]
 
 

@@ -39,6 +39,14 @@ CleanPhrase(raw) {
     return StrTitle(p)
 }
 
+; "MorningTabs" -> "Morning Tabs" — the spoken phrase for a file base. The
+; inverse convention to how bases are formed, so shortcuts regenerate the
+; same name on any machine. (LoopRunner.ahk and VoiceKitHelp.ahk keep their
+; own copy because they don't include _Common.)
+SpaceOut(camel) {
+    return Trim(RegExReplace(camel, "([a-z0-9])([A-Z])", "$1 $2"))
+}
+
 ; Append one line to logs\created.log.
 Log(root, text) {
     EnsureDir(root "\logs")
@@ -57,11 +65,25 @@ RunAhk(ahkFile) {
 ; interpreter (association-proof). Voice Access "open <name>" opens the
 ; .lnk, which runs the exe with the script as its quoted argument — so
 ; it works even if .ahk is associated with something else. Defaults the
-; working dir to the script's own folder.
-MakeAhkShortcut(linkFile, ahkFile, workingDir := "") {
+; working dir to the script's own folder. `args` are appended after the
+; script path (already-quoted by the caller if they contain spaces).
+MakeAhkShortcut(linkFile, ahkFile, workingDir := "", args := "") {
     if (workingDir = "")
         workingDir := RegExReplace(ahkFile, "\\[^\\]+$")
-    FileCreateShortcut(A_AhkPath, linkFile, workingDir, '"' ahkFile '"')
+    target := '"' ahkFile '"'
+    if (args != "")
+        target .= " " args
+    FileCreateShortcut(A_AhkPath, linkFile, workingDir, target)
+}
+
+; Create/refresh a "loop <phrase>" Start Menu entry that runs the workflow
+; <base> repeatedly via lib\LoopRunner.ahk. Voice: "open loop <phrase>".
+; root is the VoiceKit root folder; base is the workflow file base
+; (e.g. MorningTabs); phrase is its spoken/display form (e.g. Morning Tabs).
+MakeLoopShortcut(root, base, phrase) {
+    vmDir := A_Programs "\Voice Macros"
+    EnsureDir(vmDir)
+    MakeAhkShortcut(vmDir "\loop " phrase ".lnk", root "\lib\LoopRunner.ahk", root, '"' base '"')
 }
 
 ; True if a bare filename (no extension) is a reserved Windows device

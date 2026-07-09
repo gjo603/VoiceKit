@@ -39,7 +39,12 @@ BRIDGE_POOL = "ABCDFGHIJKLMOPQSTUVWYZ0123456789"
 
 # Step types from lib\Workflow.ahk WfRunStep.
 STEP_TYPES = ("run", "focus", "waitwin", "wait", "text", "keys",
-              "click", "dblclick", "rclick", "move", "close")
+              "click", "dblclick", "rclick", "move", "close",
+              # Optional branching (engine executes these; recorder never emits them).
+              # if|<window>|<element>|<condType> where condType is one of
+              # winexists / winnotexists / elementexists / elementnotexists;
+              # paired with "else" (optional) and "endif".
+              "if", "else", "endif")
 
 # Marker string that identifies a generated workflow stub (lib guards check it).
 STUDIO_MARKER = "Workflow Studio"
@@ -167,21 +172,36 @@ def _run_powershell(command: str, check: bool = True) -> subprocess.CompletedPro
     )
 
 
-def make_shortcut(link: str, ahk_file: str, workdir: str | None = None) -> None:
+def make_shortcut(link: str, ahk_file: str, workdir: str | None = None,
+                  args: str | None = None) -> None:
     """lib\\_Common.ahk MakeAhkShortcut: a .lnk whose Target is the interpreter
-    and whose Arguments is the quoted script path (association-proof)."""
+    and whose Arguments is the quoted script path (association-proof). Extra
+    `args` are appended after the script path (already quoted by the caller)."""
     if workdir is None:
         workdir = os.path.dirname(ahk_file)
+    arguments = chr(34) + ahk_file + chr(34)
+    if args:
+        arguments += " " + args
     Path(link).parent.mkdir(parents=True, exist_ok=True)
     cmd = (
         "$ws=New-Object -ComObject WScript.Shell;"
         f"$s=$ws.CreateShortcut({_ps_quote(link)});"
         f"$s.TargetPath={_ps_quote(AHK_EXE)};"
-        f"$s.Arguments={_ps_quote(chr(34) + ahk_file + chr(34))};"
+        f"$s.Arguments={_ps_quote(arguments)};"
         f"$s.WorkingDirectory={_ps_quote(workdir)};"
         "$s.Save()"
     )
     _run_powershell(cmd)
+
+
+def make_loop_shortcut(base: str, disp: str) -> str:
+    """lib\\_Common.ahk MakeLoopShortcut: a 'loop <disp>' entry that runs the
+    workflow <base> repeatedly via lib\\LoopRunner.ahk. Voice: 'open loop <disp>'."""
+    _ensure_voice_dir()
+    loop_runner = REPO_ROOT / "lib" / "LoopRunner.ahk"
+    link = VOICE_MACROS / f"loop {disp}.lnk"
+    make_shortcut(str(link), str(loop_runner), str(REPO_ROOT), chr(34) + base + chr(34))
+    return str(link)
 
 
 def validate_ahk(path: str) -> tuple[bool, str]:
@@ -396,10 +416,31 @@ def create_workflow(name: str, steps: list) -> dict:
     phrase, base = _require_name(name)
     if not steps:
         raise VoiceKitError("A workflow needs at least one step.")
+    valid_conds = ("winexists", "winnotexists", "elementexists", "elementnotexists")
+    depth = 0
     for i, s in enumerate(steps):
         if not s or s[0] not in STEP_TYPES:
             raise VoiceKitError(f"Step {i + 1}: unknown type '{s[0] if s else ''}'. "
                                 f"Valid types: {', '.join(STEP_TYPES)}.")
+        # if|window|element|condType — reject a blank window or bad condType at
+        # create time (the engine would otherwise mis-branch or stop mid-run).
+        if s[0] == "if":
+            if not (len(s) >= 2 and str(s[1]).strip()):
+                raise VoiceKitError(f"Step {i + 1}: an 'if' step needs a window to check.")
+            cond = s[3] if len(s) >= 4 else ""
+            if cond not in valid_conds:
+                raise VoiceKitError(f"Step {i + 1}: 'if' condition must be one of "
+                                    f"{', '.join(valid_conds)} (got '{cond}').")
+            depth += 1
+        elif s[0] == "else":
+            if depth == 0:
+                raise VoiceKitError(f"Step {i + 1}: 'else' has no matching 'if' above it.")
+        elif s[0] == "endif":
+            if depth == 0:
+                raise VoiceKitError(f"Step {i + 1}: 'endif' has no matching 'if' above it.")
+            depth -= 1
+    if depth > 0:
+        raise VoiceKitError(f"{depth} 'if' step(s) are missing a matching 'endif'.")
     macro = REPO_ROOT / "macros" / f"{base}.ahk"
     if macro.exists():
         txt = macro.read_text(encoding="utf-8-sig", errors="replace")
@@ -419,10 +460,12 @@ def create_workflow(name: str, steps: list) -> dict:
     link = VOICE_MACROS / f"{disp}.lnk"
     if not link.exists():
         make_shortcut(str(link), str(macro))
+    loop_link = make_loop_shortcut(base, disp)   # companion 'loop <disp>' entry (repeats until stopped)
     log(f"workflow | {phrase} | workflows\\{base}.steps.txt")
     return {"type": "workflow", "phrase": disp, "steps_file": str(steps_file),
-            "stub": str(macro), "shortcut": str(link), "step_count": len(steps),
-            "voice_phrase": f"open {disp}", "reloaded": False}
+            "stub": str(macro), "shortcut": str(link), "loop_shortcut": loop_link,
+            "step_count": len(steps), "voice_phrase": f"open {disp}",
+            "loop_voice_phrase": f"open loop {disp}", "reloaded": False}
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +614,7 @@ def delete_automation(name: str, type: str) -> dict:
             result["removed"].append(str(macro))
         disp = space_out(base)
         _delete_lnk(disp, result)
+        _delete_lnk(f"loop {disp}", result)      # companion loop entry
         log(f"deleted workflow | {disp}")
         return result
 

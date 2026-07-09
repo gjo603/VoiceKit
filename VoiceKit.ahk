@@ -44,16 +44,18 @@ InstallIfFirstRun() {
     Loop Files A_ScriptDir "\macros\*.ahk"
         MakeAhkShortcut(vmDir "\" SpaceOut(StrReplace(A_LoopFileName, ".ahk")) ".lnk", A_LoopFileFullPath)
 
+    ; A "loop <name>" companion for every saved workflow, so "open loop
+    ; <name>" runs that workflow repeatedly (stop with the Stop Looping
+    ; button or Ctrl+Alt+Shift+X). Covers workflows carried over too.
+    Loop Files A_ScriptDir "\workflows\*.steps.txt" {
+        wfBase := StrReplace(A_LoopFileName, ".steps.txt")
+        MakeLoopShortcut(A_ScriptDir, wfBase, SpaceOut(wfBase))
+    }
+
     if MsgBox("Start VoiceKit automatically when you log in?`n(Recommended — you can delete the shortcut from shell:startup later.)", "VoiceKit setup", "YesNo") = "Yes"
         MakeAhkShortcut(A_Startup "\VoiceKit.lnk", A_ScriptFullPath)
 
     FileAppend("installed " FormatTime(A_Now, "yyyy-MM-dd HH:mm") "`n", marker, "UTF-8")
     MsgBox("VoiceKit is set up.`n`nTry saying:  open new automation`n(Give Windows a few seconds to index the new Start Menu entries.)", "VoiceKit")
 }
-
-; "MorningTabs" -> "Morning Tabs" (the spoken phrase). Matches the names
-; New Automation / Workflow Studio create, so shortcuts regenerate the
-; same way when cloned to another machine.
-SpaceOut(camel) {
-    return Trim(RegExReplace(camel, "([a-z0-9])([A-Z])", "$1 $2"))
-}
+; SpaceOut() now lives in lib\_Common.ahk (shared with Workflow Studio).

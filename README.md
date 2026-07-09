@@ -2,7 +2,17 @@
 
 A small system, not a pile of macros. Voice Access does exactly one job: turn speech into a trigger. AutoHotkey v2 does everything else. The centerpiece is **New Automation** — a scaffolder that creates, wires up, and loads new automations so each one costs you about a minute.
 
-## Quick setup (new computer)
+## Got the bundled installer? (VoiceKit-Setup.zip / .exe)
+
+If someone sent you **VoiceKit-Setup.zip**, you need nothing else installed:
+
+1. Right-click the zip → **Extract All**.
+2. Open the extracted folder and **double-click `Install-VoiceKit.cmd`**. It installs VoiceKit and starts it.
+3. **Start Voice Access** (Win+Ctrl+S) and say **"open new automation"** to check it worked.
+
+(Sent a single **VoiceKit-Setup.exe** instead? Just double-click it — Windows may show a one-time "More info → Run anyway".) The rest of this page is for setting up from the source folder.
+
+## Quick setup (from the source folder)
 
 1. Clone or download this folder to a permanent home, e.g. `C:\Automations\VoiceKit`.
 2. **Double-click `Setup.bat`.** It installs AutoHotkey v2 (via winget) if needed, creates Start Menu entries, and launches VoiceKit.
@@ -21,7 +31,7 @@ Test: say **"open new automation"**. If the chooser window appears, you're done.
 
 ## Uninstalling
 
-**Double-click `Uninstall.bat`.** It stops the VoiceKit tray app, removes the `Voice Macros` Start Menu group and the login shortcut, and resets the first-run flag. It does **not** delete this folder or remove AutoHotkey — do those yourself if you want them gone. To reinstall afterward, run `Setup.bat` again. (Voice Access shortcuts you paired for bridge hotkeys are managed inside Voice Access; remove them there.)
+**Double-click `Uninstall.bat`.** It stops the VoiceKit tray app, removes the `Voice Macros` Start Menu group and the login shortcut, and resets the first-run flag. It does **not** delete this folder or remove AutoHotkey — do those yourself if you want them gone. To reinstall afterward, run your installer again (`Install-VoiceKit.cmd` for the bundled package, or `Setup.bat` from a source folder). (Voice Access shortcuts you paired for bridge hotkeys are managed inside Voice Access; remove them there.)
 
 ## How triggering works — two paths
 
@@ -41,13 +51,17 @@ Your library will grow from real friction. That's the only kind worth having.
 
 ## Workflow Studio — multi-step workflows, no code
 
-Say **"open workflow studio"** (or New Automation → Step Workflow). It's a Power-Automate-style builder for linear step lists. The window (like every VoiceKit window) follows your Windows light/dark setting, and every button is voice-clickable — say "click" plus its word:
+Say **"open workflow studio"** (or New Automation → Step Workflow Recording). It's a Power-Automate-style builder for linear step lists. The window (like every VoiceKit window) follows your Windows light/dark setting, and every button is voice-clickable — say "click" plus its word:
 
-- **Record** — the Studio hides, a small REC bar floats top-right, and you just do the thing. Stop with the bar's Stop button, by voice ("click stop"), or with **Ctrl+Alt+Shift+X** (works even if something covers the bar). It captures window switches, clicks (double- and right-clicks too) and typing. Clicks are stored by the **name of what you clicked** (button caption, link, file name) and replayed by finding that name again — raw position is kept only as a silent fallback, so recordings survive windows moving. Double-clicking a file in Explorer is recorded as **Open \<full path\>** automatically, and folder windows are recorded with their full path so playback reopens them if they've been closed. Typed keystrokes become visible, editable Type/Press steps — so don't type passwords while recording. Drags and scrolling aren't captured.
+- **Record** — the Studio hides, a small REC bar floats bottom-left, and you just do the thing. Stop with the bar's Stop button, by voice ("click stop"), or with **Ctrl+Alt+Shift+X** (works even if something covers the bar). It captures window switches, clicks (double- and right-clicks too) and typing. Clicks are stored by the **name of what you clicked** (button caption, link, file name) and replayed by finding that name again — raw position is kept only as a silent fallback, so recordings survive windows moving. Double-clicking a file in Explorer is recorded as **Open \<full path\>** automatically, and folder windows are recorded with their full path so playback reopens them if they've been closed. Typed keystrokes become visible, editable Type/Press steps — so don't type passwords while recording. Drags and scrolling aren't captured.
 - **Close browser tabs before recording** (checkbox, off by default) — tick it and clicking Record first closes every open browser window (Chrome, Edge, Firefox, Brave, Opera), so the recording starts from a fresh browser instead of whatever tabs were already open (leftover tabs shift positions and break playback). It closes gracefully: any window that pops an "unsaved changes / leave site?" warning is **left open** (nothing is discarded) and you're told how many — deal with those yourself for a fully clean start. The setting is remembered between sessions.
-- **Add** — for anything recording can't see or you want to tweak: focus a window (launching it if needed), open an app/file/site (with a Browse button — no path typing), wait for a window, pause, type text, press keys, click by element name, position (left/right/top/bottom/max) or close a window. "Grab a Window" fills in window identities for you — no Window Spy needed.
+- **Add** — for anything recording can't see or you want to tweak: focus a window (launching it if needed), open an app/file/site (with a Browse button — no path typing), wait for a window, pause, type text, press keys, click by element name, position (left/right/top/bottom/max) or close a window. "Grab a Window" fills in window identities for you — no Window Spy needed. At the bottom of the Action list are the optional **if / else / end if** steps (see below).
 - **Test** — plays the steps immediately; a failing step stops the run and names itself.
-- **Save** — writes the step list to `workflows\<Name>.steps.txt`, generates a stub in `macros\`, and creates the Start Menu entry. Saying **"open \<name\>"** runs it — zero Voice Access setup.
+- **Save** — writes the step list to `workflows\<Name>.steps.txt`, generates a stub in `macros\`, and creates the Start Menu entry. Saying **"open \<name\>"** runs it — zero Voice Access setup. Save also creates a companion **"loop \<name\>"** entry (see below).
+
+**Looping a workflow.** Every saved workflow gets a companion command so you can run it over and over: say **"open loop \<name\>"** (e.g. "open loop morning tabs"). A small **Stop Looping** bar floats bottom-left while it runs; end it by saying **"click stop looping"**, clicking the button, or pressing **Ctrl+Alt+Shift+X**. It pauses briefly between passes and stops automatically if a step fails. (Voice Access can't intercept a spoken "loop" before an arbitrary command — it launches whole Start-Menu names — so the loop is its own "loop \<name\>" entry, run with "open" like any other.) Loops repeat until you stop them, so pick actions that make sense to repeat; a workflow that opens new windows will keep piling them up.
+
+**Conditional steps (if / then).** An optional, opt-in feature for branching — nothing you record uses it, and existing workflows are unaffected. In the **Add** dialog's Action list (at the bottom) pick one of: *If a window IS/​is NOT open*, or *If something IS/​is NOT on screen* (a named button, link, etc.). Follow it with the steps to run when the condition holds, an optional **Otherwise (else)**, and an **End if**. The step list indents each block so you can see the structure. Conditions are deterministic state checks only (is a window/element present) — no pixel or image guessing. Example: *If the "Save changes?" dialog is open → click "Save" → End if*. Tip: because these aren't recordable, the easiest way to build them is often to describe the workflow to Claude via the MCP add-on.
 
 Workflows stay editable: reopen the Studio and pick one from the dropdown. The `macros\` file is generated — edit steps in the Studio, not Notepad. If a workflow stops mid-run, the popup names the failing step; usually the fix is a longer wait or a looser window title.
 

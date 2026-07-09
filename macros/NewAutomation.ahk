@@ -39,9 +39,9 @@ ChooseType() {
     ; so the window scans top-to-bottom instead of packing a sentence into a
     ; caption. The short caption ("Launch Macro") stays the voice target.
     descs := []
-    MakeCard(title, desc, choiceNum) {
+    MakeCard(title, desc, choiceNum, opts := "") {
         g.SetFont("s10 bold")
-        b := g.AddButton("xm y+14 w460 h38", title)
+        b := g.AddButton("xm y+14 w460 h38 " opts, title)
         b.OnEvent("Click", (*) => (state.choice := choiceNum, g.Destroy()))
         g.SetFont("s9 norm")
         descs.Push(g.AddText("xm y+3 w460", desc))
@@ -49,7 +49,7 @@ ChooseType() {
     MakeCard("Launch Macro",  "Runs a set of steps once. Voice-ready instantly — say “open <name>”.", 1)
     MakeCard("Hotkey Module", "An always-on key; pair a voice phrase to it once (~30 seconds).", 2)
     MakeCard("Text Snippet",  "Type a short abbreviation anywhere and it expands to full text.", 3)
-    MakeCard("Step Workflow", "Record or build a multi-step automation in a dialog — no code.", 4)
+    MakeCard("Step Workflow Recording", "Record or build a multi-step automation in a dialog — no code.", 4, "Default")
 
     g.SetFont("s10")
     b5 := g.AddButton("xm y+20 w120 h32", "Cancel")
