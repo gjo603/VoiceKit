@@ -41,8 +41,8 @@ CleanPhrase(raw) {
 
 ; "MorningTabs" -> "Morning Tabs" — the spoken phrase for a file base. The
 ; inverse convention to how bases are formed, so shortcuts regenerate the
-; same name on any machine. (LoopRunner.ahk and VoiceKitHelp.ahk keep their
-; own copy because they don't include _Common.)
+; same name on any machine. (LoopRunner.ahk keeps its own copy because it
+; doesn't include _Common.)
 SpaceOut(camel) {
     return Trim(RegExReplace(camel, "([a-z0-9])([A-Z])", "$1 $2"))
 }

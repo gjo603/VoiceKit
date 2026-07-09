@@ -63,7 +63,10 @@ Get-Content -LiteralPath (Join-Path $build 'Install-VoiceKit.cmd') |
     Set-Content -LiteralPath (Join-Path $stage 'Install-VoiceKit.cmd')
 
 # fail loudly if the package is missing something the installer depends on
-foreach ($must in 'VoiceKit.ahk', 'AutoHotkey64.exe', 'lib\LoopRunner.ahk', 'lib\WorkflowLoop.ahk', 'Install-VoiceKit.cmd') {
+foreach ($must in 'VoiceKit.ahk', 'AutoHotkey64.exe', 'lib\LoopRunner.ahk', 'lib\WorkflowLoop.ahk',
+                  'lib\AI.ahk', 'lib\Json.ahk', 'lib\Theme.ahk',
+                  'macros\VoiceKitHome.ahk', 'macros\AskAI.ahk', 'macros\NewAutomation.ahk',
+                  'macros\WorkflowStudio.ahk', 'templates\ai-template.ahk', 'Install-VoiceKit.cmd') {
     if (-not (Test-Path -LiteralPath (Join-Path $stage $must))) {
         Remove-Item -LiteralPath $stage -Recurse -Force
         throw "Staged package is missing '$must'. Aborting so a broken installer isn't shipped."
@@ -95,7 +98,7 @@ if ($Exe) {
         'PostInstallCmd=%PostInstallCmd%', 'AdminQuietInstCmd=%AdminQuietInstCmd%', 'UserQuietInstCmd=%UserQuietInstCmd%',
         'SourceFiles=SourceFiles',
         '[Strings]', 'InstallPrompt=', 'DisplayLicense=',
-        'FinishMessage=VoiceKit is installed and starting. Turn on Voice Access, then say: open new automation',
+        'FinishMessage=VoiceKit is installed and starting. Turn on Voice Access, then say: open voice kit',
         "TargetName=$exeOut", 'FriendlyName=VoiceKit Setup', 'AppLaunched=cmd /c bootstrap.cmd',
         'PostInstallCmd=<None>', 'AdminQuietInstCmd=', 'UserQuietInstCmd=',
         'FILE0="bootstrap.cmd"', 'FILE1="VoiceKit-Setup.zip"',

@@ -50,8 +50,8 @@ if defined VK_NOLAUNCH goto :nolaunch
 echo   Starting VoiceKit...
 start "" "%TARGET%\AutoHotkey64.exe" "%TARGET%\VoiceKit.ahk"
 echo.
-echo   Done. Turn on Voice Access, then say:  open new automation
-echo   (Give Windows a few seconds to index the new Start Menu entry.)
+echo   Done. Turn on Voice Access, then say:  open voice kit
+echo   (Give Windows a few seconds to index the new Start Menu entries.)
 echo.
 exit /b 0
 

@@ -36,6 +36,6 @@ start "" "%ProgramFiles%\AutoHotkey\v2\AutoHotkey64.exe" "%~dp0VoiceKit.ahk"
 
 echo.
 echo  Done! VoiceKit is running.
-echo  Try saying "open new automation" (give Windows a few seconds to index).
+echo  Try saying "open voice kit" (give Windows a few seconds to index).
 echo.
 pause

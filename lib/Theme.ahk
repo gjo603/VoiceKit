@@ -72,6 +72,20 @@ ThemeTitleBar(hwnd, dark) {
     try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "int", 20, "int*", dark ? 1 : 0, "int", 4)
 }
 
+; Round the window's corners (Win11: DWMWA_WINDOW_CORNER_PREFERENCE=33,
+; DWMWCP_ROUND=2). Captioned top-level windows are already round on Win11;
+; this matters for the caption-less floating bars, which stay square without
+; it. Harmless no-op on Win10.
+ThemeRound(hwnd) {
+    try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "int", 33, "int*", 2, "int", 4)
+}
+
+; Give a Text control the dim, secondary color (captions, hints, taglines).
+ThemeDim(ctrl) {
+    pal := ThemePalette()
+    ctrl.Opt("c" Format("{:06X}", pal.dim))
+}
+
 ; Let this process render controls in dark mode. SetPreferredAppMode is
 ; exported by ordinal only (135), so resolve it by hand. Undocumented but
 ; stable on Win10 1903+ / Win11; wrapped in try so it's a safe no-op.
@@ -106,6 +120,7 @@ ThemeApply(g, statusCtrl := 0, forceDark := -1) {
 
     g.BackColor := pal.win
     ThemeTitleBar(g.Hwnd, pal.dark)
+    ThemeRound(g.Hwnd)
 
     if (pal.dark && !_themeBrush)
         _themeBrush := DllCall("gdi32\CreateSolidBrush", "uint", ThemeBGR(pal.card), "ptr")
@@ -163,11 +178,26 @@ ThemeOnColor(wParam, lParam, msg, hwnd) {
 ; Position a floating bar at the bottom-left of the primary monitor's
 ; WORK area (i.e. clear of the taskbar — A_ScreenHeight would sit over it).
 ; The bar is realized hidden first so its auto-sized height is known.
+; Measured/moved with WinGetPos/WinMove, which use PHYSICAL pixels like
+; MonitorGetWorkArea — Gui.GetPos returns DPI-scaled units, and mixing the
+; two sat the bar on top of the taskbar on >100%-DPI displays.
 ShowBottomLeft(bar, margin := 12) {
     MonitorGetWorkArea(MonitorGetPrimary(), &l, &t, &r, &b)
     bar.Show("NoActivate Hide")
-    bar.GetPos( , , , &h)
-    bar.Show("NoActivate x" (l + margin) " y" (b - h - margin))
+    WinGetPos(, , , &h, bar.Hwnd)
+    WinMove(l + margin, b - h - margin, , , bar.Hwnd)
+    bar.Show("NoActivate")
+}
+
+; Center a floating bar at the bottom of the work area (the Wispr-style
+; pill position). Activates the bar, unlike ShowBottomLeft — bars shown
+; here take typed/dictated input.
+ShowBottomCenter(bar, margin := 16) {
+    MonitorGetWorkArea(MonitorGetPrimary(), &l, &t, &r, &b)
+    bar.Show("Hide")
+    WinGetPos(, , &w, &h, bar.Hwnd)
+    WinMove(l + ((r - l - w) // 2), b - h - margin, , , bar.Hwnd)
+    bar.Show()
 }
 
 ; Theme a caption-less status bar: window background, a primary-color text
@@ -180,4 +210,5 @@ ThemeBar(bar, textCtrl, dimCtrl, btnCtrl) {
     dimCtrl.Opt("c" Format("{:06X}", pal.dim))
     ThemeClass(btnCtrl.Hwnd, pal.dark ? "DarkMode_Explorer" : "Explorer")
     ThemeTitleBar(bar.Hwnd, pal.dark)
+    ThemeRound(bar.Hwnd)
 }

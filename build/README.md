@@ -31,8 +31,8 @@ double-click `Install-VoiceKit.cmd`.
 unsigned, Windows SmartScreen shows a one-time *More info → Run anyway*.
 
 Either way it installs to `%LOCALAPPDATA%\Programs\VoiceKit`, runs from the
-bundled interpreter, and starts VoiceKit. Then they turn on Voice Access and
-say *open new automation*.
+bundled interpreter, and starts VoiceKit (a welcome screen walks them through
+Voice Access and auto-start). Then they say *open voice kit*.
 
 ## Files
 

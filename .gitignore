@@ -1,7 +1,10 @@
 # Per-machine runtime state — regenerated on each computer, never shared.
-logs/installed.flag
-logs/created.log
-logs/recording.autosave
+# The whole folder: it now also holds settings.ini (with the DPAPI-wrapped
+# OpenRouter key — must never be committed) and AI draft scratch files.
+logs/
+
+# Personal AI-action prompts — user content, like personal macros.
+prompts/
 
 # MCP server (optional add-on) — Python venv and caches are per-machine.
 mcp/.venv/

@@ -5,7 +5,7 @@
 ;  workflows in a dialog. No code required.
 ;
 ;  Open it by voice:  "open workflow studio"
-;  (or: New Automation -> Step Workflow Recording)
+;  (or: New Automation -> Record My Steps)
 ;
 ;  Record captures what you actually do:
 ;    - window switches            -> Focus steps
@@ -158,7 +158,13 @@ LoadSettings()
 ThemeApply(g, statusBar)
 g.Show()
 btnRec.Focus()           ; land on Record so pressing Enter starts recording
-OfferRecovery()          ; restore an interrupted recording, if any
+recovered := OfferRecovery()   ; restore an interrupted recording, if any
+if (A_Args.Length >= 1) {
+    if recovered
+        SB("Recovered steps kept — the file passed on the command line was not loaded.")
+    else
+        LoadStartupFile(A_Args[1])
+}
 
 ; ============================================================
 ;  Workflow list / load / new
@@ -215,6 +221,32 @@ NewWorkflowState() {
     dirty := false
     RefreshLV()
     SB("New workflow — click Record and just do the thing, or build it up with Add.")
+}
+
+; Open the Studio "on" a file passed as a command-line argument:
+;   - a saved workflow's own steps file -> load it as that workflow
+;     (the Voice Kit home window's Edit button does this);
+;   - any other steps file (the AI draft that New Automation writes to
+;     logs\ai-draft.steps.txt) -> load as an unsaved draft for review.
+; Never auto-saves either way — Save stays a deliberate act.
+LoadStartupFile(path) {
+    global root, steps, currentPhrase, dirty
+    if !FileExist(path)
+        return
+    if (RegExMatch(path, "i)\\workflows\\([^\\]+)\.steps\.txt$", &m)
+        && FileExist(root "\workflows\" m[1] ".steps.txt")) {
+        RefreshWorkflowList(SpaceOut(m[1]))
+        LoadWorkflow(m[1])
+        return
+    }
+    loaded := WorkflowLoad(path)
+    if !loaded.Length
+        return
+    steps := loaded
+    currentPhrase := ""
+    dirty := true
+    RefreshLV()
+    SB("AI draft loaded (" steps.Length " steps) — review each one, click Test, then Save to make it a voice command.")
 }
 
 ; ============================================================
@@ -677,11 +709,11 @@ ClearAutosave() {
 OfferRecovery() {
     global steps, dirty, g
     if !FileExist(AutosaveFile())
-        return
+        return false
     recovered := WorkflowLoad(AutosaveFile())   ; reuse the engine's parser
     if !recovered.Length {
         ClearAutosave()
-        return
+        return false
     }
     if (MsgBox("A recording from an interrupted session was found ("
         recovered.Length " steps). Recover it?", "Workflow Studio", "YesNo Icon? Owner" g.Hwnd) = "Yes") {
@@ -689,9 +721,10 @@ OfferRecovery() {
         dirty := true
         RefreshLV()
         SB("Recovered " steps.Length " steps — review them, then click Save.")
-    } else {
-        ClearAutosave()
+        return true
     }
+    ClearAutosave()
+    return false
 }
 
 RecTick() {
@@ -1046,7 +1079,8 @@ ShowHelp(*) {
         . "browser — handy when leftover tabs shift things and break playback.`n`n"
         . "Notes: don't type passwords while recording; drags and scrolling`n"
         . "aren't captured. Every button is voice-clickable — say `"click`" plus`n"
-        . "its word: `"click record`", `"click add`", `"click test`", `"click save`".",
+        . "its word: `"click record`", `"click add`", `"click test`", `"click save`".`n`n"
+        . "See everything you've made in one place: say `"open voice kit`".",
         "Workflow Studio — help", "Owner" g.Hwnd)
 }
 
