@@ -162,8 +162,16 @@ WfRunStep(s) {
                 Sleep(300)          ; let the app take focus before keys arrive
                 return ""
             }
-            if (b = "")
-                return "Window not found (and no launch command is set): " a
+            if (b = "") {
+                ; Recordings capture no timing, so a window that appears a
+                ; beat later (a dialog, a loading app) is normal — wait for
+                ; it like waitwin does instead of failing instantly.
+                if !WinWait(a, , 10)
+                    return "Window not found (and no launch command is set): " a
+                WinActivate(a)
+                Sleep(300)
+                return ""
+            }
             try Run(b)
             catch
                 return "Couldn't launch: " b
@@ -191,7 +199,7 @@ WfRunStep(s) {
                 return "Bad key syntax (see AHK v2 Send docs): " a
         case "click", "dblclick", "rclick":
             ; a = window, b = element name (may be ""), c = "x,y" window-relative fallback
-            if !WinExist(a)
+            if (!WinExist(a) && !WinWait(a, , 10))   ; same grace as focus/waitwin
                 return "Window not found: " a
             WinActivate(a)
             Sleep(400)

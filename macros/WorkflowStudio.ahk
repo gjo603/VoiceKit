@@ -49,6 +49,8 @@ ih := ""                ; InputHook while recording
 typedBuf := ""          ; keystrokes waiting to become a Type step
 lastCharTick := 0
 lastClick := {tick: 0, x: 0, y: 0, idx: 0}
+recMaxed := Map()       ; window crits already maximize-handled this take
+recStartCount := 0      ; steps.Length when recording started (for the stop summary)
 
 ; Advanced if/else/endif entries live at the END so they're never the default
 ; and don't clutter ordinary recording. The four "if" rows all save as type
@@ -106,6 +108,7 @@ btnDown := g.AddButton("x+6 w96 h30",      "↓  Down")
 
 g.SetFont("s10")
 chkCloseTabs := g.AddCheckBox("xm y+14", "Close browser tabs before recording")
+chkMaxWins := g.AddCheckBox("xm y+6", "Maximize windows while recording  (steadier playback)")
 
 g.SetFont("s11")
 btnRec  := g.AddButton("xm y+8 w214 h44 Default", "●  Record (F9)")   ; Default: Enter starts recording
@@ -144,6 +147,7 @@ btnTest.OnEvent("Click", TestRun)
 btnSave.OnEvent("Click", SaveWorkflow)
 btnHelp.OnEvent("Click", ShowHelp)
 chkCloseTabs.OnEvent("Click", SaveSettings)
+chkMaxWins.OnEvent("Click", SaveSettings)
 g.OnEvent("Close", CloseStudio)
 
 ; ---- F9 starts recording while the main Studio window is active ----
@@ -262,7 +266,10 @@ RefreshLV() {
         indent := ""
         Loop shown
             indent .= "      "
-        lv.Add(, i, indent WfDesc(s))
+        desc := WfDesc(s)
+        if ((t = "click" || t = "dblclick" || t = "rclick") && s[3] = "" && s[4] != "")
+            desc .= "      ⚠ by position only — may break if the window moves"
+        lv.Add(, i, indent desc)
         if (t = "if")
             depth += 1
         else if (t = "endif")
@@ -616,6 +623,7 @@ RunOwnedDialog(d) {
 ; ============================================================
 StartRecording() {
     global recording, recLastHwnd, recLastCrit, typedBuf, lastClick, g, recBar, chkCloseTabs, steps
+    global recMaxed, recStartCount
     if recording
         return
     ; Recording APPENDS to the current step list, so an accidental start
@@ -639,6 +647,8 @@ StartRecording() {
     recLastHwnd := 0
     recLastCrit := ""
     lastClick := {tick: 0, x: 0, y: 0, idx: 0}
+    recMaxed := Map()
+    recStartCount := steps.Length
     StartKeyHook()
     g.Hide()
     UpdateRecBar("Recording — stop: Stop button or Ctrl+Alt+Shift+X")
@@ -647,7 +657,7 @@ StartRecording() {
 }
 
 StopRecording() {
-    global recording, steps, lv, g, recBar, btnRec
+    global recording, steps, lv, g, recBar, btnRec, recStartCount
     if !recording
         return
     recording := false
@@ -660,7 +670,18 @@ StopRecording() {
     WinActivate("ahk_id " g.Hwnd)
     if steps.Length
         lv.Modify(steps.Length, "Select Focus Vis")
-    SB("Recorded — trim or edit steps, add waits if needed, then click Test and Save.")
+    posOnly := 0
+    Loop Max(0, steps.Length - recStartCount) {      ; count THIS take only
+        s := steps[recStartCount + A_Index]
+        if ((s[1] = "click" || s[1] = "dblclick" || s[1] = "rclick") && s[3] = "" && s[4] != "")
+            posOnly += 1
+    }
+    if (steps.Length = recStartCount)
+        SB("Nothing was captured — recording sees window switches, clicks and typing in normal app windows (the Start menu and taskbar don't count). Try again.")
+    else if posOnly
+        SB("Recorded — " posOnly " click" (posOnly = 1 ? " was" : "s were") " captured by position only (⚠ in the list) because nothing readable was under the mouse. They replay less reliably — prefer clicking labeled controls.")
+    else
+        SB("Recorded — trim or edit steps if needed, then click Test and Save.")
 }
 
 RecPush(step, note) {
@@ -743,6 +764,41 @@ RecTick() {
     FlushTypedText()
     recLastCrit := info.crit
     RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
+    RecEnsureMax(hwnd, info.crit)
+}
+
+; If a window newly entering the recording is maximizable, maximize it now
+; and record a "move max" step, so playback reproduces the exact geometry
+; the recording saw — coordinate fallbacks stay valid and apps that open
+; half-screen (snap layouts) stop breaking takes. Once per window identity
+; per take. A window with no maximize box (a dialog) is left alone AND
+; leaves the slot open: dialogs share their app's "ahk_exe" identity, so
+; marking them handled would block the app's real main window later.
+RecEnsureMax(hwnd, crit) {
+    global chkMaxWins, recMaxed
+    if (!chkMaxWins.Value || recMaxed.Has(crit))
+        return
+    try {
+        if !(WinGetStyle(hwnd) & 0x10000)          ; WS_MAXIMIZEBOX
+            return
+        recMaxed[crit] := true
+        if (WinGetMinMax(hwnd) != 1)
+            WinMaximize(hwnd)
+        RecPush(["move", crit, "max", ""], "Maximize " crit)
+    }
+}
+
+; Deferred entry for the CLICK path. Maximizing synchronously inside the
+; button-down hook would reflow the window mid-gesture: the second half of
+; a live double-click lands on shifted content (and the Explorer rewrite
+; could then record the WRONG file), and even a single click can be
+; cancelled when the pressed control moves out from under the held button.
+; So clicks schedule this to run after the double-click window has passed.
+RecDeferredMax(hwnd, crit) {
+    global recording
+    if (!recording || !WinExist("ahk_id " hwnd))
+        return
+    RecEnsureMax(hwnd, crit)
 }
 
 RecClick(btn) {
@@ -790,6 +846,11 @@ RecClick(btn) {
         (btn = "R" ? "Right-click " : "Click ") (elem != "" ? "`"" elem "`"" : "at " rel))
     if (btn = "L")
         lastClick := {tick: now, x: mx, y: my, idx: steps.Length}
+    ; Maximize LATER, not now: this hotkey runs on button-DOWN, and moving
+    ; the window mid-gesture would break the user's own click/double-click
+    ; (see RecDeferredMax). The captured element/coords above deliberately
+    ; reflect the geometry the user actually clicked in.
+    SetTimer((*) => RecDeferredMax(hwnd, info.crit), -(DllCall("GetDoubleClickTime") + 150))
 }
 
 ; Full path of the item selected in an Explorer window, or "".
@@ -1075,8 +1136,13 @@ ShowHelp(*) {
         . "       double-click a row to edit, and click Add to insert a pause if`n"
         . "       an app needs time to load.`n"
         . "  4.  Test plays it. Save makes it a voice command: say `"open <name>`".`n`n"
-        . "Tip: tick `"Close browser tabs before recording`" to start from a fresh`n"
-        . "browser — handy when leftover tabs shift things and break playback.`n`n"
+        . "Playback is patient: it waits up to 10 seconds for each window to`n"
+        . "appear, so you rarely need manual Wait steps.`n`n"
+        . "Tips: `"Close browser tabs before recording`" starts from a fresh`n"
+        . "browser (leftover tabs shift things). `"Maximize windows while`n"
+        . "recording`" locks in one window layout — playback re-maximizes the`n"
+        . "same windows, so nothing has moved. Steps marked ⚠ were captured`n"
+        . "by position only and are the first thing to fix if playback misses.`n`n"
         . "Notes: don't type passwords while recording; drags and scrolling`n"
         . "aren't captured. Every button is voice-clickable — say `"click`" plus`n"
         . "its word: `"click record`", `"click add`", `"click test`", `"click save`".`n`n"
@@ -1136,13 +1202,15 @@ SettingsFile() {
     return root "\logs\settings.ini"
 }
 LoadSettings() {
-    global chkCloseTabs
+    global chkCloseTabs, chkMaxWins
     chkCloseTabs.Value := (IniRead(SettingsFile(), "Studio", "CloseBrowserTabs", "0") = "1")
+    chkMaxWins.Value := (IniRead(SettingsFile(), "Studio", "MaximizeWhileRecording", "1") = "1")
 }
 SaveSettings(*) {
-    global chkCloseTabs
+    global chkCloseTabs, chkMaxWins
     EnsureDir(RegExReplace(SettingsFile(), "\\[^\\]+$"))
     IniWrite(chkCloseTabs.Value ? 1 : 0, SettingsFile(), "Studio", "CloseBrowserTabs")
+    IniWrite(chkMaxWins.Value ? 1 : 0, SettingsFile(), "Studio", "MaximizeWhileRecording")
 }
 
 SB(text) {
