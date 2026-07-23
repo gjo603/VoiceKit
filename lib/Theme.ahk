@@ -200,6 +200,17 @@ ShowBottomCenter(bar, margin := 16) {
     bar.Show()
 }
 
+; Bottom-right corner of the work area — for input dialogs that must not
+; cover a document the user is reading (Split Pages). Activates, like
+; ShowBottomCenter, because the user types into it.
+ShowBottomRight(bar, margin := 16) {
+    MonitorGetWorkArea(MonitorGetPrimary(), &l, &t, &r, &b)
+    bar.Show("Hide")
+    WinGetPos(, , &w, &h, bar.Hwnd)
+    WinMove(r - w - margin, b - h - margin, , , bar.Hwnd)
+    bar.Show()
+}
+
 ; Theme a caption-less status bar: window background, a primary-color text
 ; control, a dim text control, and a native button (kept native so it stays
 ; voice-clickable). ThemeTitleBar is a no-op on a -Caption window.

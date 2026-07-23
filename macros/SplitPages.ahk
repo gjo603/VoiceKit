@@ -53,8 +53,10 @@ stopped := false
 Loop pageCount {
     i := A_Index
     pageFile := splitDir "\page " Format("{:03}", i) ".pdf"
-    if !noPreview
+    if !noPreview {
         Run('"' pageFile '"')                ; default PDF viewer shows the page
+        WaitViewer(i)                        ; let it open FIRST, so it can't steal
+    }                                        ; focus from the dialog afterwards
     r := PageDialog(i, pageCount, today)
     if !noPreview
         ClosePreview(i)
@@ -105,10 +107,24 @@ PageDialog(i, n, today) {
     ThemeDim(hint)
     ThemeDim(ex)
     hwnd := d.Hwnd
-    d.Show()
-    WinActivate("ahk_id " hwnd)              ; over the just-opened viewer
+    ShowBottomRight(d)                       ; corner placement — never covers the page
+    WinActivate("ahk_id " hwnd)              ; focused over the just-opened viewer
+    edDesc.Focus()                           ; caret in the input field, ready to type
     WinWaitClose("ahk_id " hwnd)
     return state
+}
+
+; Wait (briefly) for the viewer window showing temp page i, then let it
+; settle — so the dialog shown next keeps focus and the caret stays in
+; its input field. No viewer in 4 s (odd title, slow app) is fine: the
+; dialog still opens; worst case the viewer takes focus and one click
+; brings the dialog back.
+WaitViewer(i) {
+    prev := A_TitleMatchMode
+    SetTitleMatchMode(2)
+    WinWait("page " Format("{:03}", i), , 4)
+    SetTitleMatchMode(prev)
+    Sleep(400)
 }
 
 ; Description -> safe file-name fragment (strip illegal chars, tidy spaces).
