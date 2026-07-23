@@ -41,6 +41,8 @@ Test: say **"open new automation"**. If the chooser window appears, you're done.
 
 **Snippets** are a third mini-path: typed abbreviations (`/sig`, `/date`) that expand instantly — single-line or multi-line — fully automated end to end by the scaffolder, and editable in place from the home window.
 
+**Split Pages** is a filing tool: select a multi-page PDF (a stack of scanned receipts, say) in File Explorer and say **"open split pages"** — each page opens in your PDF viewer while a small dialog asks what it is, and the page is saved beside the original as `<today's date> <your words>.pdf` (e.g. `2026-07-23 Home Depot receipt.pdf`). Skip pages you don't want; the original document is never modified. Needs Python 3 — the small `pypdf` component is offered as a one-time install on first use.
+
 **Any Path-1 automation can ALSO get a keyboard trigger** — a companion `Ctrl+Alt+Shift+<key>` assigned in the home window (say "open voice kit" → select it → **Hotkey**) for the moments voice isn't available. Unlike Path 2 there's no Voice Access step at all: the key is live the moment you save it.
 
 **Step Workflows** are Path-1 macros you build visually instead of writing code — see **Workflow Studio** below. **AI text actions** (optional — see the AI section) are Path-1 macros too: a saved prompt with its own voice phrase.
