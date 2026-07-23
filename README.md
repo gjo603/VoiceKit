@@ -39,7 +39,9 @@ Test: say **"open new automation"**. If the chooser window appears, you're done.
 
 **Path 2 — Hotkey modules (the bridge you already discovered).** A module in `hotkeys\` binds `Ctrl+Alt+Shift+<letter>`; you create one Voice Access shortcut whose action is *Press keys* with that combo. Best for: always-on hotkeys, toggles, anything needing shared state, or a natural phrase without the word "open". Costs ~30 seconds of manual Voice Access setup per command — unavoidable, see limits below.
 
-**Snippets** are a third mini-path: typed abbreviations (`/sig`, `/date`) that expand instantly, fully automated end to end by the scaffolder.
+**Snippets** are a third mini-path: typed abbreviations (`/sig`, `/date`) that expand instantly — single-line or multi-line — fully automated end to end by the scaffolder, and editable in place from the home window.
+
+**Any Path-1 automation can ALSO get a keyboard trigger** — a companion `Ctrl+Alt+Shift+<key>` assigned in the home window (say "open voice kit" → select it → **Hotkey**) for the moments voice isn't available. Unlike Path 2 there's no Voice Access step at all: the key is live the moment you save it.
 
 **Step Workflows** are Path-1 macros you build visually instead of writing code — see **Workflow Studio** below. **AI text actions** (optional — see the AI section) are Path-1 macros too: a saved prompt with its own voice phrase.
 
@@ -62,11 +64,12 @@ Your library will grow from real friction. That's the only kind worth having.
 
 Say **"open workflow studio"** (or New Automation → Record My Steps). It's a Power-Automate-style builder for linear step lists. The window (like every VoiceKit window) follows your Windows light/dark setting, and every button is voice-clickable — say "click" plus its word:
 
-- **Record** — the Studio hides, a small REC bar floats bottom-left, and you just do the thing. Stop with the bar's Stop button, by voice ("click stop"), or with **Ctrl+Alt+Shift+X** (works even if something covers the bar). It captures window switches, clicks (double- and right-clicks too) and typing. Clicks are stored by the **name of what you clicked** (button caption, link, file name) and replayed by finding that name again — raw position is kept only as a silent fallback, so recordings survive windows moving. Double-clicking a file in Explorer is recorded as **Open \<full path\>** automatically, and folder windows are recorded with their full path so playback reopens them if they've been closed. Typed keystrokes become visible, editable Type/Press steps — so don't type passwords while recording. Drags and scrolling aren't captured.
+- **Record** — the Studio hides, a small REC bar floats bottom-left, and you just do the thing. Stop with the bar's Stop button, by voice ("click stop"), or with **Ctrl+Alt+Shift+X** (works even if something covers the bar). It captures window switches, clicks (double- and right-clicks too) and typing. Clicks are stored by the **name of what you clicked** (button caption, link, file name) and replayed by finding that name again — raw position is kept only as a silent fallback, so recordings survive windows moving. Double-clicking a file in Explorer is recorded as **Open \<full path\>** automatically, and folder windows are recorded with their full path so playback reopens them if they've been closed. Typed keystrokes become visible, editable Type/Press steps — so don't type passwords while recording. To capture a **hover** (resting the mouse to reveal a menu or tooltip), point at it and press **Ctrl+Alt+Shift+H** — a Hover step is added where the mouse is. Drags and scrolling aren't captured.
 - **Close browser tabs before recording** (checkbox, off by default) — tick it and clicking Record first closes every open browser window (Chrome, Edge, Firefox, Brave, Opera), so the recording starts from a fresh browser instead of whatever tabs were already open (leftover tabs shift positions and break playback). It closes gracefully: any window that pops an "unsaved changes / leave site?" warning is **left open** (nothing is discarded) and you're told how many — deal with those yourself for a fully clean start. The setting is remembered between sessions.
 - **Maximize windows while recording** (checkbox, **on** by default) — every window that enters the recording is maximized (and a *maximize* step is saved with it), so playback re-creates the same window layout. This is what stops "it worked when I recorded it" breakage from apps opening half-screen in a snap layout. One honest edge: a **⚠ position-only click** that itself brings a new window into the recording is captured before that window gets maximized — those are exactly the steps the ⚠ marker tells you to re-record on a labeled control. Untick the box only for automations that depend on a specific window arrangement.
+- **Record clicks by position only** (checkbox, off by default) — skips element-name detection and stores just the window-relative X,Y of each click (and hover), for apps where accessible names are unreliable or misleading: maps, canvases, games, custom-drawn UIs. Everything captured this way is a **⚠** position-only step, so keep the window layout stable (the Maximize option helps). Double-clicking a file in Explorer is still recorded as a reliable **Open \<full path\>** step, not a raw position. Remembered between sessions.
 - **Playback is patient** — each step waits up to 10 seconds for its window to appear before giving up, so slow-loading apps and dialogs don't need hand-added Wait steps. Clicks that couldn't be captured by an element's name are marked **⚠** in the step list (they replay by position, which is fragile) — the stop message counts them so you know before you save.
-- **Add** — for anything recording can't see or you want to tweak: focus a window (launching it if needed), open an app/file/site (with a Browse button — no path typing), wait for a window, pause, type text, press keys, click by element name, position (left/right/top/bottom/max) or close a window. "Grab a Window" fills in window identities for you — no Window Spy needed. At the bottom of the Action list are the optional **if / else / end if** steps (see below).
+- **Add** — for anything recording can't see or you want to tweak: focus a window (launching it if needed), open an app/file/site (with a Browse button — no path typing), wait for a window, pause, type text, press keys, click by element name, **hover** over something (to reveal a menu/tooltip), position (left/right/top/bottom/max) or close a window. "Grab a Window" fills in window identities for you — no Window Spy needed. At the bottom of the Action list are the optional **if / else / end if** steps (see below).
 - **Test** — plays the steps immediately; a failing step stops the run and names itself.
 - **Save** — writes the step list to `workflows\<Name>.steps.txt`, generates a stub in `macros\`, and creates the Start Menu entry. Saying **"open \<name\>"** runs it — zero Voice Access setup. Save also creates a companion **"loop \<name\>"** entry (see below).
 
@@ -78,7 +81,9 @@ Workflows stay editable: reopen the Studio and pick one from the dropdown. The `
 
 ## The home window — say "open voice kit"
 
-One calm place for everything (inspired by the disappearing-UI school of tools like Wispr Flow): every workflow, macro, AI action, hotkey, and snippet in a searchable list with the exact phrase to say, plus **Run**, **Edit** (workflows open straight in the Studio; AI prompts get an inline editor), **Delete** (removes all of an automation's artifacts, including Start Menu entries), **New Automation**, and **AI Settings**. The old **"open voice kit help"** phrase still works — it lands here.
+One calm place for everything (inspired by the disappearing-UI school of tools like Wispr Flow): every workflow, macro, AI action, hotkey, and snippet in a searchable list with the exact phrase to say, plus **Run**, **Edit** (workflows open straight in the Studio; AI prompts and text snippets get an inline editor — the snippet editor takes multi-line text and renames), **Hotkey** (below), **Delete** (removes all of an automation's artifacts, including Start Menu entries and its hotkey), **New Automation**, and **AI Settings**. The old **"open voice kit help"** phrase still works — it lands here.
+
+**Give any automation a hotkey — for when you can't use your voice.** Select it, click **Hotkey**, pick a free key, done: pressing **Ctrl+Alt+Shift+\<key\>** now runs the same automation the phrase does (mic muted, on a call, voice tired — the keyboard still works, and the phrase keeps working too). The assigned combo shows in the list's **Hotkey** column; the same dialog changes or removes it. No Voice Access setup is involved — the key lives in VoiceKit itself, so it works the moment you save it (VoiceKit must be running, as always).
 
 ## AI features (optional) — the OpenRouter layer
 
@@ -93,19 +98,23 @@ What leaves your machine: only what a feature needs at the moment you trigger it
 ## Create automations with Claude (MCP) — optional
 
 Prefer to *describe* an automation instead of recording it? There's an optional
-**MCP server** in `mcp\` that lets Claude (Desktop or Claude Code) build launch
-macros, hotkey modules, snippets, and step workflows for you from natural language
-(the AI text actions above are created in New Automation, not through MCP) — "make a workflow that opens Notepad and
-types my address" — writing the exact same files the recorder does. It's an add-on,
-not a replacement: recording and New Automation still work unchanged. Setup and the
-tool list are in **`mcp\README.md`** (needs Python 3.10+). Every script it generates
-is load-checked before it's kept.
+**MCP server** in `mcp\` that lets Claude (Desktop or Claude Code) build every
+automation type for you from natural language — launch macros (including the
+no-code "open something" kind), hotkey modules, snippets, step workflows, and AI
+text actions — "make a workflow that opens Notepad and types my address" —
+writing the exact same files the GUI does. Claude can also **trigger** them:
+`run_automation` is the MCP equivalent of you saying "open \<name\>" (including
+"loop \<name\>" for repeat runs), and `press_hotkey` fires an always-on hotkey
+module. It's an add-on, not a
+replacement: recording and New Automation still work unchanged. Setup, the tool
+list, and the security model are in **`mcp\README.md`** (needs Python 3.10+).
+Every script it generates is load-checked before it's kept.
 
 ## Hard limits — know these, don't fight them
 
 - **Voice Access shortcuts cannot be created programmatically.** No API, no PowerShell, no registry path. This is why Path 1 exists and why Path 2 keeps a 30-second manual step.
 - **Voice shortcuts max out at 8 actions, with no variables, conditionals, or loops.** Never build logic in Voice Access. One shortcut = one handoff to AHK.
-- **Voice shortcuts don't sync or back up.** `bridge-map.txt` is your recreate list for a new machine or reinstall.
+- **Voice shortcuts don't sync or back up.** `bridge-map.txt` is your recreate list for a new machine or reinstall. (Lines in it whose file ends `.hotkey.ahk` are companion hotkeys assigned in the home window — those need no Voice Access recreation; they're keyboard-only.)
 - **Say phrases exactly**; distinct, uncommon phrases misfire less. Mute Voice Access during calls or your meeting will run your macros.
 
 ## Troubleshooting
@@ -124,7 +133,8 @@ is load-checked before it's kept.
 3. New Automation → Type Text For Me: `/hi` → "hello world" → typing `/hi` in Notepad expands it.
 4. New Automation → Always-On Hotkey "Test Bridge" (Open something → notepad.exe) → pressing the assigned Ctrl+Alt+Shift key opens Notepad; register the phrase in Voice Access and repeat by voice.
 5. Say "open workflow studio" → click Record, open Notepad and type a few words, click Stop → click Test replays it; Save as "Test Flow" → say "open test flow".
-6. (With an OpenRouter key saved) say "open ask ai", ask something small → the answer types into your last app.
+6. Say "open voice kit" → select "open test ping" → click **Hotkey** → Save Hotkey → press the shown Ctrl+Alt+Shift key (no voice) → Notepad opens.
+7. (With an OpenRouter key saved) say "open ask ai", ask something small → the answer types into your last app.
 
 ## Out of scope, on purpose
 

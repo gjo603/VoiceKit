@@ -1,4 +1,4 @@
-#Requires AutoHotkey v2.0
+﻿#Requires AutoHotkey v2.0
 ; ============================================================
 ;  Module manifest — VoiceKit loads every file listed here.
 ;  "New Automation" appends new modules automatically.

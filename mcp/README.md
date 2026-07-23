@@ -1,27 +1,31 @@
 # VoiceKit MCP server
 
-Create VoiceKit automations from natural language. This is an **optional** add-on
-to VoiceKit: a [FastMCP](https://gofastmcp.com) server that exposes the same
-automation-creation the GUI does — launch macros, snippets, hotkey modules, and
-multi-step workflows — as MCP tools, so Claude (Desktop or Claude Code) can build
-them for you. The traditional recorder/scaffolder still work unchanged; this is a
-third path.
+Create **and trigger** VoiceKit automations from natural language. This is an
+**optional** add-on to VoiceKit: a [FastMCP](https://gofastmcp.com) server that
+exposes the same automation-creation the GUI does — launch macros, snippets,
+hotkey modules, multi-step workflows, and AI text actions — as MCP tools, and can
+run any of them the same way Voice Access does. The recorder/scaffolder still
+work unchanged; this is a third path.
 
 ## What it can do
 
 | Tool | Creates / does |
 |------|----------------|
-| `create_launch_macro` | A `macros\<Name>.ahk` + Start Menu shortcut → say "open \<name\>". Optional `ahk_body`. |
+| `create_launch_macro` | A `macros\<Name>.ahk` + Start Menu shortcut → say "open \<name\>". `opens` (no-code: app/file/folder/URL) or `ahk_body` (custom code). |
+| `create_ai_action` | A saved AI prompt with its own voice phrase (select text → say it → the answer replaces the selection). Opt-in OpenRouter layer; creating it makes no network calls. |
+| `update_ai_prompt` | Rewrite an existing AI action's prompt. |
 | `create_hotkey_module` | A `hotkeys\<Name>.ahk` on an auto-allocated `Ctrl+Alt+Shift+<key>`; returns the one-time Voice Access pairing steps. |
 | `create_snippet` | A hotstring in `Snippets.ahk` (e.g. `/addr` → your address). |
 | `create_workflow` | The recorder's output, **authored** instead of recorded: `workflows\<Name>.steps.txt` + generated stub + shortcut. |
-| `list_automations`, `read_workflow`, `get_bridge_map` | Inspect what exists. |
-| `run_workflow` | Run one now (drives the real desktop). |
-| `delete_automation` | Remove an automation and its artifacts. |
+| `list_automations`, `read_workflow`, `read_ai_prompt`, `get_bridge_map` | Inspect what exists (exact voice phrases, full AI prompts). |
+| `run_automation` | **Trigger** any spoken automation now — the MCP equivalent of "open \<name\>". `loop <name>` starts a workflow's loop companion (repeats until the user stops it). Optional `wait_seconds` to wait and report the outcome. |
+| `press_hotkey` | **Trigger** an always-on hotkey module by synthesizing its registered combo (bridge-map entries only; needs the resident VoiceKit running). |
+| `delete_automation` | Remove an automation and its artifacts (VoiceKit's own tools are protected). |
 
 Every generated `.ahk` is load-checked with AutoHotkey before it's kept; if it
 fails, nothing is written (snippets roll back). Hotkey/snippet changes reload the
-running VoiceKit automatically.
+running VoiceKit automatically. After updating the server, **restart your MCP
+client** (or the `voicekit` connection) so it picks up the new tool list.
 
 ## Setup
 
@@ -80,9 +84,25 @@ Claude calls `create_workflow` with typed steps; you then say **"open morning se
 { "type": "text",    "text": "hello" }
 { "type": "keys",    "keys": "^s" }
 { "type": "click",   "window": "Untitled - Notepad", "element": "File" }
+{ "type": "hover",   "window": "Untitled - Notepad", "element": "Format" }
 { "type": "move",    "window": "ahk_exe notepad.exe", "position": "left" }
 { "type": "close",   "window": "ahk_exe notepad.exe" }
 ```
+
+Workflows can also **branch** — deterministic state checks only (no pixel
+guessing), each `if` closed by an `endif`, `else` optional:
+
+```
+{ "type": "if",    "window": "ahk_exe notepad.exe", "condition": "winexists" }
+{ "type": "text",  "text": "already open" }
+{ "type": "else" }
+{ "type": "run",   "target": "notepad.exe" }
+{ "type": "endif" }
+```
+
+Conditions: `winexists` / `winnotexists` (is the window open) and
+`elementexists` / `elementnotexists` (is a named element on screen in it —
+set `element` too). Balance is validated at create time.
 
 ## Security
 
@@ -101,10 +121,19 @@ any program. That is VoiceKit's purpose — but exposing it over MCP means an
 - **The real risk is prompt injection (a confused-deputy).** If Claude is
   processing untrusted content (a web page, email, file) that hides an
   instruction like *"use voicekit to create a macro that runs …"*, it could
-  create a persistent payload. Note which tools execute **immediately**:
-  `create_hotkey_module` (reloads the resident master) and `run_workflow`
-  (runs on the desktop now). `create_launch_macro`, `create_workflow`, and
-  `create_snippet` only fire when later triggered.
+  create a persistent payload. Note which tools have an **immediate effect**:
+  `run_automation` (runs on the desktop now, including `loop <name>` runs),
+  `press_hotkey` (fires a registered combo now — it can only press combos
+  already in bridge-map.txt, never arbitrary keys), and everything that
+  reloads the resident master: `create_hotkey_module`, `create_snippet`
+  (the new hotstring is armed the moment it loads — it fires on ordinary
+  typing), and `delete_automation` for hotkeys/snippets. `create_launch_macro`,
+  `create_workflow`, and `create_ai_action` only fire when later triggered.
+- **AI actions and the network.** Creating or editing an AI action writes
+  only local files. When the *user* (or `run_automation`) later triggers it,
+  it sends the saved prompt plus the current selection/clipboard to
+  OpenRouter under the user's own key — same behavior as actions made in the
+  GUI. No key, no network.
 - **The load-check is not a safety check.** Generated scripts are `/validate`d
   so a broken one is rolled back — but that only proves it *loads*, not that
   it's *safe*. There is deliberately no allow/blocklist on AHK content; that
@@ -113,7 +142,7 @@ any program. That is VoiceKit's purpose — but exposing it over MCP means an
 **What you should do:**
 1. **Keep your MCP client's tool-approval prompts on** for `voicekit` — don't
    blanket-allow it. Review `create_*` arguments (especially `ahk_body` and
-   `run` targets) and `run_workflow` before approving.
+   `run` targets), `run_automation`, and `press_hotkey` before approving.
 2. **Don't use this server in sessions that ingest untrusted content** without
    watching the tool calls.
 3. **Don't put secrets in automations.** Created macros, `Snippets.ahk`, and

@@ -34,12 +34,15 @@ VOICE_MACROS = Path(os.environ.get(
                  "Start Menu", "Programs", "Voice Macros"),
 ))
 
-# Bridge-key pool from NewAutomation.ahk AllocateBridgeKey — E,N,R,X excluded.
-BRIDGE_POOL = "ABCDFGHIJKLMOPQSTUVWYZ0123456789"
+# Bridge-key pool from lib\_Common.ahk BridgeKeyPool — E,N,R,X,H excluded
+# (H is Workflow Studio's mark-hover key while recording).
+# (Companion hotkeys — hotkeys\<Base>.hotkey.ahk, assigned in the Voice Kit
+# home window — draw from the same pool via bridge-map.txt registration.)
+BRIDGE_POOL = "ABCDFGIJKLMOPQSTUVWYZ0123456789"
 
 # Step types from lib\Workflow.ahk WfRunStep.
 STEP_TYPES = ("run", "focus", "waitwin", "wait", "text", "keys",
-              "click", "dblclick", "rclick", "move", "close",
+              "click", "dblclick", "rclick", "hover", "move", "close",
               # Optional branching (engine executes these; recorder never emits them).
               # if|<window>|<element>|<condType> where condType is one of
               # winexists / winnotexists / elementexists / elementnotexists;
@@ -48,6 +51,24 @@ STEP_TYPES = ("run", "focus", "waitwin", "wait", "text", "keys",
 
 # Marker string that identifies a generated workflow stub (lib guards check it).
 STUDIO_MARKER = "Workflow Studio"
+
+# Companion-hotkey module suffix from lib\_Common.ahk HotkeyCompanionRel:
+# hotkeys\<Base>.hotkey.ahk is a keyboard trigger for macros\<Base>.ahk,
+# assigned in the home window. The suffix doubles as the marker (scaffolded
+# module names come from CleanPhrase and can never contain a dot).
+COMPANION_SUFFIX = ".hotkey.ahk"
+
+
+def _companion_rel(base: str) -> str:
+    """Repo-relative bridge-map FILE field of <base>'s companion module."""
+    return f"hotkeys\\{base}{COMPANION_SUFFIX}"
+
+
+def _companion_parent(relfile: str) -> str:
+    """Parent automation base for a bridge-map FILE field, or "" when the
+    file isn't a companion module (mirrors _Common.ahk HotkeyCompanionParent)."""
+    m = re.match(rf"(?i)^hotkeys\\(.+){re.escape(COMPANION_SUFFIX)}$", relfile)
+    return m.group(1) if m else ""
 
 
 class VoiceKitError(Exception):
@@ -86,6 +107,17 @@ def space_out(base: str) -> str:
     """SpaceOut: re-insert a space between a lowercase/digit and a following
     uppercase. 'OpenPublicUserFolder' -> 'Open Public User Folder'."""
     return re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", base).strip()
+
+
+def ahk_str_lit(s: str) -> str:
+    """macros\\NewAutomation.ahk AhkStrLit: render a value as an AutoHotkey v2
+    double-quoted string literal (backtick doubled, quote escaped, CR dropped,
+    LF -> `n)."""
+    s = s.replace("`", "``")
+    s = s.replace('"', '`"')
+    s = s.replace("\r", "")
+    s = s.replace("\n", "`n")
+    return '"' + s + '"'
 
 
 def wf_encode(s: str) -> str:
@@ -152,10 +184,16 @@ def log(text: str) -> None:
 
 
 def _read_template(name: str) -> str:
-    """Read a template, normalizing to LF regardless of the checkout's endings
-    (.gitattributes may make it CRLF on a fresh clone)."""
+    """Read a template PRESERVING its on-disk line endings. The AHK generators
+    fill templates with FileRead + StrReplace + FileAppend (no EOL translation),
+    so they emit whatever endings the template has on disk (CRLF on a normal
+    .gitattributes checkout). To stay byte-identical the writer must do the same
+    — do NOT normalize here. (An earlier version normalized to LF, so MCP-created
+    template macros came out LF while GUI-created ones were CRLF.) Content built
+    from Python string literals stays LF, matching AHK's backtick-n literals."""
     p = REPO_ROOT / "templates" / name
-    return p.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    with open(p, encoding="utf-8-sig", newline="") as f:
+        return f.read()
 
 
 # ---------------------------------------------------------------------------
@@ -213,17 +251,27 @@ def validate_ahk(path: str) -> tuple[bool, str]:
     return r.returncode == 0, (r.stdout or r.stderr or "").strip()
 
 
-def voicekit_running() -> bool:
-    """True if the resident VoiceKit master is running (matched by its command
-    line, so unrelated AutoHotkey scripts are ignored)."""
+def _ahk_script_running(script_name: str) -> bool:
+    """True if OUR interpreter (basename of AHK_EXE — honors the VOICEKIT_AHK
+    override, e.g. a UIA build) is running a script whose command line contains
+    `\\<script_name>`. The pattern is anchored on the path separator so a user
+    macro whose base merely ENDS in the name (RestartVoicekit.ahk vs
+    \\VoiceKit.ahk) never matches. `script_name` is a fixed literal from our own
+    code — never user input — so embedding it in the -like pattern is safe."""
+    exe = os.path.basename(AHK_EXE).replace("'", "''")
     cmd = ("Get-CimInstance Win32_Process | Where-Object { "
-           "$_.Name -eq 'AutoHotkey64.exe' -and $_.CommandLine -like '*VoiceKit.ahk*' "
+           "$_.Name -eq '" + exe + "' -and $_.CommandLine -like '*\\" + script_name + "*' "
            "} | Select-Object -First 1 | ForEach-Object { $_.ProcessId }")
     try:
         r = _run_powershell(cmd, check=False)
         return bool(r.stdout.strip())
     except Exception:
         return False
+
+
+def voicekit_running() -> bool:
+    """True if the resident VoiceKit master is running."""
+    return _ahk_script_running("VoiceKit.ahk")
 
 
 def reload_voicekit() -> bool:
@@ -269,6 +317,35 @@ def _launch_content(phrase: str, ahk_body: str | None) -> str:
         "\n"
         + ahk_body.strip("\n") + "\n"
     )
+
+
+def _opens_content(phrase: str, target: str) -> str:
+    """NewAutomation.ahk NewOpenSomething: the no-code 'Open Something' macro.
+    Keep the ';  Opens:  <target>' header line — the Voice Kit home window
+    parses it for the row's detail text."""
+    run_arg = f'"{target}"' if (" " in target and Path(target).exists()) else target
+    return (
+        "#Requires AutoHotkey v2.0\n"
+        "#SingleInstance Force\n"
+        "; ============================================================\n"
+        f";  {phrase}   (created {_today()})\n"
+        f';  Trigger by voice:  "open {phrase}"\n'
+        f";  Opens:  {target}\n"
+        ";\n"
+        ";  Created by New Automation — no code needed. To add steps,\n"
+        ";  edit below (building blocks: templates\\launch-template.ahk).\n"
+        "; ============================================================\n"
+        '#Include "%A_ScriptDir%\\..\\lib\\_Common.ahk"\n'
+        f"Run({ahk_str_lit(run_arg)})\n"
+    )
+
+
+def _ai_action_content(phrase: str, base: str) -> str:
+    """NewAutomation.ahk NewAIAction: fill templates\\ai-template.ahk."""
+    tpl = _read_template("ai-template.ahk")
+    return (tpl.replace("{{PHRASE}}", phrase)
+               .replace("{{BASE}}", base)
+               .replace("{{DATE}}", _today()))
 
 
 def _indent_body(ahk_body: str) -> str:
@@ -335,22 +412,114 @@ def steps_to_text(phrase: str, steps: list) -> str:
 # ---------------------------------------------------------------------------
 # Create
 # ---------------------------------------------------------------------------
-def create_launch_macro(name: str, ahk_body: str | None = None) -> dict:
+def _require_free_lnk(disp: str) -> Path:
+    """Refuse a voice phrase whose Start Menu entry already exists — creating it
+    would silently hijack another automation's phrase (NewAutomation checks the
+    same thing since the production review)."""
+    _ensure_voice_dir()
+    link = VOICE_MACROS / f"{disp}.lnk"
+    if link.exists():
+        raise VoiceKitError(
+            f'The voice phrase "open {disp}" is already taken by another Start Menu '
+            f"entry. Pick another name.")
+    return link
+
+
+def create_launch_macro(name: str, ahk_body: str | None = None,
+                        opens: str | None = None) -> dict:
+    """A standalone macro + Start Menu entry. Exactly one content source:
+    `opens` (the no-code 'Open Something' generator — app/file/folder/URL) or
+    `ahk_body` (custom AHK v2 code), or neither (placeholder template).
+    The .lnk is named SpaceOut(base) — the same name listing, Delete, and
+    first-run reinstall reconstruct — so they never drift (phrases with digits
+    don't round-trip otherwise)."""
+    if ahk_body and opens:
+        raise VoiceKitError("Give either 'opens' or 'ahk_body', not both.")
+    if opens is not None:
+        opens = opens.strip()
+        if not opens:
+            raise VoiceKitError("'opens' is empty — give an app, file, folder, or https:// URL "
+                                "(or use 'ahk_body' for custom code).")
+        # 'opens' is a single target, advertised as no-code data — a line break
+        # would escape the ';  Opens:' comment header and inject executable AHK.
+        if "\n" in opens or "\r" in opens:
+            raise VoiceKitError("'opens' can't contain line breaks — it names one thing to open. "
+                                "For multi-line code use 'ahk_body'.")
     phrase, base = _require_name(name)
     macro = REPO_ROOT / "macros" / f"{base}.ahk"
     if macro.exists():
         raise VoiceKitError(f"A macro named '{base}' already exists. Pick another name.")
-    _write_new(macro, _launch_content(phrase, ahk_body))
+    disp = space_out(base)
+    link = _require_free_lnk(disp)
+    content = _opens_content(phrase, opens) if opens else _launch_content(phrase, ahk_body)
+    _write_new(macro, content)
     ok, err = validate_ahk(str(macro))
     if not ok:
         macro.unlink(missing_ok=True)
         raise VoiceKitError(f"The generated macro failed to load, so nothing was kept:\n{err}")
-    _ensure_voice_dir()
-    link = VOICE_MACROS / f"{phrase}.lnk"
     make_shortcut(str(link), str(macro))
-    log(f"launch | {phrase} | macros\\{base}.ahk")
-    return {"type": "launch_macro", "phrase": phrase, "file": str(macro),
-            "shortcut": str(link), "voice_phrase": f"open {phrase}", "reloaded": False}
+    log(f"launch | {disp} | macros\\{base}.ahk" + (f" | opens {opens}" if opens else ""))
+    return {"type": "launch_macro", "phrase": disp, "file": str(macro),
+            "shortcut": str(link), "voice_phrase": f"open {disp}", "reloaded": False}
+
+
+def create_ai_action(name: str, prompt: str) -> dict:
+    """An AI text action (mirrors NewAutomation.ahk NewAIAction): the prompt is
+    saved to prompts\\<Base>.prompt.txt and the macro is templates\\ai-template.ahk
+    filled in. Select text anywhere, say 'open <name>' — the AI's answer replaces
+    it. Needs the user's OpenRouter key (AI Settings); creating the action never
+    calls the network."""
+    phrase, base = _require_name(name)
+    prompt = prompt.strip()
+    if not prompt:
+        raise VoiceKitError("The AI action needs a prompt — what should the AI do "
+                            "with the selected text?")
+    macro = REPO_ROOT / "macros" / f"{base}.ahk"
+    if macro.exists():
+        raise VoiceKitError(f"A macro named '{base}' already exists. Pick another name.")
+    disp = space_out(base)
+    link = _require_free_lnk(disp)
+    prompt_file = REPO_ROOT / "prompts" / f"{base}.prompt.txt"
+    _write_new(prompt_file, prompt + "\n")
+    _write_new(macro, _ai_action_content(phrase, base))
+    ok, err = validate_ahk(str(macro))
+    if not ok:
+        macro.unlink(missing_ok=True)
+        prompt_file.unlink(missing_ok=True)
+        raise VoiceKitError(f"The generated AI action failed to load, so nothing was kept:\n{err}")
+    make_shortcut(str(link), str(macro))
+    log(f"ai-action | {disp} | macros\\{base}.ahk")
+    return {"type": "ai_action", "phrase": disp, "file": str(macro),
+            "prompt_file": str(prompt_file), "shortcut": str(link),
+            "voice_phrase": f"open {disp}",
+            "note": "Runs on the user's selected text; needs their OpenRouter key "
+                    "(home window -> AI Settings) the first time."}
+
+
+def read_ai_prompt(name: str) -> dict:
+    """The full current prompt of an AI action (list_automations only previews
+    the first 120 characters — read before rewriting)."""
+    base = to_base(clean_phrase(name))
+    prompt_file = REPO_ROOT / "prompts" / f"{base}.prompt.txt"
+    if not prompt_file.exists():
+        raise VoiceKitError(f"No AI action named '{base}' (looked for {prompt_file.name}).")
+    return {"type": "ai_action", "base": base, "name": space_out(base),
+            "prompt_file": str(prompt_file),
+            "prompt": prompt_file.read_text(encoding="utf-8-sig", errors="replace").strip()}
+
+
+def update_ai_prompt(name: str, prompt: str) -> dict:
+    """Rewrite an existing AI action's prompt (the macro itself is untouched).
+    Returns the previous prompt so an unwanted overwrite can be undone."""
+    prev = read_ai_prompt(name)          # same resolution + not-found error
+    prompt = prompt.strip()
+    if not prompt:
+        raise VoiceKitError("The new prompt can't be empty.")
+    _write_new(Path(prev["prompt_file"]), prompt + "\n")
+    log(f"ai-prompt updated | {prev['base']}")
+    return {"type": "ai_action", "base": prev["base"], "prompt_file": prev["prompt_file"],
+            "previous_prompt": prev["prompt"],
+            "note": "Applies the next time the action runs."}
 
 
 def create_hotkey_module(name: str, ahk_body: str | None = None) -> dict:
@@ -393,11 +562,17 @@ def create_snippet(abbrev: str, expansion: str) -> dict:
     if not abbrev or ":" in abbrev:
         raise VoiceKitError("The abbreviation can't be empty or contain a colon (:) — "
                             "a colon breaks the hotstring format and would disable every snippet.")
+    if expansion.strip() == "{":
+        raise VoiceKitError("The expansion can't be just '{' — that's code-block syntax "
+                            "in the snippets file (it would break loading entirely).")
     snip = REPO_ROOT / "hotkeys" / "Snippets.ahk"
     existing = snip.read_text(encoding="utf-8-sig", errors="replace") if snip.exists() else ""
-    if f":{abbrev}::" in existing:
+    # Case-insensitive like the GUI (and like AHK hotstring firing itself):
+    # a case-differing duplicate would load fine but never fire (shadowed).
+    if re.search(rf"^:[^:]*:{re.escape(abbrev)}::", existing, re.MULTILINE | re.IGNORECASE):
         raise VoiceKitError(f"A snippet for '{abbrev}' already exists. Delete it first to change it.")
     exp = expansion.replace("`", "``")          # escape literal backticks (AHK escape char)
+    exp = exp.replace(";", "`;")                # a bare ; would start a comment mid-line
     exp = exp.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "`n")  # multi-line -> `n
     orig_size = snip.stat().st_size if snip.exists() else 0
     _append(snip, f"\n:*:{abbrev}::{exp}")
@@ -471,38 +646,94 @@ def create_workflow(name: str, steps: list) -> dict:
 # ---------------------------------------------------------------------------
 # Read / list
 # ---------------------------------------------------------------------------
-_BUILTINS = {"NewAutomation", "WorkflowStudio", "VoiceKitHelp"}
+# VoiceKit's own tools: listed separately, never deletable through MCP.
+_BUILTINS = {"NewAutomation", "WorkflowStudio", "VoiceKitHelp", "VoiceKitHome", "AskAI"}
+# Deletion guard compares case-insensitively: spoken names round-trip through
+# CleanPhrase's Title Case ("Ask AI" -> base "AskAi"), and NTFS would happily
+# match AskAi.ahk to AskAI.ahk — an exact-case check would not protect it.
+_BUILTINS_LOWER = {b.lower() for b in _BUILTINS}
 
 
 def list_automations() -> dict:
+    """Everything sayable/typable, in the same categories the Voice Kit home
+    window shows: workflows (+ loop phrase), launch macros (+ what they open),
+    AI actions (+ prompt preview), hotkey modules (+ combo), snippets
+    (+ expansion), and VoiceKit's own tools. An automation the user gave a
+    companion hotkey (the home window's Hotkey button) carries it as
+    "hotkey" on its own entry — the companion module isn't listed twice."""
+    combos = {e["file"]: e for e in get_bridge_map()["entries"]}
+    # Companion hotkeys fold into their automation's entry (mirrors the
+    # home window) instead of listing as modules of their own.
+    companion_combo = {}
+    for file, e in combos.items():
+        parent = _companion_parent(file)
+        if parent:
+            companion_combo[parent.lower()] = e["combo"]
+
+    def _with_hotkey(entry: dict) -> dict:
+        combo = companion_combo.get(entry["base"].lower())
+        if combo:
+            entry["hotkey"] = combo
+        return entry
+
     macros_dir = REPO_ROOT / "macros"
-    launch, workflows = [], []
+    launch, workflows, ai_actions, tools = [], [], [], []
     for f in sorted(macros_dir.glob("*.ahk")):
         base = f.stem
+        disp = space_out(base)
         txt = f.read_text(encoding="utf-8-sig", errors="replace")
-        entry = {"name": space_out(base), "base": base, "file": str(f),
-                 "builtin": base in _BUILTINS}
+        if base in _BUILTINS:
+            say = "open voice kit" if base == "VoiceKitHome" else f"open {disp}"
+            tools.append(_with_hotkey(
+                {"name": disp, "base": base, "voice_phrase": say, "file": str(f)}))
+            continue
         if STUDIO_MARKER in txt:
-            workflows.append(entry)
-        else:
-            launch.append(entry)
+            workflows.append(_with_hotkey(
+                {"name": disp, "base": base, "file": str(f),
+                 "voice_phrase": f"open {disp}",
+                 "loop_voice_phrase": f"open loop {disp}"}))
+            continue
+        prompt_file = REPO_ROOT / "prompts" / f"{base}.prompt.txt"
+        if prompt_file.exists():
+            preview = prompt_file.read_text(encoding="utf-8-sig", errors="replace").strip()
+            ai_actions.append(_with_hotkey(
+                {"name": disp, "base": base, "file": str(f),
+                 "voice_phrase": f"open {disp}",
+                 "prompt_preview": preview[:120]}))
+            continue
+        entry = {"name": disp, "base": base, "file": str(f),
+                 "voice_phrase": f"open {disp}"}
+        m = re.search(r"^;\s+Opens:\s+(.+)$", txt, re.MULTILINE)
+        if m:
+            entry["opens"] = m.group(1).strip()
+        launch.append(_with_hotkey(entry))
 
     hotkeys = []
     for f in sorted((REPO_ROOT / "hotkeys").glob("*.ahk")):
         if f.stem in ("_index", "Snippets"):
             continue
-        hotkeys.append({"name": space_out(f.stem), "base": f.stem, "file": str(f)})
+        if f.name.lower().endswith(COMPANION_SUFFIX):
+            continue    # a companion — already folded into its automation above
+        entry = {"name": space_out(f.stem), "base": f.stem, "file": str(f)}
+        bm = combos.get(f"hotkeys\\{f.stem}.ahk")
+        if bm:
+            entry["combo"] = bm["combo"]
+            entry["voice_phrase"] = bm["phrase"]
+        hotkeys.append(entry)
 
     snippets = []
     snip = REPO_ROOT / "hotkeys" / "Snippets.ahk"
     if snip.exists():
         for line in snip.read_text(encoding="utf-8-sig", errors="replace").splitlines():
-            m = re.match(r"^:[^:]*:([^:]+)::", line.strip())
+            m = re.match(r"^:\*?[^:]*:(.+?)::(.*)$", line.strip())
             if m:
-                snippets.append(m.group(1))
+                exp = m.group(2).strip()
+                snippets.append({"abbrev": m.group(1),
+                                 "dynamic": exp in ("{", ""),
+                                 "expansion_preview": "" if exp in ("{", "") else exp[:80]})
 
-    return {"launch_macros": launch, "workflows": workflows,
-            "hotkey_modules": hotkeys, "snippets": snippets}
+    return {"workflows": workflows, "launch_macros": launch, "ai_actions": ai_actions,
+            "hotkey_modules": hotkeys, "snippets": snippets, "voicekit_tools": tools}
 
 
 def read_workflow(name: str) -> dict:
@@ -533,31 +764,144 @@ def get_bridge_map() -> dict:
             line = line.strip()
             if not line or line.startswith(";"):
                 continue
-            parts = line.split("|")
+            # Trim each field like the GUI does (VoiceKitHome.ahk) — the file is
+            # the user's hand-maintained recreate list, so padded fields happen.
+            parts = [p.strip() for p in line.split("|")]
             if len(parts) >= 3:
                 entries.append({"combo": parts[0], "phrase": parts[1], "file": parts[2],
                                 "created": parts[3] if len(parts) > 3 else ""})
     used = {e["combo"].rsplit("+", 1)[-1] for e in entries}
     free = [k for k in BRIDGE_POOL if k not in used]
-    return {"entries": entries, "free_keys": free, "reserved_keys": ["E", "N", "R", "X"]}
+    return {"entries": entries, "free_keys": free, "reserved_keys": ["E", "N", "R", "X", "H"]}
 
 
 # ---------------------------------------------------------------------------
-# Run / delete
+# Run / trigger / delete
 # ---------------------------------------------------------------------------
-def run_workflow(name: str) -> dict:
-    base = to_base(clean_phrase(name))
+def run_automation(name: str, wait_seconds: int = 0) -> dict:
+    """Trigger any spoken automation (workflow, launch macro, AI action, or
+    VoiceKit tool) by launching its macro — the same thing Voice Access does
+    when the user says 'open <name>'. A 'loop <name>' phrase starts a workflow's
+    loop companion (repeats until stopped — the floating Stop Looping button,
+    Ctrl+Alt+Shift+X, or a failing step). With wait_seconds > 0, waits that long
+    for the script to finish and reports how it went; otherwise fire-and-forget."""
+    phrase = clean_phrase(name)
+    base = to_base(phrase)
     macro = REPO_ROOT / "macros" / f"{base}.ahk"
-    if not macro.exists():
-        raise VoiceKitError(f"No macro named '{base}' to run.")
-    subprocess.Popen([AHK_EXE, str(macro)])
-    return {"launched": space_out(base), "file": str(macro),
-            "note": "Running on the desktop now; a failing step shows a popup naming it."}
+    if macro.exists():
+        # Workflow Studio is #SingleInstance Force: relaunching it would kill an
+        # open session and lose unsaved recorded steps (the GUI's OpenStudioSafely
+        # guards this; do the same headlessly by refusing rather than clobbering).
+        if base.lower() == "workflowstudio" and _ahk_script_running("WorkflowStudio.ahk"):
+            raise VoiceKitError("Workflow Studio is already open — launching it again would discard "
+                                "any unsaved recorded steps. Ask the user to save or close it first.")
+        return _launch_and_report([AHK_EXE, str(macro)], space_out(base), str(macro), wait_seconds)
+    # 'loop <name>': the workflow's loop companion (same target as its
+    # 'loop <name>.lnk' — lib\LoopRunner.ahk resolves the steps file itself).
+    if phrase.lower().startswith("loop "):
+        wf_base = to_base(phrase[5:])
+        if (REPO_ROOT / "workflows" / f"{wf_base}.steps.txt").exists():
+            r = _launch_and_report(
+                [AHK_EXE, str(REPO_ROOT / "lib" / "LoopRunner.ahk"), wf_base],
+                f"loop {space_out(wf_base)}", str(REPO_ROOT / "lib" / "LoopRunner.ahk"),
+                wait_seconds)
+            if not r.get("finished"):
+                r["note"] = ("Looping until stopped — the floating Stop Looping button, "
+                             "saying 'click stop looping', or Ctrl+Alt+Shift+X ends it; "
+                             "it also stops itself if a step fails.")
+            return r
+        raise VoiceKitError(f"No workflow named '{wf_base}' to loop — "
+                            f"list_automations shows what exists.")
+    raise VoiceKitError(f"No automation named '{base}' to run — "
+                        f"list_automations shows what exists.")
+
+
+def _launch_and_report(cmd: list, launched: str, file: str, wait_seconds: int) -> dict:
+    proc = subprocess.Popen(cmd)
+    result = {"launched": launched, "file": file}
+    if wait_seconds > 0:
+        try:
+            rc = proc.wait(timeout=wait_seconds)
+            result["finished"] = True
+            result["exit_code"] = rc
+            result["note"] = ("Finished cleanly." if rc == 0 else
+                              f"Exited with code {rc} — something in it failed.")
+        except subprocess.TimeoutExpired:
+            result["finished"] = False
+            result["note"] = (f"Still running after {wait_seconds}s — a long automation, "
+                              "a window it's waiting for, or a failing step showing its popup.")
+    else:
+        result["finished"] = False
+        result["note"] = "Running on the desktop now; a failing step shows a popup naming it."
+    return result
+
+
+def _run_inline_ahk(script: str, timeout: int = 15) -> None:
+    """Run a short throwaway AHK v2 script via stdin (AutoHotkey's `*` mode) —
+    no temp files."""
+    subprocess.run([AHK_EXE, "/ErrorStdOut", "*"], input=script,
+                   capture_output=True, text=True, timeout=timeout, check=True)
+
+
+def resolve_bridge(name_or_key: str) -> dict:
+    """Find a bridge-map entry by voice phrase, module name, or bare key
+    (e.g. 'Toggle Timer', 'ToggleTimer', or 'A'). Raises if there's no match.
+
+    Matches in PRECEDENCE order — exact phrase, then module base, then bare key
+    letter — across all entries, so a coincidental single-letter key match never
+    beats an entry whose actual phrase/name equals the input."""
+    entries = get_bridge_map()["entries"]
+    want = name_or_key.strip()
+    want_base = to_base(clean_phrase(want))
+
+    def rows():
+        for e in entries:
+            key = e["combo"].rsplit("+", 1)[-1]
+            mod_base = re.sub(r"^hotkeys\\|\.ahk$", "", e["file"])
+            yield e, key, mod_base
+
+    for match in (
+        lambda e, key, mb: want.lower() == e["phrase"].lower(),
+        lambda e, key, mb: want_base and want_base.lower() == mb.lower(),
+        lambda e, key, mb: len(want) == 1 and want.upper() == key.upper(),
+    ):
+        for e, key, mb in rows():
+            if match(e, key, mb):
+                return {"combo": e["combo"], "phrase": e["phrase"], "key": key, "module": e["file"]}
+    raise VoiceKitError(f"No hotkey module matches '{name_or_key}' — "
+                        f"get_bridge_map shows what exists.")
+
+
+def press_hotkey(name_or_key: str) -> dict:
+    """Trigger an always-on hotkey module by synthesizing its Ctrl+Alt+Shift
+    combo (SendLevel 1, so VoiceKit's hook hotkeys hear it — the same way the
+    home window's Run button does it). Only combos registered in bridge-map.txt
+    can be pressed. Requires the resident VoiceKit master to be running."""
+    hit = resolve_bridge(name_or_key)
+    # The key comes from bridge-map.txt (rsplit on '+'). Even though the file is
+    # ours, constrain it to a single alphanumeric before it enters an executed
+    # Send string — a tampered/garbled combo field must never inject keystrokes.
+    if not re.fullmatch(r"[A-Za-z0-9]", hit["key"]):
+        raise VoiceKitError(f"Refusing to press a malformed bridge key '{hit['key']}' "
+                            f"(from {hit['combo']}). Check bridge-map.txt.")
+    if not voicekit_running():
+        raise VoiceKitError(
+            "VoiceKit isn't running, so its hotkeys aren't registered — pressing "
+            f"{hit['combo']} would do nothing. Start VoiceKit first (VoiceKit.ahk).")
+    _run_inline_ahk(
+        "#Requires AutoHotkey v2.0\n"
+        "SendLevel 1\n"
+        f'Send "^!+{hit["key"].lower()}"\n'
+        "Sleep 150\n"
+        "ExitApp\n")
+    return {"pressed": hit["combo"], "phrase": hit["phrase"], "module": hit["module"],
+            "note": "The combo was sent; the module's action ran in the resident VoiceKit."}
 
 
 def _remove_matching_lines(path: Path, predicate) -> int:
     """Rewrite a file (no BOM, LF) dropping lines for which predicate(line) is
-    True. Returns the number removed."""
+    True. Returns the number removed; the file is left untouched when nothing
+    matched (no churn on unrelated deletes)."""
     if not path.exists():
         return 0
     text = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -567,55 +911,128 @@ def _remove_matching_lines(path: Path, predicate) -> int:
             removed += 1
         else:
             kept.append(line)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write("\n".join(kept))
+    if removed:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("\n".join(kept))
     return removed
 
 
+def _remove_companion_hotkey(base: str, result: dict) -> None:
+    """The home window's Hotkey button can give any automation a companion
+    Ctrl+Alt+Shift key: hotkeys\\<Base>.hotkey.ahk, registered in _index.ahk and
+    bridge-map.txt. Deleting the automation must retire all three (mirroring the
+    GUI's delete parity), or a live key keeps pointing at a ghost and its bridge
+    key stays allocated forever."""
+    module = REPO_ROOT / _companion_rel(base)
+    existed = module.exists()
+    if existed:
+        module.unlink()
+        result["removed"].append(str(module))
+    rel = _companion_rel(base)
+    n = _remove_matching_lines(REPO_ROOT / "hotkeys" / "_index.ahk",
+                               lambda ln: rel in ln)
+    n += _remove_matching_lines(REPO_ROOT / "bridge-map.txt",
+                                lambda ln: f"|{rel}|" in ln)
+    if existed or n:
+        result["reloaded"] = reload_voicekit()   # so the key stops working now
+
+
 def delete_automation(name: str, type: str) -> dict:
-    """Remove an automation and its artifacts. `type` is one of
-    launch_macro | workflow | hotkey_module | snippet."""
+    """Remove an automation and its artifacts (including a companion hotkey
+    assigned in the home window). `type` is one of
+    launch_macro | workflow | hotkey_module | snippet | ai_action."""
     result = {"type": type, "removed": []}
 
     if type == "snippet":
         abbrev = re.sub(r"\s", "", name.strip())
         snip = REPO_ROOT / "hotkeys" / "Snippets.ahk"
-        n = _remove_matching_lines(snip, lambda ln: re.match(rf"^:[^:]*:{re.escape(abbrev)}::", ln.strip()) is not None)
-        if not n:
+        text = snip.read_text(encoding="utf-8-sig", errors="replace") if snip.exists() else ""
+        # Case-insensitive like the GUI (hotstrings themselves fire caselessly).
+        pat = re.compile(rf"^:[^:]*:{re.escape(abbrev)}::(.*)$", re.IGNORECASE)
+        matches = [m for m in (pat.match(ln.strip()) for ln in text.split("\n")) if m]
+        if not matches:
             raise VoiceKitError(f"No snippet '{abbrev}' found.")
+        # A code-block snippet's line is ':*:abbrev:: {' — removing just that
+        # line orphans the block, Snippets.ahk stops loading, and the reload
+        # below would take down EVERY hotkey and snippet. Refuse, like Home does.
+        if any(m.group(1).strip() in ("{", "") for m in matches):
+            raise VoiceKitError(
+                f"'{abbrev}' is a code-block (dynamic) snippet — deleting its line would break "
+                f"Snippets.ahk and every hotkey with it. Edit hotkeys\\Snippets.ahk by hand "
+                f"and remove the whole block instead.")
+        orig_bytes = snip.read_bytes()
+        _remove_matching_lines(snip, lambda ln: pat.match(ln.strip()) is not None)
+        ok, err = validate_ahk(str(snip))
+        if not ok:
+            snip.write_bytes(orig_bytes)        # roll back — never reload a broken file
+            raise VoiceKitError(f"Removing '{abbrev}' would break Snippets.ahk, so it was "
+                                f"rolled back:\n{err}")
         result["removed"].append(f"snippet {abbrev}")
         result["reloaded"] = reload_voicekit()
         log(f"deleted snippet | {abbrev}")
         return result
 
     base = to_base(clean_phrase(name))
+    if base.lower() in _BUILTINS_LOWER:
+        raise VoiceKitError(f"'{base}' is part of VoiceKit itself and can't be deleted.")
 
     if type == "hotkey_module":
         module = REPO_ROOT / "hotkeys" / f"{base}.ahk"
-        if module.exists():
+        existed = module.exists()
+        if existed:
             module.unlink()
             result["removed"].append(str(module))
-        _remove_matching_lines(REPO_ROOT / "hotkeys" / "_index.ahk",
-                               lambda ln: f"hotkeys\\{base}.ahk" in ln)
-        _remove_matching_lines(REPO_ROOT / "bridge-map.txt",
-                               lambda ln: f"|hotkeys\\{base}.ahk|" in ln)
+        n = _remove_matching_lines(REPO_ROOT / "hotkeys" / "_index.ahk",
+                                   lambda ln: f"hotkeys\\{base}.ahk" in ln)
+        n += _remove_matching_lines(REPO_ROOT / "bridge-map.txt",
+                                    lambda ln: f"|hotkeys\\{base}.ahk|" in ln)
+        if not existed and n == 0:
+            raise VoiceKitError(f"No hotkey module '{base}' found — nothing was deleted.")
         result["reloaded"] = reload_voicekit()
         log(f"deleted hotkey | {base}")
         return result
 
     if type == "workflow":
         steps_file = REPO_ROOT / "workflows" / f"{base}.steps.txt"
+        macro = REPO_ROOT / "macros" / f"{base}.ahk"
+        is_stub = macro.exists() and STUDIO_MARKER in macro.read_text(encoding="utf-8-sig",
+                                                                      errors="replace")
+        # Cross-guard BEFORE touching anything: a same-named launch macro / AI
+        # action must not lose its Start Menu shortcut to a mistyped `type`.
+        if macro.exists() and not is_stub:
+            hint = ("ai_action" if (REPO_ROOT / "prompts" / f"{base}.prompt.txt").exists()
+                    else "launch_macro")
+            raise VoiceKitError(f"'{base}' isn't a workflow — delete it with type='{hint}'.")
+        if not steps_file.exists() and not is_stub:
+            raise VoiceKitError(f"No workflow named '{base}' found — nothing was deleted.")
         if steps_file.exists():
             steps_file.unlink()
             result["removed"].append(str(steps_file))
-        macro = REPO_ROOT / "macros" / f"{base}.ahk"
-        if macro.exists() and STUDIO_MARKER in macro.read_text(encoding="utf-8-sig", errors="replace"):
+        if is_stub:
             macro.unlink()
             result["removed"].append(str(macro))
         disp = space_out(base)
         _delete_lnk(disp, result)
         _delete_lnk(f"loop {disp}", result)      # companion loop entry
+        _remove_companion_hotkey(base, result)   # companion hotkey, if assigned
         log(f"deleted workflow | {disp}")
+        return result
+
+    if type == "ai_action":
+        macro = REPO_ROOT / "macros" / f"{base}.ahk"
+        prompt_file = REPO_ROOT / "prompts" / f"{base}.prompt.txt"
+        if not macro.exists() and not prompt_file.exists():
+            raise VoiceKitError(f"No AI action '{base}' found.")
+        if macro.exists():
+            macro.unlink()
+            result["removed"].append(str(macro))
+        if prompt_file.exists():
+            prompt_file.unlink()
+            result["removed"].append(str(prompt_file))
+        for nm in {clean_phrase(name), space_out(base)}:
+            _delete_lnk(nm, result)
+        _remove_companion_hotkey(base, result)
+        log(f"deleted ai-action | {base}")
         return result
 
     if type == "launch_macro":
@@ -625,11 +1042,15 @@ def delete_automation(name: str, type: str) -> dict:
         if STUDIO_MARKER in macro.read_text(encoding="utf-8-sig", errors="replace"):
             raise VoiceKitError(f"'{base}' is a workflow, not a launch macro — "
                                 f"delete it with type='workflow'.")
+        if (REPO_ROOT / "prompts" / f"{base}.prompt.txt").exists():
+            raise VoiceKitError(f"'{base}' is an AI action — delete it with "
+                                f"type='ai_action' so its prompt file goes too.")
         macro.unlink()
         result["removed"].append(str(macro))
         # Launch shortcut may be named by phrase or SpaceOut(base); try both.
         for nm in {clean_phrase(name), space_out(base)}:
             _delete_lnk(nm, result)
+        _remove_companion_hotkey(base, result)
         log(f"deleted launch | {base}")
         return result
 

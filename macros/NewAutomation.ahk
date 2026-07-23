@@ -266,8 +266,8 @@ NewSnippet(root, masterPath) {
     edAbbrev := d.AddEdit("xm y+4 w200")
     exA := d.AddText("xm y+3 w480", "Example:  /sig    (a / prefix avoids firing by accident)")
     d.AddText("xm y+14", "Expands to:")
-    edText := d.AddEdit("xm y+4 w480")
-    exB := d.AddText("xm y+3 w480", "Typing the abbreviation anywhere replaces it with this text, instantly.")
+    edText := d.AddEdit("xm y+4 w480 r6 +Wrap")
+    exB := d.AddText("xm y+3 w480", "Typing the abbreviation anywhere replaces it with this text. Press Enter for line breaks — it expands to as many lines as you type.")
     btnOK := d.AddButton("xm y+18 w150 h36 Default", "Create")
     btnCancel := d.AddButton("x+8 w110 h36", "Cancel")
 
@@ -279,7 +279,7 @@ NewSnippet(root, masterPath) {
             return
         }
         expansion := edText.Value
-        if (expansion = "") {
+        if (Trim(expansion, " `t`r`n") = "") {
             MsgBox("Give it the text to expand into.", "New Automation", "Icon! Owner" d.Hwnd)
             return
         }
@@ -298,8 +298,7 @@ NewSnippet(root, masterPath) {
                 }
             }
         }
-        expansion := StrReplace(expansion, "``", "````")   ; escape literal backticks
-        expansion := StrReplace(expansion, ";", "``;")     ; a bare ; would start a comment
+        expansion := SnipEncode(expansion)                 ; multi-line -> `n; escape ` and ;
         FileAppend("`n:*:" abbrev "::" expansion, snipFile, "UTF-8")
         RunAhk(masterPath)               ; reload VoiceKit so it works immediately
         Log(root, "snippet | " abbrev)
@@ -471,6 +470,7 @@ DraftSystemPrompt() {
         . "- text: a = text to type into the focused window.`n"
         . "- keys: a = keys in AutoHotkey v2 Send syntax, e.g. {Enter}, {Tab 2}, ^s.`n"
         . "- click / dblclick / rclick: a = window; b = the EXACT on-screen name of the thing to click (button caption, link text, menu item).`n"
+        . "- hover: a = window; b = the on-screen name to rest the mouse over (moves there and pauses so a hover menu/tooltip appears; follow with a click on what it reveals).`n"
         . "- move: a = window; b = one of left, right, top, bottom, max.`n"
         . "- close: a = window to close.`n"
         . '- if: a = window; b = element name ("" unless the condition checks an element); c = one of winexists, winnotexists, elementexists, elementnotexists.' "`n"
@@ -514,7 +514,7 @@ ParseDraftInner(raw, &perr) {
         return ""
     }
     validTypes := Map("run",1, "focus",1, "waitwin",1, "wait",1, "text",1, "keys",1,
-        "click",1, "dblclick",1, "rclick",1, "move",1, "close",1, "if",1, "else",1, "endif",1)
+        "click",1, "dblclick",1, "rclick",1, "hover",1, "move",1, "close",1, "if",1, "else",1, "endif",1)
     validConds := Map("winexists",1, "winnotexists",1, "elementexists",1, "elementnotexists",1)
     steps := []
     for i, el in arr {
@@ -541,8 +541,8 @@ ParseDraftInner(raw, &perr) {
                 perr := "Draft step " i " has a bad if-condition ('" c "')"
                 return ""
             }
-        } else if (t != "click" && t != "dblclick" && t != "rclick")
-            c := ""                       ; paramC is only meaningful for if + click steps
+        } else if (t != "click" && t != "dblclick" && t != "rclick" && t != "hover")
+            c := ""                       ; paramC is only meaningful for if + click/hover steps
         steps.Push([t, a, b, c])
     }
     if (berr := DraftBalanceError(steps)) {
@@ -687,8 +687,7 @@ NewHotkeyModule(root, masterPath) {
             FileAppend(content, newFile, "UTF-8")
         }
 
-        FileAppend('`n#Include "%A_ScriptDir%\hotkeys\' nm.fileBase '.ahk"', root "\hotkeys\_index.ahk", "UTF-8")
-        FileAppend("Ctrl+Alt+Shift+" key "|" nm.phrase "|hotkeys\" nm.fileBase ".ahk|" FormatTime(A_Now, "yyyy-MM-dd") "`n", mapFile, "UTF-8")
+        BridgeRegisterModule(root, key, nm.phrase, "hotkeys\" nm.fileBase ".ahk")
         RunAhk(masterPath)               ; reload VoiceKit so the hotkey is live now
         Log(root, "hotkey | " nm.phrase " | Ctrl+Alt+Shift+" key " | hotkeys\" nm.fileBase ".ahk")
         if rCode.Value
@@ -726,14 +725,10 @@ PairingDialog(phrase, key) {
     ShowModal(d, [lead, tail])
 }
 
-; E, N, R are VoiceKit's own hotkeys; X is Workflow Studio's
-; stop-recording key.
+; First free key from the shared pool (lib\_Common.ahk BridgeKeyPool —
+; E, N, R, X reserved; companion hotkeys assigned in Voice Kit draw
+; from the same pool, so the registry keeps everyone honest).
 AllocateBridgeKey(mapFile) {
-    pool := "ABCDFGHIJKLMOPQSTUVWYZ0123456789"
-    used := FileExist(mapFile) ? FileRead(mapFile, "UTF-8") : ""
-    Loop Parse pool {
-        if !InStr(used, "Ctrl+Alt+Shift+" A_LoopField "|")
-            return A_LoopField
-    }
-    return ""
+    free := BridgeFreeKeys(mapFile)
+    return free.Length ? free[1] : ""
 }

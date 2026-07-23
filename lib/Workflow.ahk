@@ -224,6 +224,33 @@ WfRunStep(s) {
             WinGetPos(&wx, &wy, , , a)
             MouseClick(btn, wx + Trim(xy[1]), wy + Trim(xy[2]), n)
             Sleep(150)
+        case "hover":
+            ; a = window, b = element name (may be ""), c = "x,y" window-relative
+            ; fallback. Move the pointer there and dwell so hover-triggered UI
+            ; (submenus, tooltips) has time to appear; the next step acts on it.
+            if (!WinExist(a) && !WinWait(a, , 10))   ; same grace as click/focus
+                return "Window not found: " a
+            WinActivate(a)
+            Sleep(400)
+            CoordMode("Mouse", "Screen")
+            if (b != "") {
+                loc := AccFindByName(WinExist(a), b)
+                if IsObject(loc) {
+                    MouseMove(loc.x + loc.w // 2, loc.y + loc.h // 2, 0)
+                    Sleep(700)                       ; dwell so the hover registers
+                    return ""
+                }
+                if (c = "")
+                    return "Couldn't find anything named `"" b "`" to hover over in that window."
+            }
+            if (c = "")
+                return "Nothing to hover over — no element name and no recorded position."
+            xy := StrSplit(c, ",")
+            if (xy.Length != 2 || !IsInteger(Trim(xy[1])) || !IsInteger(Trim(xy[2])))
+                return "Bad hover position: " c
+            WinGetPos(&wx, &wy, , , a)
+            MouseMove(wx + Trim(xy[1]), wy + Trim(xy[2]), 0)
+            Sleep(700)
         case "move":
             if !WinExist(a)
                 return "Window not found: " a
@@ -269,6 +296,7 @@ WfDesc(s) {
         case "click":    return "Click  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a
         case "dblclick": return "Double-click  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a
         case "rclick":   return "Right-click  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a
+        case "hover":    return "Hover over  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a
         case "move":     return "Position  " a "  ->  " b
         case "close":    return "Close  " a
         case "if":       return "If  " WfCondDesc(c, a, b)     ; a=window, b=element, c=condType

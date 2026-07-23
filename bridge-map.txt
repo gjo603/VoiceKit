@@ -1,10 +1,14 @@
-; VoiceKit bridge map — phrase <-> hotkey registry.
-; Managed by "New Automation". Do not edit unless freeing a key.
+﻿; VoiceKit bridge map — phrase <-> hotkey registry.
+; Managed by "New Automation" and Voice Kit (the Hotkey button).
+; Do not edit unless freeing a key.
 ;
 ; This file is also your RECREATE LIST: Voice Access shortcuts
 ; are stored per-machine with no backup, export, or sync. After
 ; a reinstall or on a new PC, recreate each voice shortcut below
 ; (say "show voice shortcuts" -> Create new shortcut).
+; EXCEPTION: lines whose FILE ends in .hotkey.ahk are companion
+; hotkeys (a keyboard trigger for a voice automation, assigned in
+; Voice Kit) — they need NO Voice Access shortcut.
 ;
 ; Format: KEYCOMBO|PHRASE|FILE|CREATED
 Ctrl+Alt+Shift+A|Toggle Timer|hotkeys\ToggleTimer.ahk|2026-07-07

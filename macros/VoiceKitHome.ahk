@@ -28,28 +28,30 @@ g.MarginX := 20, g.MarginY := 16
 g.SetFont("s16 bold")
 g.AddText("xm", "VoiceKit")
 g.SetFont("s10 norm")
-tagline := g.AddText("xm y+2 w700", "Everything you can say, in one place.")
+tagline := g.AddText("xm y+2 w760", "Everything you can say, in one place.")
 
-edSearch := g.AddEdit("xm y+14 w700")
+edSearch := g.AddEdit("xm y+14 w760")
 SendMessage(0x1501, 1, StrPtr("Search your automations…"), edSearch.Hwnd)   ; EM_SETCUEBANNER
 
-lv := g.AddListView("xm y+10 w700 r15 -Multi Grid NoSortHdr NoSort", ["Say this", "Type", "Details"])
+lv := g.AddListView("xm y+10 w760 r15 -Multi Grid NoSortHdr NoSort", ["Say this", "Type", "Hotkey", "Details"])
 
 g.SetFont("s10")
-btnRun  := g.AddButton("xm y+12 w110 h34", "▶  Run")
-btnEdit := g.AddButton("x+6 w110 h34", "✎  Edit")
-btnDel  := g.AddButton("x+6 w120 h34", "✕  Delete")
-btnNew  := g.AddButton("x+24 w190 h34 Default", "＋  New Automation")
-btnAI   := g.AddButton("x+6 w130 h34", "AI Settings")
+btnRun  := g.AddButton("xm y+12 w100 h34", "▶  Run")
+btnEdit := g.AddButton("x+6 w95 h34", "✎  Edit")
+btnKey  := g.AddButton("x+6 w110 h34", "⌨  Hotkey")
+btnDel  := g.AddButton("x+6 w105 h34", "✕  Delete")
+btnNew  := g.AddButton("x+22 w185 h34 Default", "＋  New Automation")
+btnAI   := g.AddButton("x+6 w120 h34", "AI Settings")
 
 g.SetFont("s9")
-statusBar := g.AddText("xm y+12 w700 h30", "")
+statusBar := g.AddText("xm y+12 w760 h30", "")
 
 ; ---- events ----
 edSearch.OnEvent("Change", (*) => RefreshLV())
 lv.OnEvent("DoubleClick", RunSelected)
 btnRun.OnEvent("Click", RunSelected)
 btnEdit.OnEvent("Click", EditSelected)
+btnKey.OnEvent("Click", HotkeySelected)
 btnDel.OnEvent("Click", DeleteSelected)
 btnNew.OnEvent("Click", (*) => (RunAhk(root "\macros\NewAutomation.ahk"), SB("New Automation is opening…")))
 btnAI.OnEvent("Click", (*) => AISettingsDialog(g))
@@ -60,7 +62,7 @@ ReloadItems()
 ThemeApply(g, statusBar)
 ThemeDim(tagline)
 g.Show()
-SB(items.Length " automations. Say any phrase in the list — or select a row and say “click run”.")
+SB(items.Length " automations. Say any phrase in the list — or select a row for Run, Edit, Delete, or Hotkey (a Ctrl+Alt+Shift key for when you can't use your voice).")
 
 ; ============================================================
 ;  Data
@@ -75,6 +77,30 @@ CollectItems() {
     global root
     list := []
     tools := []
+    ; Bridge registry first (bridge-map.txt): hand-written hotkey modules
+    ; become rows of their own; companion hotkeys (hotkeys\<Base>.hotkey.ahk,
+    ; assigned with this window's Hotkey button) fold into their automation's
+    ; row as its Hotkey column instead of appearing twice.
+    hotkeyRows := []
+    ; lower(parent base) -> {key, parent}. NB: the property is "parent", never
+    ; "base" — `base:` in an AHK v2 object literal sets the PROTOTYPE and
+    ; throws at runtime for a string value.
+    compKeys := Map()
+    for e in BridgeMapEntries(root) {
+        parentBase := HotkeyCompanionParent(e.file)
+        if (parentBase != "") {
+            compKeys[StrLower(parentBase)] := {key: e.key, parent: parentBase}
+            continue
+        }
+        modBase := RegExReplace(e.file, "^hotkeys\\|\.ahk$", "")
+        hotkeyRows.Push({say: StrLower(e.phrase), kind: "hotkey", kindLabel: "Hotkey",
+            detail: "always-on while VoiceKit runs", baseName: modBase,
+            file: root "\hotkeys\" modBase ".ahk", key: e.key})
+    }
+    TakeCompanionKey(base) {
+        b := StrLower(base)
+        return compKeys.Has(b) ? compKeys.Delete(b).key : ""
+    }
     ; Saved workflows (their macros\ stubs are folded into these rows).
     wfBases := Map()
     Loop Files root "\workflows\*.steps.txt" {
@@ -82,7 +108,8 @@ CollectItems() {
         wfBases[base] := true
         disp := StrLower(SpaceOut(base))
         list.Push({say: "open " disp, kind: "workflow", kindLabel: "Workflow",
-            detail: "repeat it:  “open loop " disp "”", baseName: base, file: A_LoopFileFullPath, key: ""})
+            detail: "repeat it:  “open loop " disp "”", baseName: base, file: A_LoopFileFullPath,
+            key: TakeCompanionKey(base)})
     }
     ; Launch macros, AI actions, and VoiceKit's own tools.
     builtin := Map(
@@ -99,33 +126,32 @@ CollectItems() {
         if builtin.Has(base) {
             say := (base = "VoiceKitHome") ? "open voice kit" : "open " disp
             tools.Push({say: say, kind: "tool", kindLabel: "VoiceKit",
-                detail: builtin[base], baseName: base, file: A_LoopFileFullPath, key: ""})
+                detail: builtin[base], baseName: base, file: A_LoopFileFullPath,
+                key: TakeCompanionKey(base)})
             continue
         }
         if FileExist(root "\prompts\" base ".prompt.txt") {
             list.Push({say: "open " disp, kind: "ai", kindLabel: "AI action",
-                detail: "select text first — the AI's answer replaces it", baseName: base, file: A_LoopFileFullPath, key: ""})
+                detail: "select text first — the AI's answer replaces it", baseName: base,
+                file: A_LoopFileFullPath, key: TakeCompanionKey(base)})
             continue
         }
         list.Push({say: "open " disp, kind: "macro", kindLabel: "Macro",
-            detail: MacroDetail(A_LoopFileFullPath), baseName: base, file: A_LoopFileFullPath, key: ""})
+            detail: MacroDetail(A_LoopFileFullPath), baseName: base, file: A_LoopFileFullPath,
+            key: TakeCompanionKey(base)})
     }
-    ; Hotkey modules (bridge-map.txt is the registry).
-    mapFile := root "\bridge-map.txt"
-    if FileExist(mapFile) {
-        Loop Parse FileRead(mapFile, "UTF-8"), "`n", "`r" {
-            if (A_LoopField = "" || SubStr(A_LoopField, 1, 1) = ";")
-                continue
-            parts := StrSplit(A_LoopField, "|")
-            if (parts.Length < 3)
-                continue
-            keyCombo := Trim(parts[1])                     ; "Ctrl+Alt+Shift+K"
-            phrase := Trim(parts[2])
-            modBase := RegExReplace(Trim(parts[3]), "^hotkeys\\|\.ahk$", "")
-            list.Push({say: StrLower(phrase), kind: "hotkey", kindLabel: "Hotkey",
-                detail: "or press  " keyCombo, baseName: modBase,
-                file: root "\hotkeys\" modBase ".ahk", key: SubStr(keyCombo, StrLen("Ctrl+Alt+Shift+") + 1)})
-        }
+    ; Hand-written hotkey modules keep their own rows.
+    for hr in hotkeyRows
+        list.Push(hr)
+    ; Companion hotkeys whose automation is gone (deleted outside this window):
+    ; surface them so Delete can retire the key like any hotkey row (the
+    ; module base comes from the same rel-file transform as normal rows).
+    for , c in compKeys {
+        rel := HotkeyCompanionRel(c.parent)
+        modBase := RegExReplace(rel, "^hotkeys\\|\.ahk$", "")
+        list.Push({say: StrLower(SpaceOut(c.parent)) " (missing)", kind: "hotkey", kindLabel: "Hotkey",
+            detail: "runs a deleted automation — delete this hotkey", baseName: modBase,
+            file: root "\" rel, key: c.key})
     }
     ; Snippets (typed, not spoken). An expansion of just "{" is a code-block
     ; hotstring (like /date) — show it as dynamic and protect it from the
@@ -137,8 +163,9 @@ CollectItems() {
                 continue
             exp := Trim(m[2])
             dyn := (exp = "{" || exp = "")
+            preview := StrReplace(SnipDecode(exp), "`r`n", " ↵ ")   ; newlines shown inline
             det := dyn ? "dynamic snippet (runs code)"
-                : "expands to:  " Abbrev(StrReplace(exp, "``n", " ↵ "), 44)
+                : "expands to:  " Abbrev(preview, 44)
             list.Push({say: "type " m[1], kind: "snippet", kindLabel: "Snippet",
                 detail: det, baseName: m[1], file: snipFile, key: "", dyn: dyn})
         }
@@ -167,14 +194,16 @@ RefreshLV() {
     lv.Delete()
     rowItems := []
     for it in items {
-        if (q != "" && !InStr(StrLower(it.say " " it.kindLabel " " it.detail), q))
+        combo := it.key != "" ? "Ctrl+Alt+Shift+" it.key : ""
+        if (q != "" && !InStr(StrLower(it.say " " it.kindLabel " " it.detail " " combo), q))
             continue
         rowItems.Push(it)
-        lv.Add(, "“" it.say "”", it.kindLabel, it.detail)
+        lv.Add(, "“" it.say "”", it.kindLabel, combo, it.detail)
     }
-    lv.ModifyCol(1, 240)
-    lv.ModifyCol(2, 90)
-    lv.ModifyCol(3, 350)
+    lv.ModifyCol(1, 235)
+    lv.ModifyCol(2, 85)
+    lv.ModifyCol(3, 125)
+    lv.ModifyCol(4, 285)     ; 730 total — inside the client area even with a scrollbar
     if (q != "")
         SB(rowItems.Length " match" (rowItems.Length = 1 ? "" : "es") ".")
 }
@@ -240,8 +269,15 @@ EditSelected(*) {
             Run('notepad.exe "' it.file '"')
             SB("Opened the script in Notepad. Careful: it's AutoHotkey v2.")
         case "snippet":
-            Run('notepad.exe "' it.file '"')
-            SB("Snippets live in this one file — one  :*:abbrev::text  line each.")
+            ; A code-block snippet (like /date) is real AHK code, not plain
+            ; text — it can't round-trip through the text editor, so it opens
+            ; in Notepad. Everything else gets the in-app snippet editor.
+            if it.dyn {
+                Run('notepad.exe "' it.file '"')
+                SB("This snippet runs code — opened Snippets.ahk in Notepad. Careful: it's AutoHotkey v2.")
+            } else {
+                EditSnippetDialog(it)
+            }
         case "tool":
             SB("That's part of VoiceKit itself — nothing to edit here.")
     }
@@ -280,6 +316,184 @@ EditPromptDialog(base) {
     WinActivate("ahk_id " g.Hwnd)
 }
 
+; Edit a text snippet in place — its abbreviation and its (multi-line)
+; expansion — without hand-editing Snippets.ahk. Only plain-text snippets
+; reach here; code-block ones open in Notepad (they can't round-trip through
+; a text box). The on-disk text is decoded for editing and re-encoded on save
+; (real newlines <-> `n), so multi-line snippets stay on their single line.
+EditSnippetDialog(it) {
+    global root, masterPath, g
+    snipFile := it.file
+    oldAbbrev := it.baseName
+    current := ""
+    Loop Parse FileRead(snipFile, "UTF-8"), "`n", "`r" {
+        if (RegExMatch(A_LoopField, "^:\*?[^:]*:(.+?)::(.*)$", &m) && m[1] = oldAbbrev) {
+            current := SnipDecode(m[2])
+            break
+        }
+    }
+    d := Gui("+AlwaysOnTop +Owner" g.Hwnd, "Edit Snippet")
+    d.SetFont("s10", "Segoe UI")
+    d.MarginX := 18, d.MarginY := 14
+    d.SetFont("s12 bold")
+    d.AddText("xm", "Edit a text snippet")
+    d.SetFont("s10 norm")
+    d.AddText("xm y+12", "Abbreviation to type:")
+    edAbbrev := d.AddEdit("xm y+4 w200", oldAbbrev)
+    d.AddText("xm y+12", "Expands to:")
+    edText := d.AddEdit("xm y+4 w480 r8 +Wrap", current)
+    hint := d.AddText("xm y+3 w480", "Press Enter for line breaks. Typing the abbreviation anywhere replaces it with this text.")
+    btnOK := d.AddButton("xm y+14 w120 h34 Default", "🖫  Save")
+    btnCancel := d.AddButton("x+8 w100 h34", "Cancel")
+    btnFile := d.AddButton("x+8 w150 h34", "Open File…")
+
+    OK(*) {
+        newAbbrev := RegExReplace(Trim(edAbbrev.Value), "\s", "")
+        if (newAbbrev = "" || InStr(newAbbrev, ":")) {
+            MsgBox("The abbreviation can't be empty or contain a colon (:).", "VoiceKit", "Icon! Owner" d.Hwnd)
+            return
+        }
+        expansion := edText.Value
+        if (Trim(expansion, " `t`r`n") = "") {
+            MsgBox("Give it the text to expand into.", "VoiceKit", "Icon! Owner" d.Hwnd)
+            return
+        }
+        if (Trim(expansion) = "{") {
+            MsgBox("The text can't be just '{' — that's code syntax in the snippets file.", "VoiceKit", "Icon! Owner" d.Hwnd)
+            return
+        }
+        ; Renaming onto another snippet's abbreviation would silently shadow it.
+        if (newAbbrev != oldAbbrev) {
+            Loop Parse FileRead(snipFile, "UTF-8"), "`n", "`r" {
+                if (RegExMatch(A_LoopField, "^:\*?[^:]*:(.+?)::", &m) && m[1] = newAbbrev) {
+                    MsgBox("A snippet  " newAbbrev "  already exists. Pick another abbreviation.", "VoiceKit", "Icon! Owner" d.Hwnd)
+                    return
+                }
+            }
+        }
+        if !ReplaceSnippetLine(snipFile, oldAbbrev, newAbbrev, SnipEncode(expansion)) {
+            MsgBox("Couldn't find that snippet to update — it may have changed already. Close and reopen Voice Kit.",
+                "VoiceKit", "Icon! Owner" d.Hwnd)
+            return
+        }
+        RunAhk(masterPath)                    ; reload so the edit is live now
+        Log(root, "snippet-edit | " oldAbbrev (newAbbrev != oldAbbrev ? " -> " newAbbrev : ""))
+        d.Destroy()
+        ReloadItems()
+        SB("Saved — type  " newAbbrev "  anywhere to use it.")
+    }
+    OpenFile(*) {
+        d.Destroy()
+        Run('notepad.exe "' snipFile '"')
+        SB("Opened Snippets.ahk in Notepad. Careful: it's AutoHotkey v2.")
+    }
+    btnOK.OnEvent("Click", OK)
+    btnCancel.OnEvent("Click", (*) => d.Destroy())
+    btnFile.OnEvent("Click", OpenFile)
+    d.OnEvent("Close", (*) => d.Destroy())
+    d.OnEvent("Escape", (*) => d.Destroy())
+    ThemeApply(d)
+    ThemeDim(hint)
+    d.Show()
+    g.Opt("+Disabled")
+    WinWaitClose("ahk_id " d.Hwnd)
+    g.Opt("-Disabled")
+    WinActivate("ahk_id " g.Hwnd)
+}
+
+; ============================================================
+;  Hotkey — give any voice automation a Ctrl+Alt+Shift key, for
+;  when voice isn't available. The generated companion module
+;  (hotkeys\<Base>.hotkey.ahk) runs the same macro the phrase does.
+; ============================================================
+HotkeySelected(*) {
+    it := Selected()
+    if !IsObject(it)
+        return
+    switch it.kind {
+        case "hotkey":
+            SB(it.key != "" ? "That's already a key — press Ctrl+Alt+Shift+" it.key " any time."
+                : "That's already a hotkey module.")
+        case "snippet":
+            SB("Snippets are typed, not keyed — typing  " it.baseName "  anywhere expands it.")
+        default:
+            HotkeyDialog(it)
+    }
+}
+
+HotkeyDialog(it) {
+    global root, masterPath, g
+    keys := []
+    if (it.key != "")
+        keys.Push(it.key)                     ; current assignment stays pickable
+    for k in BridgeFreeKeys(root "\bridge-map.txt")
+        keys.Push(k)
+    if (keys.Length = 0) {
+        MsgBox("No free Ctrl+Alt+Shift keys are left — remove one first (bridge-map.txt lists them all).",
+            "VoiceKit", "Icon! Owner" g.Hwnd)
+        return
+    }
+    d := Gui("+AlwaysOnTop +Owner" g.Hwnd, "Hotkey")
+    d.SetFont("s10", "Segoe UI")
+    d.MarginX := 18, d.MarginY := 14
+    d.SetFont("s12 bold")
+    d.AddText("xm", "A key that runs “" it.say "”")
+    d.SetFont("s10 norm")
+    why := d.AddText("xm y+4 w440", "For when you can't use your voice — the key works whenever "
+        . "VoiceKit is running, and the phrase keeps working too.")
+    d.AddText("xm y+16", "Press:")
+    d.SetFont("s11 bold")
+    d.AddText("x+8 yp", "Ctrl + Alt + Shift  +")
+    ddl := d.AddDropDownList("x+8 yp-2 w62 Choose1", keys)
+    d.SetFont("s10 norm")
+    btnSave := d.AddButton("xm y+20 w150 h34 Default", "Save Hotkey")
+    btnRemove := d.AddButton("x+8 w150 h34", "Remove Hotkey")
+    btnCancel := d.AddButton("x+8 w100 h34", "Cancel")
+    btnRemove.Enabled := it.key != ""
+
+    Done(msg) {
+        RunAhk(masterPath)                    ; reload so the change is live now
+        d.Destroy()
+        ReloadItems()
+        SB(msg)
+    }
+    Save(*) {
+        chosen := ddl.Text
+        if (chosen = "")
+            return
+        if (chosen = it.key) {                ; nothing to change
+            d.Destroy()
+            return
+        }
+        if (it.key != "")
+            HotkeyCompanionRemove(root, it.baseName)
+        err := HotkeyCompanionCreate(root, it.baseName, it.say, chosen)
+        if (err != "") {
+            MsgBox(err, "VoiceKit", "Icon! Owner" d.Hwnd)
+            return
+        }
+        Log(root, "hotkey-assign | " it.say " | Ctrl+Alt+Shift+" chosen)
+        Done("Ctrl+Alt+Shift+" chosen "  now runs “" it.say "” — no voice needed.")
+    }
+    Remove(*) {
+        HotkeyCompanionRemove(root, it.baseName)
+        Log(root, "hotkey-remove | " it.say)
+        Done("Hotkey removed — “" it.say "” is back to voice only.")
+    }
+    btnSave.OnEvent("Click", Save)
+    btnRemove.OnEvent("Click", Remove)
+    btnCancel.OnEvent("Click", (*) => d.Destroy())
+    d.OnEvent("Close", (*) => d.Destroy())
+    d.OnEvent("Escape", (*) => d.Destroy())
+    ThemeApply(d)
+    ThemeDim(why)
+    d.Show()
+    g.Opt("+Disabled")
+    WinWaitClose("ahk_id " d.Hwnd)
+    g.Opt("-Disabled")
+    WinActivate("ahk_id " g.Hwnd)
+}
+
 DeleteSelected(*) {
     global root, masterPath, g
     it := Selected()
@@ -299,19 +513,16 @@ DeleteSelected(*) {
     disp := SpaceOut(it.baseName)
     switch it.kind {
         case "workflow":
-            try FileDelete(root "\workflows\" it.baseName ".steps.txt")
-            macroFile := root "\macros\" it.baseName ".ahk"
-            if (FileExist(macroFile) && InStr(FileRead(macroFile, "UTF-8"), "Workflow Studio"))
-                try FileDelete(macroFile)
-            try FileDelete(A_Programs "\Voice Macros\" disp ".lnk")
-            try FileDelete(A_Programs "\Voice Macros\loop " disp ".lnk")
+            DeleteWorkflowArtifacts(root, it.baseName, disp)
         case "ai":
             try FileDelete(root "\macros\" it.baseName ".ahk")
             try FileDelete(root "\prompts\" it.baseName ".prompt.txt")
             try FileDelete(A_Programs "\Voice Macros\" disp ".lnk")
+            HotkeyCompanionRetire(root, it.baseName)      ; companion key too
         case "macro":
             try FileDelete(root "\macros\" it.baseName ".ahk")
             try FileDelete(A_Programs "\Voice Macros\" disp ".lnk")
+            HotkeyCompanionRetire(root, it.baseName)
         case "hotkey":
             try FileDelete(root "\hotkeys\" it.baseName ".ahk")
             RemoveLinesContaining(root "\hotkeys\_index.ahk", "\hotkeys\" it.baseName ".ahk")
@@ -326,20 +537,8 @@ DeleteSelected(*) {
     SB("Deleted." (it.kind = "hotkey" ? "  If you paired a voice phrase in Voice Access, remove it there too." : ""))
 }
 
-; Rewrite a text file without the lines that contain `needle`.
-RemoveLinesContaining(file, needle) {
-    if !FileExist(file)
-        return
-    out := ""
-    Loop Parse FileRead(file, "UTF-8"), "`n", "`r" {
-        if InStr(A_LoopField, needle)
-            continue
-        out .= A_LoopField "`n"
-    }
-    f := FileOpen(file, "w", "UTF-8")
-    f.Write(RTrim(out, "`n") "`n")
-    f.Close()
-}
+; (RemoveLinesContaining moved to lib\_Common.ahk — the companion-hotkey
+; helpers there need it too.)
 
 ; Remove one hotstring by its abbreviation (line looks like :*:abbrev::text).
 RemoveSnippetLine(file, abbrev) {
@@ -354,6 +553,29 @@ RemoveSnippetLine(file, abbrev) {
     f := FileOpen(file, "w", "UTF-8")
     f.Write(RTrim(out, "`n") "`n")
     f.Close()
+}
+
+; Rewrite one hotstring in place, matched by its current abbreviation.
+; Preserves its position, its options (:*: vs ::), and any comment above it —
+; only the abbreviation and replacement change. Returns true if it was found.
+ReplaceSnippetLine(file, oldAbbrev, newAbbrev, encoded) {
+    if !FileExist(file)
+        return false
+    out := "", found := false
+    Loop Parse FileRead(file, "UTF-8"), "`n", "`r" {
+        if (!found && RegExMatch(A_LoopField, "^:([^:]*):(.+?)::", &m) && m[2] = oldAbbrev) {
+            out .= ":" m[1] ":" newAbbrev "::" encoded "`n"
+            found := true
+        } else {
+            out .= A_LoopField "`n"
+        }
+    }
+    if found {
+        f := FileOpen(file, "w", "UTF-8")
+        f.Write(RTrim(out, "`n") "`n")
+        f.Close()
+    }
+    return found
 }
 
 ; ============================================================

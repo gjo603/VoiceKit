@@ -55,9 +55,9 @@ recStartCount := 0      ; steps.Length when recording started (for the stop summ
 ; Advanced if/else/endif entries live at the END so they're never the default
 ; and don't clutter ordinary recording. The four "if" rows all save as type
 ; "if"; typeConds carries the condition kind (paramC of the step).
-typeIds    := ["focus", "run", "waitwin", "wait", "text", "keys", "click", "dblclick", "rclick", "move", "close"
+typeIds    := ["focus", "run", "waitwin", "wait", "text", "keys", "click", "dblclick", "rclick", "hover", "move", "close"
              , "if", "if", "if", "if", "else", "endif"]
-typeConds  := ["", "", "", "", "", "", "", "", "", "", ""
+typeConds  := ["", "", "", "", "", "", "", "", "", "", "", ""
              , "winexists", "winnotexists", "elementexists", "elementnotexists", "", ""]
 typeLabels := ["Focus window (launch it if needed)"
              , "Open app / file / website"
@@ -68,6 +68,7 @@ typeLabels := ["Focus window (launch it if needed)"
              , "Left-click something in a window (by its name)"
              , "Double-click something in a window"
              , "Right-click something in a window"
+             , "Hover over something in a window (reveals menus / tooltips)"
              , "Position window (left / right / top / bottom / max)"
              , "Close window"
              , "— If a window IS open …"
@@ -81,6 +82,7 @@ typeLabels := ["Focus window (launch it if needed)"
 #HotIf recording
 ~*LButton:: RecClick("L")
 ~*RButton:: RecClick("R")
+^!+h:: RecHover()           ; mark a hover point (menus/tooltips can't be clicked)
 ^!+x:: StopRecording()      ; backup stop — works even if the REC bar is covered
 #HotIf
 
@@ -109,6 +111,7 @@ btnDown := g.AddButton("x+6 w96 h30",      "↓  Down")
 g.SetFont("s10")
 chkCloseTabs := g.AddCheckBox("xm y+14", "Close browser tabs before recording")
 chkMaxWins := g.AddCheckBox("xm y+6", "Maximize windows while recording  (steadier playback)")
+chkCoordsOnly := g.AddCheckBox("xm y+6", "Record clicks by position only  (skip element names — for maps, canvases, games)")
 
 g.SetFont("s11")
 btnRec  := g.AddButton("xm y+8 w214 h44 Default", "●  Record (F9)")   ; Default: Enter starts recording
@@ -148,6 +151,7 @@ btnSave.OnEvent("Click", SaveWorkflow)
 btnHelp.OnEvent("Click", ShowHelp)
 chkCloseTabs.OnEvent("Click", SaveSettings)
 chkMaxWins.OnEvent("Click", SaveSettings)
+chkCoordsOnly.OnEvent("Click", SaveSettings)
 g.OnEvent("Close", CloseStudio)
 
 ; ---- F9 starts recording while the main Studio window is active ----
@@ -267,7 +271,7 @@ RefreshLV() {
         Loop shown
             indent .= "      "
         desc := WfDesc(s)
-        if ((t = "click" || t = "dblclick" || t = "rclick") && s[3] = "" && s[4] != "")
+        if ((t = "click" || t = "dblclick" || t = "rclick" || t = "hover") && s[3] = "" && s[4] != "")
             desc .= "      ⚠ by position only — may break if the window moves"
         lv.Add(, i, indent desc)
         if (t = "if")
@@ -415,6 +419,7 @@ StepDialog(existing := "") {
             "click",    ["Window:", "What to click — its name exactly as shown on screen:"],
             "dblclick", ["Window:", "What to double-click — its name exactly as shown on screen:"],
             "rclick",   ["Window:", "What to right-click — its name exactly as shown on screen:"],
+            "hover",    ["Window:", "What to hover over — its name exactly as shown on screen:"],
             "move",     ["Window to position:", "Where: left / right / top / bottom / max"],
             "close",    ["Window to close:", ""])
         needB := (labels[t][2] != "")
@@ -424,7 +429,7 @@ StepDialog(existing := "") {
         laB.Visible := needB
         edB.Visible := needB
         btnGrab.Visible := (t != "run" && t != "wait" && t != "text" && t != "keys")
-        btnPick.Visible := (t = "click" || t = "dblclick" || t = "rclick")   ; element-name steps
+        btnPick.Visible := (t = "click" || t = "dblclick" || t = "rclick" || t = "hover")   ; element-name steps
         btnBrowse.Visible := (t = "run")
     }
 
@@ -526,14 +531,14 @@ StepDialog(existing := "") {
                 return
             }
         }
-        isClick := (t = "click" || t = "dblclick" || t = "rclick")
-        if (isClick && b = "" && preservedC = "") {
-            MsgBox("Give the element's name as shown on screen — or record the click instead.", "Add Step", "Owner" d.Hwnd)
+        isPointer := (t = "click" || t = "dblclick" || t = "rclick" || t = "hover")
+        if (isPointer && b = "" && preservedC = "") {
+            MsgBox("Give the element's name as shown on screen — or record it instead.", "Add Step", "Owner" d.Hwnd)
             return
         }
-        if !(t = "focus" || t = "waitwin" || t = "move" || isClick)
+        if !(t = "focus" || t = "waitwin" || t = "move" || isPointer)
             b := ""
-        result := [t, a, b, isClick ? preservedC : ""]
+        result := [t, a, b, isPointer ? preservedC : ""]
         d.Destroy()
     }
 
@@ -651,13 +656,13 @@ StartRecording() {
     recStartCount := steps.Length
     StartKeyHook()
     g.Hide()
-    UpdateRecBar("Recording — stop: Stop button or Ctrl+Alt+Shift+X")
+    UpdateRecBar("Hover: Ctrl+Alt+Shift+H   ·   Stop: Ctrl+Alt+Shift+X")
     ShowBottomLeft(recBar)                    ; bottom-left, clear of the taskbar
     SetTimer(RecTick, 250)
 }
 
 StopRecording() {
-    global recording, steps, lv, g, recBar, btnRec, recStartCount
+    global recording, steps, lv, g, recBar, btnRec, recStartCount, chkCoordsOnly
     if !recording
         return
     recording := false
@@ -673,11 +678,13 @@ StopRecording() {
     posOnly := 0
     Loop Max(0, steps.Length - recStartCount) {      ; count THIS take only
         s := steps[recStartCount + A_Index]
-        if ((s[1] = "click" || s[1] = "dblclick" || s[1] = "rclick") && s[3] = "" && s[4] != "")
+        if ((s[1] = "click" || s[1] = "dblclick" || s[1] = "rclick" || s[1] = "hover") && s[3] = "" && s[4] != "")
             posOnly += 1
     }
     if (steps.Length = recStartCount)
         SB("Nothing was captured — recording sees window switches, clicks and typing in normal app windows (the Start menu and taskbar don't count). Try again.")
+    else if (posOnly && chkCoordsOnly.Value)
+        SB("Recorded — " posOnly " step" (posOnly = 1 ? "" : "s") " captured by position (⚠), as chosen. They replay by screen location, so keep the same window layout — the Maximize option helps.")
     else if posOnly
         SB("Recorded — " posOnly " click" (posOnly = 1 ? " was" : "s were") " captured by position only (⚠ in the list) because nothing readable was under the mouse. They replay less reliably — prefer clicking labeled controls.")
     else
@@ -802,7 +809,7 @@ RecDeferredMax(hwnd, crit) {
 }
 
 RecClick(btn) {
-    global recording, steps, recLastHwnd, recLastCrit, lastClick
+    global recording, steps, recLastHwnd, recLastCrit, lastClick, chkCoordsOnly
     if !recording
         return
     MouseGetPos(&mx, &my, &hwnd)
@@ -834,11 +841,13 @@ RecClick(btn) {
         return
     }
     elem := ""
-    ap := AccFromPoint(mx, my)
-    if IsObject(ap)
-        elem := AccName(ap.acc, ap.child)
-    if (StrLen(elem) > 100)                 ; paragraph-length names aren't stable selectors
-        elem := ""
+    if (!chkCoordsOnly.Value) {              ; position-only mode records the spot, not the name
+        ap := AccFromPoint(mx, my)
+        if IsObject(ap)
+            elem := AccName(ap.acc, ap.child)
+        if (StrLen(elem) > 100)             ; paragraph-length names aren't stable selectors
+            elem := ""
+    }
     WinGetPos(&wx, &wy, , , hwnd)
     rel := (mx - wx) "," (my - wy)
     stepType := (btn = "R") ? "rclick" : "click"
@@ -850,6 +859,46 @@ RecClick(btn) {
     ; the window mid-gesture would break the user's own click/double-click
     ; (see RecDeferredMax). The captured element/coords above deliberately
     ; reflect the geometry the user actually clicked in.
+    SetTimer((*) => RecDeferredMax(hwnd, info.crit), -(DllCall("GetDoubleClickTime") + 150))
+}
+
+; Mark a HOVER at the current mouse position — Ctrl+Alt+Shift+H while recording.
+; Hovers (revealing a menu or tooltip) aren't clicks, so they can't be captured
+; automatically; this is the deliberate "do it here" gesture. Same capture as a
+; click: the element's accessible name (unless position-only mode is on) with the
+; window-relative position kept as the fallback. The engine's hover step moves
+; the pointer there and pauses so the menu/tooltip appears.
+RecHover() {
+    global recording, recLastHwnd, recLastCrit, chkCoordsOnly
+    if !recording
+        return
+    MouseGetPos(&mx, &my, &hwnd)
+    info := ClassifyWindow(hwnd)
+    if !IsObject(info) {
+        UpdateRecBar("Hover ignored — point at an app window first")
+        return
+    }
+    FlushTypedText()
+    if (info.crit != recLastCrit) {
+        RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
+        recLastCrit := info.crit
+        recLastHwnd := hwnd
+    }
+    elem := ""
+    if (!chkCoordsOnly.Value) {
+        ap := AccFromPoint(mx, my)
+        if IsObject(ap)
+            elem := AccName(ap.acc, ap.child)
+        if (StrLen(elem) > 100)
+            elem := ""
+    }
+    WinGetPos(&wx, &wy, , , hwnd)
+    rel := (mx - wx) "," (my - wy)
+    RecPush(["hover", info.crit, elem, rel],
+        "Hover " (elem != "" ? "`"" elem "`"" : "at " rel))
+    ; Maximize AFTER capturing (like the click path) so the recorded coords/name
+    ; reflect the geometry the mouse was actually over; the deferred timer avoids
+    ; reflowing the window synchronously under the just-pressed hotkey.
     SetTimer((*) => RecDeferredMax(hwnd, info.crit), -(DllCall("GetDoubleClickTime") + 150))
 }
 
@@ -922,6 +971,8 @@ RecKeyDown(h, vk, sc) {
     shift := GetKeyState("Shift")
     if (key = "x" && ctrl && alt && shift)
         return                              ; the stop-recording hotkey, not a workflow step
+    if (key = "h" && ctrl && alt && shift)
+        return                              ; the mark-hover hotkey, not a workflow step
     mods := (ctrl ? "^" : "") (alt ? "!" : "") (win ? "#" : "")
     if (key = "Backspace" && mods = "") {
         if (typedBuf != "") {               ; natural correction: un-type the last char
@@ -1109,12 +1160,7 @@ DeleteWorkflow(*) {
         "Workflow Studio", "YesNo Icon! Owner" g.Hwnd) != "Yes")
         return
     base := ddlMap[sel]
-    try FileDelete(root "\workflows\" base ".steps.txt")
-    macroFile := root "\macros\" base ".ahk"
-    if (FileExist(macroFile) && InStr(FileRead(macroFile, "UTF-8"), "Workflow Studio"))
-        try FileDelete(macroFile)
-    try FileDelete(A_Programs "\Voice Macros\" sel ".lnk")
-    try FileDelete(A_Programs "\Voice Macros\loop " sel ".lnk")
+    DeleteWorkflowArtifacts(root, base, sel)     ; steps, stub, .lnks, companion hotkey
     Log(root, "deleted workflow | " sel)
     NewWorkflowState()
     RefreshWorkflowList()
@@ -1131,6 +1177,9 @@ ShowHelp(*) {
         . "       Clicks are remembered by the NAME of what you clicked, so they`n"
         . "       keep working when windows move. Double-clicking a file in`n"
         . "       Explorer records `"Open <that file>`" with its full path.`n"
+        . "       To capture a HOVER (e.g. to open a menu that only appears`n"
+        . "       when the mouse rests on something), point at it and press`n"
+        . "       Ctrl+Alt+Shift+H — a Hover step is added where the mouse is.`n"
         . "  3.  Stop with the REC bar's Stop button, by saying `"click stop`",`n"
         . "       or by pressing Ctrl+Alt+Shift+X. Then trim or edit the steps —`n"
         . "       double-click a row to edit, and click Add to insert a pause if`n"
@@ -1141,10 +1190,14 @@ ShowHelp(*) {
         . "Tips: `"Close browser tabs before recording`" starts from a fresh`n"
         . "browser (leftover tabs shift things). `"Maximize windows while`n"
         . "recording`" locks in one window layout — playback re-maximizes the`n"
-        . "same windows, so nothing has moved. Steps marked ⚠ were captured`n"
-        . "by position only and are the first thing to fix if playback misses.`n`n"
+        . "same windows, so nothing has moved. `"Record clicks by position`n"
+        . "only`" ignores element names and stores just the X,Y spot — for`n"
+        . "maps, canvases and games where names aren't reliable. Steps marked`n"
+        . "⚠ were captured by position only and are the first thing to fix if`n"
+        . "playback misses.`n`n"
         . "Notes: don't type passwords while recording; drags and scrolling`n"
-        . "aren't captured. Every button is voice-clickable — say `"click`" plus`n"
+        . "aren't captured (hover is — see Ctrl+Alt+Shift+H above). Every`n"
+        . "button is voice-clickable — say `"click`" plus`n"
         . "its word: `"click record`", `"click add`", `"click test`", `"click save`".`n`n"
         . "See everything you've made in one place: say `"open voice kit`".",
         "Workflow Studio — help", "Owner" g.Hwnd)
@@ -1202,15 +1255,17 @@ SettingsFile() {
     return root "\logs\settings.ini"
 }
 LoadSettings() {
-    global chkCloseTabs, chkMaxWins
+    global chkCloseTabs, chkMaxWins, chkCoordsOnly
     chkCloseTabs.Value := (IniRead(SettingsFile(), "Studio", "CloseBrowserTabs", "0") = "1")
     chkMaxWins.Value := (IniRead(SettingsFile(), "Studio", "MaximizeWhileRecording", "1") = "1")
+    chkCoordsOnly.Value := (IniRead(SettingsFile(), "Studio", "CoordsOnly", "0") = "1")
 }
 SaveSettings(*) {
-    global chkCloseTabs, chkMaxWins
+    global chkCloseTabs, chkMaxWins, chkCoordsOnly
     EnsureDir(RegExReplace(SettingsFile(), "\\[^\\]+$"))
     IniWrite(chkCloseTabs.Value ? 1 : 0, SettingsFile(), "Studio", "CloseBrowserTabs")
     IniWrite(chkMaxWins.Value ? 1 : 0, SettingsFile(), "Studio", "MaximizeWhileRecording")
+    IniWrite(chkCoordsOnly.Value ? 1 : 0, SettingsFile(), "Studio", "CoordsOnly")
 }
 
 SB(text) {
