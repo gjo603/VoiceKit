@@ -33,7 +33,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Process -Name AutoHo
 if not exist "%TARGET%" mkdir "%TARGET%" 2>nul
 rem Additive copy (keeps any automations the user already made); never copies
 rem this installer or the legacy Setup.bat into the install.
-robocopy "%SRC%" "%TARGET%" /E /XF "Install-VoiceKit.cmd" "Setup.bat" /NFL /NDL /NJH /NJS /NP >nul
+rem UPGRADE GUARD: three shipped files hold per-machine user state — the
+rem snippet file, the hotkey include manifest, and the bridge-key registry.
+rem On a fresh install the shipped copies must land; on an upgrade (the file
+rem already exists in the target) they must NOT be overwritten, or the user's
+rem snippets vanish and every registered hotkey goes dead.
+set "XFILES="Install-VoiceKit.cmd" "Setup.bat""
+if exist "%TARGET%\hotkeys\Snippets.ahk" set "XFILES=%XFILES% "Snippets.ahk""
+if exist "%TARGET%\hotkeys\_index.ahk"   set "XFILES=%XFILES% "_index.ahk""
+if exist "%TARGET%\bridge-map.txt"       set "XFILES=%XFILES% "bridge-map.txt""
+robocopy "%SRC%" "%TARGET%" /E /XF %XFILES% /NFL /NDL /NJH /NJS /NP >nul
 set "RC=%ERRORLEVEL%"
 if %RC% GEQ 8 goto :copyfail
 if not exist "%TARGET%\VoiceKit.ahk" goto :missing
