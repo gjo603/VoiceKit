@@ -162,11 +162,11 @@ RemoveLinesContaining(file, needle) {
 ; ============================================================
 
 ; The allocatable keys. E, N, R are VoiceKit's own hotkeys, X is Workflow
-; Studio's stop-recording / loop-stop key, and H is its mark-hover key while
-; recording — all five stay out. (mcp\voicekit_writer.py BRIDGE_POOL mirrors
-; this string.)
+; Studio's stop-recording / loop-stop key, and H / I are its mark-hover and
+; ask-for-input keys while recording — all six stay out.
+; (mcp\voicekit_writer.py BRIDGE_POOL mirrors this string.)
 BridgeKeyPool() {
-    return "ABCDFGIJKLMOPQSTUVWYZ0123456789"
+    return "ABCDFGJKLMOPQSTUVWYZ0123456789"
 }
 
 ; Pool keys not yet registered in bridge-map.txt, in pool order.

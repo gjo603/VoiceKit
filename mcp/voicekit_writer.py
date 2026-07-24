@@ -34,15 +34,21 @@ VOICE_MACROS = Path(os.environ.get(
                  "Start Menu", "Programs", "Voice Macros"),
 ))
 
-# Bridge-key pool from lib\_Common.ahk BridgeKeyPool — E,N,R,X,H excluded
-# (H is Workflow Studio's mark-hover key while recording).
+# Bridge-key pool from lib\_Common.ahk BridgeKeyPool — E,N,R,X,H,I excluded
+# (H and I are Workflow Studio's mark-hover and ask-for-input keys while
+# recording).
 # (Companion hotkeys — hotkeys\<Base>.hotkey.ahk, assigned in the Voice Kit
 # home window — draw from the same pool via bridge-map.txt registration.)
-BRIDGE_POOL = "ABCDFGIJKLMOPQSTUVWYZ0123456789"
+BRIDGE_POOL = "ABCDFGJKLMOPQSTUVWYZ0123456789"
 
 # Step types from lib\Workflow.ahk WfRunStep.
 STEP_TYPES = ("run", "focus", "waitwin", "wait", "text", "keys",
               "click", "dblclick", "rclick", "hover", "move", "close",
+              # ask|<label>|<suggested answer>| — the run collects every ask
+              # input up front (one dialog per unique label) and types the
+              # answer at this step's position. The loop runner can batch
+              # them (typed-in rows or a CSV whose columns are the labels).
+              "ask",
               # Optional branching (engine executes these; recorder never emits them).
               # if|<window>|<element>|<condType> where condType is one of
               # winexists / winnotexists / elementexists / elementnotexists;
@@ -597,6 +603,10 @@ def create_workflow(name: str, steps: list) -> dict:
         if not s or s[0] not in STEP_TYPES:
             raise VoiceKitError(f"Step {i + 1}: unknown type '{s[0] if s else ''}'. "
                                 f"Valid types: {', '.join(STEP_TYPES)}.")
+        # ask|label|suggestion| — a blank label would collapse every input
+        # into the engine's "Input" fallback; require one at create time.
+        if s[0] == "ask" and not (len(s) >= 2 and str(s[1]).strip()):
+            raise VoiceKitError(f"Step {i + 1}: an 'ask' step needs a label (what to ask the user for).")
         # if|window|element|condType — reject a blank window or bad condType at
         # create time (the engine would otherwise mis-branch or stop mid-run).
         if s[0] == "if":
@@ -647,7 +657,7 @@ def create_workflow(name: str, steps: list) -> dict:
 # Read / list
 # ---------------------------------------------------------------------------
 # VoiceKit's own tools: listed separately, never deletable through MCP.
-_BUILTINS = {"NewAutomation", "WorkflowStudio", "VoiceKitHelp", "VoiceKitHome", "AskAI"}
+_BUILTINS = {"NewAutomation", "WorkflowStudio", "RecordMySteps", "VoiceKitHelp", "VoiceKitHome", "AskAI"}
 # Deletion guard compares case-insensitively: spoken names round-trip through
 # CleanPhrase's Title Case ("Ask AI" -> base "AskAi"), and NTFS would happily
 # match AskAi.ahk to AskAI.ahk — an exact-case check would not protect it.
@@ -772,7 +782,7 @@ def get_bridge_map() -> dict:
                                 "created": parts[3] if len(parts) > 3 else ""})
     used = {e["combo"].rsplit("+", 1)[-1] for e in entries}
     free = [k for k in BRIDGE_POOL if k not in used]
-    return {"entries": entries, "free_keys": free, "reserved_keys": ["E", "N", "R", "X", "H"]}
+    return {"entries": entries, "free_keys": free, "reserved_keys": ["E", "N", "R", "X", "H", "I"]}
 
 
 # ---------------------------------------------------------------------------

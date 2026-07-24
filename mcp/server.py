@@ -39,6 +39,7 @@ class WorkflowStep(BaseModel):
       waitwin  -> window   (+ seconds, default 10)
       wait     -> ms
       text     -> text
+      ask      -> label (+ suggestion)   collects an input from the user
       keys     -> keys
       click/dblclick/rclick -> window + element (name on screen)   [or xy]
       hover    -> window + element (or xy) — moves the mouse there and pauses
@@ -52,7 +53,7 @@ class WorkflowStep(BaseModel):
     condition holds; pair it with an optional `else` and a closing `endif`.
     """
 
-    type: Literal["run", "focus", "waitwin", "wait", "text", "keys",
+    type: Literal["run", "focus", "waitwin", "wait", "text", "ask", "keys",
                   "click", "dblclick", "rclick", "hover", "move", "close",
                   "if", "else", "endif"]
     window: Optional[str] = Field(
@@ -66,6 +67,13 @@ class WorkflowStep(BaseModel):
         None, description="waitwin: seconds to wait for the window (default 10).")
     ms: Optional[int] = Field(None, description="wait: milliseconds to pause.")
     text: Optional[str] = Field(None, description="text: the literal text to type.")
+    label: Optional[str] = Field(
+        None, description="ask: what to ask the user for (e.g. 'Customer name'). Every ask input "
+        "is collected in dialogs BEFORE the run starts; the answer is typed at this step's "
+        "position. Loop runs can batch the answers (typed-in rows or a CSV whose columns are "
+        "these labels, one pass per row).")
+    suggestion: Optional[str] = Field(
+        None, description="ask: optional answer to prefill in the input dialog.")
     keys: Optional[str] = Field(
         None, description="keys: an AutoHotkey Send string, e.g. '{Enter}', '{Tab 2}', '^s'.")
     element: Optional[str] = Field(
@@ -100,6 +108,9 @@ class WorkflowStep(BaseModel):
             if self.text is None:
                 raise ValueError("text step needs 'text'")
             return (t, self.text, "", "")
+        if t == "ask":
+            _need(self.label, "ask", "label")
+            return (t, self.label, self.suggestion or "", "")
         if t == "keys":
             _need(self.keys, "keys", "keys")
             return (t, self.keys, "", "")

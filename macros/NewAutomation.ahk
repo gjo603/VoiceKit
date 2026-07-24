@@ -468,6 +468,7 @@ DraftSystemPrompt() {
         . "- waitwin: a = window to wait for; b = timeout in seconds (optional, default 10).`n"
         . "- wait: a = milliseconds to pause.`n"
         . "- text: a = text to type into the focused window.`n"
+        . "- ask: a = a short label for a value the USER should supply when the workflow runs (e.g. 'Customer name'); b = suggested answer (optional). All ask inputs are collected in dialogs before the run starts, and the answer is typed into the focused window at this step's position. Use ask instead of text whenever the description implies the value changes each run.`n"
         . "- keys: a = keys in AutoHotkey v2 Send syntax, e.g. {Enter}, {Tab 2}, ^s.`n"
         . "- click / dblclick / rclick: a = window; b = the EXACT on-screen name of the thing to click (button caption, link text, menu item).`n"
         . "- hover: a = window; b = the on-screen name to rest the mouse over (moves there and pauses so a hover menu/tooltip appears; follow with a click on what it reveals).`n"
@@ -513,7 +514,7 @@ ParseDraftInner(raw, &perr) {
         perr := "The AI returned an empty step list"
         return ""
     }
-    validTypes := Map("run",1, "focus",1, "waitwin",1, "wait",1, "text",1, "keys",1,
+    validTypes := Map("run",1, "focus",1, "waitwin",1, "wait",1, "text",1, "ask",1, "keys",1,
         "click",1, "dblclick",1, "rclick",1, "hover",1, "move",1, "close",1, "if",1, "else",1, "endif",1)
     validConds := Map("winexists",1, "winnotexists",1, "elementexists",1, "elementnotexists",1)
     steps := []
@@ -533,6 +534,10 @@ ParseDraftInner(raw, &perr) {
         c := DraftField(el, "c", &ok)
         if !ok {
             perr := "Draft step " i " has a non-text value in it"
+            return ""
+        }
+        if (t = "ask" && Trim(a) = "") {
+            perr := "Draft step " i " is an 'ask' with no label"
             return ""
         }
         if (t = "if") {
@@ -726,7 +731,7 @@ PairingDialog(phrase, key) {
 }
 
 ; First free key from the shared pool (lib\_Common.ahk BridgeKeyPool —
-; E, N, R, X reserved; companion hotkeys assigned in Voice Kit draw
+; E, N, R, X, H, I reserved; companion hotkeys assigned in Voice Kit draw
 ; from the same pool, so the registry keeps everyone honest).
 AllocateBridgeKey(mapFile) {
     free := BridgeFreeKeys(mapFile)

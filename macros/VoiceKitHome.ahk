@@ -115,6 +115,7 @@ CollectItems() {
     builtin := Map(
         "NewAutomation",  "create any new automation",
         "WorkflowStudio", "record or edit step workflows",
+        "RecordMySteps",  "start recording a new workflow now",
         "AskAI",          "ask the AI anything, hands-free",
         "VoiceKitHome",   "this window",
         "VoiceKitHelp",   "this window (older phrase)")
