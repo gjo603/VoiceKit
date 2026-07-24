@@ -1018,6 +1018,10 @@ def delete_automation(name: str, type: str) -> dict:
         if steps_file.exists():
             steps_file.unlink()
             result["removed"].append(str(steps_file))
+        sheet = REPO_ROOT / "workflows" / f"{base}.inputs.csv"   # loop inputs sheet
+        if sheet.exists():
+            sheet.unlink()
+            result["removed"].append(str(sheet))
         if is_stub:
             macro.unlink()
             result["removed"].append(str(macro))

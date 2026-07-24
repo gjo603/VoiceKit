@@ -12,12 +12,22 @@
 ;  from the host, or AHK will report duplicate definitions.)
 ;
 ;  Stop while looping: the floating "Stop Looping" button
-;  (voice: "click stop looping") or Ctrl+Alt+Shift+X. A loop also
-;  stops on its own if a step fails (so a broken workflow can't spin).
+;  (voice: "click stop looping") or Ctrl+Alt+Shift+X. Stopping is
+;  immediate — the engine polls the abort hook (wfRunAbortCheck)
+;  between steps and inside its waits, so even a long Wait step or
+;  a window-wait ends right away, with no failure popup. A loop
+;  also stops on its own if a step fails (so a broken workflow
+;  can't spin).
 ;
 ;  Workflows with `ask` steps: before looping starts, a chooser
-;  offers to import a CSV (columns = the input labels; one pass
-;  per row), type a batch of rows in, or ask each pass. With a
+;  offers ways to feed the loop. The lead option is the workflow's
+;  own INPUTS SHEET — workflows\<Base>.inputs.csv, created on
+;  demand with one column per input and opened in Excel/Notepad;
+;  fill one row per run, save, and "Run from my sheet" runs the
+;  list (the sheet stays there to edit and re-run later). The
+;  chooser also imports any CSV, takes typed-in rows, or falls
+;  back to asking each pass, and sets the pause between runs
+;  (remembered per workflow in logs\settings.ini [Loop]). With a
 ;  batch, the loop runs the rows in order and stops by itself.
 ; ============================================================
 #Include "%A_LineFile%\..\Workflow.ahk"
@@ -41,18 +51,29 @@ RunWorkflowLoop(stepsFile, phrase, delayMs := 1500) {
         return
     }
 
-    ; Workflows that ask for input: batch the answers up front (CSV or
-    ; typed-in rows — one loop pass per row), or fall back to asking
-    ; every pass. rows = "" means no batch (ask each pass, or no asks).
+    ; Workflows that ask for input: batch the answers up front (the
+    ; workflow's inputs sheet, any CSV, or typed-in rows — one loop pass
+    ; per row), or fall back to asking every pass. rows = "" means no
+    ; batch. The chooser also sets the pause between passes.
     rows := ""
     labels := WfAskLabels(steps)
     if labels.Length {
-        plan := WfLoopInputPlan(labels, phrase)
+        SplitPath(stepsFile, &fname, &fdir)
+        base := RegExReplace(fname, "i)\.steps\.txt$")
+        plan := WfLoopInputPlan(labels, phrase, base, fdir "\" base ".inputs.csv")
         if !IsObject(plan)
             return                               ; cancelled
         if (plan.mode = "rows")
             rows := plan.rows
+        delayMs := plan.delayMs
     }
+
+    ; Make each pass abortable from the inside: the engine polls this
+    ; between steps and inside its waits, so Stop cuts in mid-pass (a
+    ; captured 20 s Wait step can't hold the loop hostage) instead of
+    ; waiting for the pass to finish.
+    global wfRunAbortCheck
+    wfRunAbortCheck := (*) => wfLoopStop
 
     ; ---- floating status bar (bottom-left, clear of the taskbar) ----
     bar := Gui("+AlwaysOnTop +ToolWindow -Caption +Border")
@@ -79,13 +100,14 @@ RunWorkflowLoop(stepsFile, phrase, delayMs := 1500) {
         i += 1
         barCount.Text := IsObject(rows) ? ("row " i "/" rows.Length) : ("run " i)
         ok := RunWorkflowSteps(steps, IsObject(rows) ? rows[i] : "")
-        if !ok                             ; a failing step already showed its popup — don't keep spinning
+        if !ok                             ; a step failed (its popup already showed) or Stop cut the pass short
             break
         if (IsObject(rows) && i >= rows.Length)
             break                          ; last row done — skip the trailing pause
         WfLoopSleep(delayMs)               ; interruptible pause; also returns at once if stop was requested
     }
     bar.Destroy()
+    wfRunAbortCheck := ""                  ; runs outside the loop are not abortable
     if (IsObject(rows) && ok && !wfLoopStop && i >= rows.Length)
         MsgBox("Done — ran '" phrase "' for all " rows.Length " row" (rows.Length = 1 ? "" : "s") ".",
             "VoiceKit loop", "262144")
@@ -95,72 +117,197 @@ RunWorkflowLoop(stepsFile, phrase, delayMs := 1500) {
 ;  Batched inputs for looping workflows that ask for input
 ; ------------------------------------------------------------
 
-; Chooser: how should this loop get its inputs? Returns
-;   {mode:"rows", rows:[Map(label->answer), ...]}  — batch, one pass per row
-;   {mode:"each"}                                  — ask dialogs every pass
-;   ""                                             — cancelled
-WfLoopInputPlan(labels, phrase) {
+; Chooser: how should this loop get its inputs, and how long should it
+; pause between runs? Leads with the workflow's own inputs sheet
+; (<Base>.inputs.csv beside the steps file — created on demand, edited
+; in Excel/Notepad, re-read every time, so a list is easy to tweak and
+; re-run). Returns
+;   {mode:"rows", rows:[Map(label->answer), ...], delayMs}  — batch
+;   {mode:"each", delayMs}                                  — ask every pass
+;   ""                                                      — cancelled
+WfLoopInputPlan(labels, phrase, base, sheetPath) {
     result := ""
     joined := ""
     for l in labels
         joined .= (A_Index > 1 ? "  ·  " : "") l
-    d := Gui("+AlwaysOnTop", "Loop " phrase " — inputs")
+    d := Gui("+AlwaysOnTop", "Loop " phrase)
+    dh := 0                             ; d.Hwnd, captured below pre-Show
     d.SetFont("s10", "Segoe UI")
-    d.AddText("xm w440", "'" phrase "' asks for:")
+    d.AddText("xm w460", "Each run of '" phrase "' needs these answers:")
     d.SetFont("s10 bold")
-    d.AddText("xm y+4 w440", joined)
+    d.AddText("xm y+4 w460", joined)
     d.SetFont("s10 norm")
-    d.AddText("xm y+10 w440", "Give the answers for every pass now — the loop runs once per row and stops on its own — or answer fresh each time around.")
-    btnCsv  := d.AddButton("xm y+14 w440 h34 Default", "Import a CSV file  (columns named like the inputs)")
-    btnType := d.AddButton("xm y+8 w440 h34", "Type the rows in")
-    btnEach := d.AddButton("xm y+8 w440 h34", "Ask me each time around")
+    d.AddText("xm y+12 Section", "Pause between runs:")
+    edDelay := d.AddEdit("x+8 yp-3 w56 Right", WfLoopDelayLoad(base))
+    d.AddText("x+6 ys", "seconds  (remembered for this workflow)")
+    hint := d.AddText("xm y+12 w460 r3", "")
+    ThemeDim(hint)
+    btnSheetRun  := d.AddButton("xm y+8 w460 h34", "▶  Run from my sheet")
+    btnSheetEdit := d.AddButton("xm y+8 w460 h34", "✎  Edit my sheet")
+    other := d.AddText("xm y+12 w460", "Other ways to feed it:")
+    ThemeDim(other)
+    btnCsv  := d.AddButton("xm y+4 w460 h30", "Import a CSV file I already have")
+    btnType := d.AddButton("xm y+8 w460 h30", "Type the rows in here")
+    btnEach := d.AddButton("xm y+8 w460 h30", "Ask me before each run")
     btnCancel := d.AddButton("xm y+12 w120", "Cancel")
+
+    ; Rows currently in the sheet: -1 no sheet yet, 0 sheet but nothing
+    ; usable, N ready rows. Cheap and never throws (the watcher calls it).
+    SheetRows() {
+        if !FileExist(sheetPath)
+            return -1
+        rows := "", err := ""
+        try rows := WfLoopCsvRows(labels, FileRead(sheetPath, "UTF-8"), &err)
+        return IsObject(rows) ? rows.Length : 0
+    }
+    ; Reflect the sheet's state in the two sheet buttons; the ready one
+    ; gets the Default accent so Enter (and the eye) lands right.
+    Refresh() {
+        n := SheetRows()
+        if (n > 0) {
+            btnSheetRun.Text := "▶  Run from my sheet  (" n " row" (n = 1 ? "" : "s") " ready)"
+            btnSheetEdit.Text := "✎  Edit my sheet"
+            btnSheetEdit.Opt("-Default"), btnSheetRun.Opt("+Default")
+        } else {
+            btnSheetRun.Text := "▶  Run from my sheet"
+            btnSheetEdit.Text := (n < 0) ? "✎  Create my sheet  (one row per run)" : "✎  Edit my sheet"
+            btnSheetRun.Opt("-Default"), btnSheetEdit.Opt("+Default")
+        }
+    }
+    ; The pause box, parsed to ms: -1 means junk (caller explains).
+    Delay() {
+        t := StrReplace(Trim(edDelay.Value), ",", ".")
+        if (t = "")
+            return 0
+        if (!IsNumber(t) || t < 0)
+            return -1
+        return Min(Round(t * 1000), 3600000)
+    }
+    ; Every way of starting the loop funnels through here so the pause
+    ; is validated and remembered no matter which button was clicked.
+    Start(mode, rowsArr) {
+        ms := Delay()
+        if (ms < 0) {
+            hint.Text := "The pause needs to be a number of seconds — e.g. 1.5"
+            return false
+        }
+        WfLoopDelaySave(base, ms)
+        result := {mode: mode, delayMs: ms}
+        if IsObject(rowsArr)
+            result.rows := rowsArr
+        d.Destroy()
+        return true
+    }
+    SheetRun(*) {
+        if !FileExist(sheetPath) {
+            hint.Text := "No sheet yet — click '" btnSheetEdit.Text "' below, fill one row per run, and save it."
+            return
+        }
+        rows := "", err := ""
+        try rows := WfLoopCsvRows(labels, FileRead(sheetPath, "UTF-8"), &err)
+        catch
+            err := "Couldn't read the sheet. If it's open in another program, save and close it there first."
+        if !IsObject(rows) {
+            MsgBox("The sheet isn't ready to run yet.`n`n" err, "VoiceKit loop", "Icon! Owner" dh)
+            return
+        }
+        Start("rows", rows)
+    }
+    SheetEdit(*) {
+        if !FileExist(sheetPath) {
+            try WfLoopSheetCreate(sheetPath, labels)
+            catch as e {
+                MsgBox("Couldn't create the sheet:`n" e.Message, "VoiceKit loop", "Iconx Owner" dh)
+                return
+            }
+        }
+        try Run('"' sheetPath '"')                       ; default .csv app (Excel if present)
+        catch
+            try Run('notepad.exe "' sheetPath '"')
+        hint.Text := "The top row is the column names — fill one row per run underneath, save, then come back and click 'Run from my sheet'."
+        Refresh()
+    }
     Csv(*) {
         rows := WfLoopImportCsv(labels, d)
-        if IsObject(rows) {
-            result := {mode: "rows", rows: rows}
-            d.Destroy()
-        }
+        if IsObject(rows)
+            Start("rows", rows)
     }
     TypeIn(*) {
         d.Hide()
         rows := WfLoopTypeRows(labels)
-        if IsObject(rows) {
-            result := {mode: "rows", rows: rows}
-            d.Destroy()
-        } else
-            d.Show()
+        if (IsObject(rows) && Start("rows", rows))
+            return
+        d.Show()
     }
+    btnSheetRun.OnEvent("Click", SheetRun)
+    btnSheetEdit.OnEvent("Click", SheetEdit)
     btnCsv.OnEvent("Click", Csv)
     btnType.OnEvent("Click", TypeIn)
-    btnEach.OnEvent("Click", (*) => (result := {mode: "each"}, d.Destroy()))
+    btnEach.OnEvent("Click", (*) => Start("each", ""))
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
+    Refresh()
+    hint.Text := SheetRows() > 0
+        ? "Each sheet row is one run — the loop stops by itself after the last row."
+        : "Easiest: keep the answers in a sheet. Create it once, fill one row per run (Excel or Notepad), and run the whole list."
+    ; Watch the sheet while the dialog is up, so saving it in Excel
+    ; updates the row count without reopening the dialog. Everything is
+    ; try-guarded: the timer can fire between Destroy and the wait below.
+    lastStamp := "?"
+    Watch() {
+        stamp := ""
+        try stamp := FileExist(sheetPath) ? FileGetTime(sheetPath, "M") . FileGetSize(sheetPath) : ""
+        if (stamp = lastStamp)
+            return
+        lastStamp := stamp
+        try Refresh()
+    }
+    SetTimer(Watch, 800)
     ThemeApply(d)
-    hwnd := d.Hwnd                      ; pre-Show: reads on a destroyed Gui throw
+    dh := hwnd := d.Hwnd                ; pre-Show: reads on a destroyed Gui throw
     d.Show()
     try WinActivate("ahk_id " hwnd)     ; dialog may be dismissed before this runs
     WinWaitClose("ahk_id " hwnd)
+    SetTimer(Watch, 0)
     return result
 }
 
-; Pick and read a CSV whose header row names every ask label (case-
-; insensitive; extra columns are ignored). Returns [Map(label->answer),...]
-; or "" if cancelled / invalid (the problem is explained, chooser stays up).
+; Pick and read any CSV whose header row names every ask label. Returns
+; [Map(label->answer),...] or "" if cancelled / invalid (the problem is
+; explained, chooser stays up).
 WfLoopImportCsv(labels, owner) {
     f := FileSelect(1, , "Pick the CSV file", "CSV / text (*.csv; *.txt)")
     if (f = "")
         return ""
-    recs := ""
-    try recs := WfCsvParse(FileRead(f, "UTF-8"))
+    text := ""
+    try text := FileRead(f, "UTF-8")
     catch {
         MsgBox("Couldn't read that file.", "VoiceKit loop", "Iconx Owner" owner.Hwnd)
         return ""
     }
+    err := ""
+    rows := WfLoopCsvRows(labels, text, &err)
+    if !IsObject(rows)
+        MsgBox(err, "VoiceKit loop", "Icon! Owner" owner.Hwnd)
+    return rows
+}
+
+; Turn CSV text into loop rows. The header row must name every ask label
+; (case-insensitive; extra columns are ignored); each later non-empty
+; record becomes one Map(label->answer). Returns the rows array, or ""
+; with &err set to a user-facing explanation. Shared by the inputs-sheet
+; path and the import-a-CSV path so both validate identically.
+WfLoopCsvRows(labels, text, &err) {
+    err := ""
+    recs := ""
+    try recs := WfCsvParse(text)
+    catch {
+        err := "Couldn't read that file."
+        return ""
+    }
     if (!IsObject(recs) || recs.Length < 2) {
-        MsgBox("That CSV needs a header row (the input names) plus at least one row of answers.",
-            "VoiceKit loop", "Icon! Owner" owner.Hwnd)
+        err := "It needs a header row (the input names) plus at least one row of answers."
         return ""
     }
     ; header -> column index per label
@@ -174,9 +321,8 @@ WfLoopImportCsv(labels, owner) {
         if !cols.Has(l)
             missing .= (missing != "" ? ", " : "") l
     if (missing != "") {
-        MsgBox("The CSV is missing a column for: " missing
-            . "`n`nIts header row must name every input (extra columns are fine).",
-            "VoiceKit loop", "Icon! Owner" owner.Hwnd)
+        err := "It's missing a column for: " missing
+             . "`n`nThe header row must name every input (extra columns are fine)."
         return ""
     }
     rows := []
@@ -199,10 +345,47 @@ WfLoopImportCsv(labels, owner) {
         rows.Push(row)
     }
     if !rows.Length {
-        MsgBox("That CSV has a header but no rows of answers.", "VoiceKit loop", "Icon! Owner" owner.Hwnd)
+        err := "It has a header row but no rows of answers."
         return ""
     }
     return rows
+}
+
+; Create a workflow's inputs sheet: just the header row, one column per
+; input. UTF-8 BOM + CRLF so Excel opens it cleanly.
+WfLoopSheetCreate(path, labels) {
+    line := ""
+    for l in labels
+        line .= (A_Index > 1 ? "," : "") WfLoopCsvField(l)
+    f := FileOpen(path, "w", "UTF-8")
+    f.Write(line "`r`n")
+    f.Close()
+}
+
+; Quote a CSV field when it holds a comma, quote or newline (RFC-4180).
+WfLoopCsvField(s) {
+    if !RegExMatch(s, '[,"`n`r]')
+        return s
+    return '"' StrReplace(s, '"', '""') '"'
+}
+
+; ---- the pause between runs, remembered per workflow ----
+WfLoopSettingsFile() {
+    return RegExReplace(A_LineFile, "\\lib\\[^\\]+$") "\logs\settings.ini"
+}
+; Stored ms -> the seconds string the dialog's box shows ("1.5", "2").
+WfLoopDelayLoad(base) {
+    ms := IniRead(WfLoopSettingsFile(), "Loop", base, 1500)
+    if !IsNumber(ms)
+        ms := 1500
+    return RTrim(RTrim(Format("{:.1f}", ms / 1000.0), "0"), ".")
+}
+WfLoopDelaySave(base, ms) {
+    ini := WfLoopSettingsFile()
+    dir := RegExReplace(ini, "\\[^\\]+$")
+    if !DirExist(dir)
+        try DirCreate(dir)
+    try IniWrite(ms, ini, "Loop", base)
 }
 
 ; Type a batch of rows by hand: one edit per label, "Add Row" stores the
@@ -324,7 +507,9 @@ WfCsvParse(text) {
     return recs
 }
 
-; Ask the running loop to stop after the current pass.
+; Ask the running loop to stop. Takes effect immediately: the engine's
+; abort hook reads this flag between steps and inside its waits, so the
+; current pass ends right where it is (quietly — no failure popup).
 WfLoopRequestStop() {
     global wfLoopStop
     wfLoopStop := true

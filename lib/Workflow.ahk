@@ -17,6 +17,44 @@
 ; ============================================================
 #Include "%A_LineFile%\..\Acc.ahk"
 
+; Optional abort hook: a host (the loop runner's Stop button) sets this to
+; a callable returning true when the run should stop. The engine polls it
+; between steps and inside its long waits (Wait steps, window waits, the
+; settle pauses), so a stop cuts in mid-run instead of after the pass.
+; An aborted run returns false QUIETLY — no failure popup, like cancel.
+global wfRunAbortCheck := ""
+
+; True when the host asked the current run to stop.
+WfAborted() {
+    global wfRunAbortCheck
+    return IsObject(wfRunAbortCheck) && wfRunAbortCheck.Call()
+}
+
+; Sleep in slices so the abort hook can cut it short. False if aborted.
+WfSleep(ms) {
+    left := ms
+    while (left > 0) {
+        if WfAborted()
+            return false
+        chunk := Min(100, left)
+        Sleep(chunk)
+        left -= chunk
+    }
+    return !WfAborted()
+}
+
+; WinWait, sliced the same way. Returns the HWND, or 0 on timeout/abort.
+WfWinWait(crit, timeoutSec) {
+    deadline := A_TickCount + Round(timeoutSec * 1000)
+    loop {
+        if (hwnd := WinExist(crit))
+            return hwnd
+        if (WfAborted() || A_TickCount >= deadline)
+            return 0
+        Sleep(100)
+    }
+}
+
 ; Run a saved workflow file. Returns true if every step ran.
 RunWorkflow(stepsFile) {
     if !FileExist(stepsFile) {
@@ -57,6 +95,8 @@ RunWorkflowSteps(steps, askVals := "") {
     }
     i := 1, n := steps.Length
     while (i <= n) {
+        if WfAborted()                  ; host asked the run to stop — quiet, like cancel
+            return false
         s := steps[i], t := s[1]
         if (t = "ask") {                ; type the answer collected up front
             SendText(askVals.Get(WfAskLabel(s), ""))
@@ -91,13 +131,15 @@ RunWorkflowSteps(steps, askVals := "") {
         catch as e
             err := "Unexpected error: " e.Message
         if (err != "") {
+            if WfAborted()              ; the Stop cut this step's wait short — not a real failure
+                return false
             MsgBox("Workflow stopped at step " i " of " n ".`n`n"
                 . WfDesc(s) "`n`n" err, "VoiceKit workflow", "Icon! 262144")   ; 262144 = always-on-top
             return false
         }
         i += 1
     }
-    return true
+    return !WfAborted()     ; a stop during the LAST step must still report "didn't finish"
 }
 
 ; The label an `ask` step is keyed by ("Input" if somehow blank — the
@@ -175,7 +217,16 @@ WfAskInputDialog(label, suggestion := "") {
         WinActivate("ahk_id " hwnd)
         ControlFocus(edHwnd, "ahk_id " hwnd)
     }
-    WinWaitClose("ahk_id " hwnd)
+    ; Wait for the dialog, but let the abort hook close it: in the loop's
+    ; "ask me before each run" mode, clicking Stop Looping while a question
+    ; is up should end things right there — a quiet cancel.
+    while WinExist("ahk_id " hwnd) {
+        if WfAborted() {
+            try d.Destroy()
+            break
+        }
+        Sleep(100)
+    }
     return result
 }
 
@@ -259,53 +310,62 @@ WfRunStep(s) {
         case "focus":
             if WinExist(a) {
                 WinActivate(a)
-                Sleep(300)          ; let the app take focus before keys arrive
+                WfSleep(300)        ; let the app take focus before keys arrive
                 return ""
             }
             if (b = "") {
-                ; Recordings capture no timing, so a window that appears a
-                ; beat later (a dialog, a loading app) is normal — wait for
-                ; it like waitwin does instead of failing instantly.
-                if !WinWait(a, , 10)
+                ; Recorded timing is coarse (and older recordings captured
+                ; none at all), so a window that appears a beat later (a
+                ; dialog, a loading app) is normal — wait for it like
+                ; waitwin does instead of failing instantly.
+                if !WfWinWait(a, 10)
                     return "Window not found (and no launch command is set): " a
                 WinActivate(a)
-                Sleep(300)
+                WfSleep(300)
                 return ""
             }
             try Run(b)
             catch
                 return "Couldn't launch: " b
-            if !WinWait(a, , 10)
+            if !WfWinWait(a, 10)
                 return "Launched, but the window never appeared: " a
             WinActivate(a)
-            Sleep(300)
+            WfSleep(300)
         case "waitwin":
             timeout := 10
             if (b != "")
                 try timeout := Number(b)
-            if !WinWait(a, , timeout)
+            if !WfWinWait(a, timeout)
                 return "Window didn't appear within " timeout "s: " a
             WinActivate(a)
-            Sleep(300)
+            WfSleep(300)
         case "wait":
-            try Sleep(Integer(a))
+            ms := 0
+            try ms := Integer(a)
             catch
                 return "Not a number of milliseconds: " a
+            WfSleep(ms)             ; sliced, so a loop Stop cuts it short
         case "text":
             SendText(a)
+            Sleep(150)          ; same beat the ask/click steps give the app
         case "keys":
             try Send(a)
             catch
                 return "Bad key syntax (see AHK v2 Send docs): " a
+            ; Recorded keystroke steps replay machine-fast: without a beat
+            ; between them, {Down} after typed text races the app's own UI
+            ; (an autocomplete list that hasn't populated yet). Bigger gaps
+            ; the user actually took are recorded as Wait steps.
+            Sleep(150)
         case "click", "dblclick", "rclick":
             ; a = window, b = element name (may be ""), c = "x,y" window-relative fallback
-            if (!WinExist(a) && !WinWait(a, , 10))   ; same grace as focus/waitwin
+            if (!WinExist(a) && !WfWinWait(a, 10))   ; same grace as focus/waitwin
                 return "Window not found: " a
             WinActivate(a)
             if (b = "")
                 WfPosOnlySettle(a)    ; blind click — wait for the app to be ready
             else
-                Sleep(400)
+                WfSleep(400)
             CoordMode("Mouse", "Screen")
             btn := (t = "rclick") ? "Right" : "Left"
             n := (t = "dblclick") ? 2 : 1
@@ -331,19 +391,19 @@ WfRunStep(s) {
             ; a = window, b = element name (may be ""), c = "x,y" window-relative
             ; fallback. Move the pointer there and dwell so hover-triggered UI
             ; (submenus, tooltips) has time to appear; the next step acts on it.
-            if (!WinExist(a) && !WinWait(a, , 10))   ; same grace as click/focus
+            if (!WinExist(a) && !WfWinWait(a, 10))   ; same grace as click/focus
                 return "Window not found: " a
             WinActivate(a)
             if (b = "")
                 WfPosOnlySettle(a)    ; blind hover — same readiness wait as clicks
             else
-                Sleep(400)
+                WfSleep(400)
             CoordMode("Mouse", "Screen")
             if (b != "") {
                 loc := AccFindByName(WinExist(a), b)
                 if IsObject(loc) {
                     MouseMove(loc.x + loc.w // 2, loc.y + loc.h // 2, 0)
-                    Sleep(700)                       ; dwell so the hover registers
+                    WfSleep(700)                     ; dwell so the hover registers
                     return ""
                 }
                 if (c = "")
@@ -356,7 +416,7 @@ WfRunStep(s) {
                 return "Bad hover position: " c
             WinGetPos(&wx, &wy, , , a)
             MouseMove(wx + Trim(xy[1]), wy + Trim(xy[2]), 0)
-            Sleep(700)
+            WfSleep(700)
         case "move":
             if !WinExist(a)
                 return "Window not found: " a
@@ -398,7 +458,9 @@ WfRunStep(s) {
 ; deterministic with fixed caps; content that loads later still needs an
 ; explicit Wait step before the click.
 WfPosOnlySettle(win) {
-    WinWaitActive(win, , 3)
+    deadline := A_TickCount + 3000                   ; WinWaitActive, sliced for the abort hook
+    while (!WinActive(win) && A_TickCount < deadline && !WfAborted())
+        Sleep(100)
     try {
         pid := WinGetPID(win)
         ; SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION — enough for
@@ -406,11 +468,17 @@ WfPosOnlySettle(win) {
         ; full query rights. A failed open just skips straight to the pause.
         hProc := DllCall("OpenProcess", "uint", 0x101000, "int", 0, "uint", pid, "ptr")
         if hProc {
-            DllCall("user32\WaitForInputIdle", "ptr", hProc, "uint", 5000)
+            deadline := A_TickCount + 5000           ; sliced too (258 = WAIT_TIMEOUT)
+            loop {
+                if (DllCall("user32\WaitForInputIdle", "ptr", hProc, "uint", 250) != 258)
+                    break
+                if (WfAborted() || A_TickCount >= deadline)
+                    break
+            }
             DllCall("CloseHandle", "ptr", hProc)
         }
     }
-    Sleep(1200)
+    WfSleep(1200)
 }
 
 ; One-line description of a step (Studio list + error messages).
@@ -421,7 +489,7 @@ WfDesc(s) {
         case "run":      return "Open  " a
         case "focus":    return "Focus  " a (b != "" ? "    (launches: " b ")" : "")
         case "waitwin":  return "Wait for window  " a "    (up to " (b != "" ? b : "10") "s)"
-        case "wait":     return "Wait  " a " ms"
+        case "wait":     return "Wait  " WfDurDesc(a)
         case "text":     return "Type  `"" a "`""
         case "ask":      return "Ask me for  `"" a "`""
             . (b != "" ? "    (suggested: " b ")" : "") "    — the answer is typed here"
@@ -437,6 +505,16 @@ WfDesc(s) {
         case "endif":    return "End if"
     }
     return t "  " a "  " b
+}
+
+; Friendly duration for a wait step's milliseconds: "2.6 s", "2 s", "800 ms".
+; Integer math only (no float formatting surprises), and junk is shown raw —
+; WfDesc must never throw, it renders the error popup for a failing step.
+WfDurDesc(ms) {
+    if (!IsInteger(ms) || ms < 1000)
+        return ms " ms"
+    whole := ms // 1000, tenth := Mod(ms // 100, 10)
+    return whole (tenth ? "." tenth : "") " s"
 }
 
 ; Human-readable form of an `if` condition. cond = condType, win = window,

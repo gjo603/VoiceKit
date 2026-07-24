@@ -51,6 +51,7 @@ lastCharTick := 0
 lastClick := {tick: 0, x: 0, y: 0, idx: 0}
 recMaxed := Map()       ; window crits already maximize-handled this take
 recStartCount := 0      ; steps.Length when recording started (for the stop summary)
+recLastAct := 0         ; tick of the last captured input — the pause-capture anchor
 
 ; Advanced if/else/endif entries live at the END so they're never the default
 ; and don't clutter ordinary recording. The four "if" rows all save as type
@@ -644,7 +645,7 @@ RunOwnedDialog(d) {
 ; ============================================================
 StartRecording() {
     global recording, recLastHwnd, recLastCrit, typedBuf, lastClick, g, recBar, chkCloseTabs, steps
-    global recMaxed, recStartCount
+    global recMaxed, recStartCount, recLastAct
     if recording
         return
     ; Recording APPENDS to the current step list, so an accidental start
@@ -670,6 +671,7 @@ StartRecording() {
     lastClick := {tick: 0, x: 0, y: 0, idx: 0}
     recMaxed := Map()
     recStartCount := steps.Length
+    recLastAct := 0                 ; no pause before a take's first action
     StartKeyHook()
     g.Hide()
     UpdateRecBar("Ctrl+Alt+Shift:  H hover  ·  I ask input  ·  X stop")
@@ -691,20 +693,25 @@ StopRecording() {
     WinActivate("ahk_id " g.Hwnd)
     if steps.Length
         lv.Modify(steps.Length, "Select Focus Vis")
-    posOnly := 0
+    posOnly := 0, pauses := 0
     Loop Max(0, steps.Length - recStartCount) {      ; count THIS take only
         s := steps[recStartCount + A_Index]
         if ((s[1] = "click" || s[1] = "dblclick" || s[1] = "rclick" || s[1] = "hover") && s[3] = "" && s[4] != "")
             posOnly += 1
+        else if (s[1] = "wait")                      ; in-take waits are all auto-captured pauses
+            pauses += 1
     }
+    pNote := !pauses ? ""
+        : "  Kept " pauses " pause" (pauses = 1 ? "" : "s") " as Wait step" (pauses = 1 ? "" : "s")
+        . " so playback matches your pace — edit or delete any."
     if (steps.Length = recStartCount)
         SB("Nothing was captured — recording sees window switches, clicks and typing in normal app windows (the Start menu and taskbar don't count). Try again.")
     else if (posOnly && chkCoordsOnly.Value)
-        SB("Recorded — " posOnly " step" (posOnly = 1 ? "" : "s") " captured by position (⚠), as chosen. They replay by screen location, so keep the same window layout — the Maximize option helps.")
+        SB("Recorded — " posOnly " step" (posOnly = 1 ? "" : "s") " captured by position (⚠), as chosen. They replay by screen location, so keep the same window layout — the Maximize option helps." pNote)
     else if posOnly
-        SB("Recorded — " posOnly " click" (posOnly = 1 ? " was" : "s were") " captured by position only (⚠ in the list) because nothing readable was under the mouse. They replay less reliably — prefer clicking labeled controls.")
+        SB("Recorded — " posOnly " click" (posOnly = 1 ? " was" : "s were") " captured by position only (⚠ in the list) because nothing readable was under the mouse. They replay less reliably — prefer clicking labeled controls." pNote)
     else
-        SB("Recorded — trim or edit steps if needed, then click Test and Save.")
+        SB("Recorded — trim or edit steps if needed, then click Test and Save." pNote)
 }
 
 RecPush(step, note) {
@@ -719,6 +726,32 @@ UpdateRecBar(note) {
     global recNote, recCount, steps
     recNote.Text := Abbrev(note, 52)
     recCount.Text := steps.Length " steps"
+}
+
+; Reproduce the user's own pacing. Called right before a captured action is
+; pushed: if a meaningful pause separated it from the previous captured input,
+; save that pause as an ordinary (visible, editable, deletable) Wait step, so
+; playback waits roughly as long as the recording did — for the page to load,
+; the autocomplete list to appear, the menu to open. The anchor (recLastAct)
+; is the time of the previous INPUT event, never of a step push: flushing the
+; typed-text buffer pushes its Type step long after the typing happened, and
+; must not count as fresh activity. Below the floor the engine's built-in
+; pacing already covers the gap — click/hover/focus steps window-wait and
+; settle (~0.4–1.5 s) before acting, while keystroke steps get only a 150 ms
+; beat, so keyboard boundaries use the lower floor. Long distractions (a
+; phone call mid-recording) are capped; the first action of a take gets no
+; Wait at all — that gap is just the user getting ready, not the app.
+RecMarkPause(kind := "mouse", atTick := 0) {
+    global recLastAct
+    if !recLastAct
+        return
+    if !atTick
+        atTick := A_TickCount
+    gap := atTick - recLastAct
+    if (gap < (kind = "key" ? 700 : 1500))
+        return
+    gap := Round(Min(gap, 30000) / 100) * 100        ; ~0.1 s grain, 30 s cap
+    RecPush(["wait", String(gap), "", ""], "Paused " WfDurDesc(gap) " — kept as a Wait step")
 }
 
 ; ---- crash-safe autosave of an in-progress recording ----
@@ -772,7 +805,7 @@ OfferRecovery() {
 }
 
 RecTick() {
-    global recording, typedBuf, lastCharTick, recLastHwnd, recLastCrit
+    global recording, typedBuf, lastCharTick, recLastHwnd, recLastCrit, recLastAct
     if !recording
         return
     if (typedBuf != "" && A_TickCount - lastCharTick > 1500)
@@ -785,8 +818,10 @@ RecTick() {
     if (!IsObject(info) || info.crit = recLastCrit)
         return
     FlushTypedText()
+    RecMarkPause()                  ; e.g. idle until an app popped this window itself
     recLastCrit := info.crit
     RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
+    recLastAct := A_TickCount
     RecEnsureMax(hwnd, info.crit)
 }
 
@@ -825,7 +860,7 @@ RecDeferredMax(hwnd, crit) {
 }
 
 RecClick(btn) {
-    global recording, steps, recLastHwnd, recLastCrit, lastClick, chkCoordsOnly
+    global recording, steps, recLastHwnd, recLastCrit, lastClick, chkCoordsOnly, recLastAct
     if !recording
         return
     MouseGetPos(&mx, &my, &hwnd)
@@ -833,6 +868,10 @@ RecClick(btn) {
     if !IsObject(info)
         return
     FlushTypedText()
+    ; The second press of a live double-click also lands here; its gap since
+    ; the first press is under the double-click time, far below the floor,
+    ; so RecMarkPause stays silent and can't split the pair.
+    RecMarkPause()
     if (info.crit != recLastCrit) {
         RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
         recLastCrit := info.crit
@@ -853,6 +892,7 @@ RecClick(btn) {
             UpdateRecBar("Double-click " steps[lastClick.idx][3])
         }
         WriteAutosave()
+        recLastAct := now
         lastClick := {tick: 0, x: 0, y: 0, idx: 0}
         return
     }
@@ -871,6 +911,7 @@ RecClick(btn) {
         (btn = "R" ? "Right-click " : "Click ") (elem != "" ? "`"" elem "`"" : "at " rel))
     if (btn = "L")
         lastClick := {tick: now, x: mx, y: my, idx: steps.Length}
+    recLastAct := now
     ; Maximize LATER, not now: this hotkey runs on button-DOWN, and moving
     ; the window mid-gesture would break the user's own click/double-click
     ; (see RecDeferredMax). The captured element/coords above deliberately
@@ -885,7 +926,7 @@ RecClick(btn) {
 ; window-relative position kept as the fallback. The engine's hover step moves
 ; the pointer there and pauses so the menu/tooltip appears.
 RecHover() {
-    global recording, recLastHwnd, recLastCrit, chkCoordsOnly
+    global recording, recLastHwnd, recLastCrit, chkCoordsOnly, recLastAct
     if !recording
         return
     MouseGetPos(&mx, &my, &hwnd)
@@ -895,6 +936,7 @@ RecHover() {
         return
     }
     FlushTypedText()
+    RecMarkPause()
     if (info.crit != recLastCrit) {
         RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
         recLastCrit := info.crit
@@ -912,6 +954,7 @@ RecHover() {
     rel := (mx - wx) "," (my - wy)
     RecPush(["hover", info.crit, elem, rel],
         "Hover " (elem != "" ? "`"" elem "`"" : "at " rel))
+    recLastAct := A_TickCount
     ; Maximize AFTER capturing (like the click path) so the recorded coords/name
     ; reflect the geometry the mouse was actually over; the deferred timer avoids
     ; reflowing the window synchronously under the just-pressed hotkey.
@@ -926,9 +969,11 @@ RecHover() {
 ; If the focused window is new to the take, a Focus step is pushed first so the
 ; answer lands in the same app the user was in when they pressed the hotkey.
 RecAskInput() {
-    global recording, recLastHwnd, recLastCrit
+    global recording, recLastHwnd, recLastCrit, recLastAct
     if !recording
         return
+    pressTick := A_TickCount        ; any pause ends at the hotkey press — time
+                                    ; spent in the label dialog is not app time
     hwnd := WinExist("A")
     info := ClassifyWindow(hwnd)
     FlushTypedText()
@@ -936,9 +981,12 @@ RecAskInput() {
     if (hwnd && WinExist("ahk_id " hwnd))       ; hand focus back either way, so
         WinActivate("ahk_id " hwnd)             ; the recording continues seamlessly
     if (label = "") {
+        recLastAct := A_TickCount   ; dialog time must not leak into the next gap
         UpdateRecBar("Ask-for-input cancelled")
         return
     }
+    RecMarkPause("key", pressTick)  ; before the anchor reset — it reads recLastAct
+    recLastAct := A_TickCount
     if (IsObject(info) && info.crit != recLastCrit) {
         RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
         recLastCrit := info.crit
@@ -1026,18 +1074,26 @@ StopKeyHook() {
 }
 
 RecChar(h, char) {
-    global recording, typedBuf, lastCharTick
+    global recording, typedBuf, lastCharTick, recLastAct
     if (!recording || Ord(char) < 32)
         return
     if !IsObject(ClassifyWindow(WinExist("A")))   ; ignore typing into Start menu / own UI
         return
+    ; A new burst of typing starts here; whatever it later flushes into a Type
+    ; step, the pause the user took BEFORE typing belongs in front of it — and
+    ; every flush trigger pushes the Type step next, so the Wait lands right
+    ; before it. Pauses WITHIN a burst don't split it (the buffer only flushes
+    ; after 1.5 s idle, and a fresh burst after that gets its own Wait).
+    if (typedBuf = "")
+        RecMarkPause("key")
     typedBuf .= char
     lastCharTick := A_TickCount
+    recLastAct := lastCharTick
     UpdateRecBar("Typing: `"" typedBuf "`"")
 }
 
 RecKeyDown(h, vk, sc) {
-    global recording, typedBuf
+    global recording, typedBuf, recLastAct
     if !recording
         return
     key := GetKeyName(Format("vk{:x}sc{:x}", vk, sc))
@@ -1059,9 +1115,12 @@ RecKeyDown(h, vk, sc) {
     if (key = "Backspace" && mods = "") {
         if (typedBuf != "") {               ; natural correction: un-type the last char
             typedBuf := SubStr(typedBuf, 1, -1)
+            recLastAct := A_TickCount       ; a correction is activity too
             UpdateRecBar("Typing: `"" typedBuf "`"")
         } else {
+            RecMarkPause("key")
             RecPush(["keys", "{Backspace}", "", ""], "Press Backspace")
+            recLastAct := A_TickCount
         }
         return
     }
@@ -1071,8 +1130,11 @@ RecKeyDown(h, vk, sc) {
     if (mods != "" && !isSpecial && StrLen(key) != 1)
         return                              ; modifier + exotic key (volume etc.) — skip
     FlushTypedText()
+    RecMarkPause("key")             ; e.g. typed a name, waited for the
+                                    ; suggestion list, THEN pressed Down
     combo := mods (shift ? "+" : "") "{" key "}"
     RecPush(["keys", combo, "", ""], "Press " combo)
+    recLastAct := A_TickCount
 }
 
 FlushTypedText() {
@@ -1273,8 +1335,10 @@ ShowHelp(*) {
         . "       double-click a row to edit, and click Add to insert a pause if`n"
         . "       an app needs time to load.`n"
         . "  4.  Test plays it. Save makes it a voice command: say `"open <name>`".`n`n"
-        . "Playback is patient: it waits up to 10 seconds for each window to`n"
-        . "appear, so you rarely need manual Wait steps.`n`n"
+        . "Playback matches your pace: pauses you take while recording (for`n"
+        . "a page to load, a menu to appear) are saved as editable Wait steps`n"
+        . "— delete any you don't want. It's patient beyond that too, waiting`n"
+        . "up to 10 seconds for each window to appear.`n`n"
         . "Tips: `"Close browser tabs before recording`" starts from a fresh`n"
         . "browser (leftover tabs shift things). `"Maximize windows while`n"
         . "recording`" locks in one window layout — playback re-maximizes the`n"

@@ -318,14 +318,16 @@ HotkeyCompanionRetire(root, base) {
         RunAhk(root "\VoiceKit.ahk")
 }
 
-; Delete a saved workflow's artifacts, all five: steps file, generated
-; stub (only when it carries the "Workflow Studio" marker — hand-written
-; macros are never clobbered), the phrase and "loop <phrase>" Start Menu
-; entries, and any companion hotkey (reloading the master if one
-; existed). disp is the spoken/display phrase the .lnk files are named
-; by. Home and Workflow Studio both delete through here.
+; Delete a saved workflow's artifacts, all of them: steps file, loop
+; inputs sheet, generated stub (only when it carries the "Workflow
+; Studio" marker — hand-written macros are never clobbered), the phrase
+; and "loop <phrase>" Start Menu entries, and any companion hotkey
+; (reloading the master if one existed). disp is the spoken/display
+; phrase the .lnk files are named by. Home and Workflow Studio both
+; delete through here.
 DeleteWorkflowArtifacts(root, base, disp) {
     try FileDelete(root "\workflows\" base ".steps.txt")
+    try FileDelete(root "\workflows\" base ".inputs.csv")
     stub := root "\macros\" base ".ahk"
     if (FileExist(stub) && InStr(FileRead(stub, "UTF-8"), "Workflow Studio"))
         try FileDelete(stub)
