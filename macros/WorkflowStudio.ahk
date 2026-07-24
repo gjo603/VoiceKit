@@ -55,15 +55,16 @@ recStartCount := 0      ; steps.Length when recording started (for the stop summ
 ; Advanced if/else/endif entries live at the END so they're never the default
 ; and don't clutter ordinary recording. The four "if" rows all save as type
 ; "if"; typeConds carries the condition kind (paramC of the step).
-typeIds    := ["focus", "run", "waitwin", "wait", "text", "keys", "click", "dblclick", "rclick", "hover", "move", "close"
+typeIds    := ["focus", "run", "waitwin", "wait", "text", "ask", "keys", "click", "dblclick", "rclick", "hover", "move", "close"
              , "if", "if", "if", "if", "else", "endif"]
-typeConds  := ["", "", "", "", "", "", "", "", "", "", "", ""
+typeConds  := ["", "", "", "", "", "", "", "", "", "", "", "", ""
              , "winexists", "winnotexists", "elementexists", "elementnotexists", "", ""]
 typeLabels := ["Focus window (launch it if needed)"
              , "Open app / file / website"
              , "Wait for a window to appear"
              , "Wait (pause for milliseconds)"
              , "Type text"
+             , "Ask me for input (asks before the run; types the answer here)"
              , "Press keys (e.g. {Enter}, ^s)"
              , "Left-click something in a window (by its name)"
              , "Double-click something in a window"
@@ -83,6 +84,7 @@ typeLabels := ["Focus window (launch it if needed)"
 ~*LButton:: RecClick("L")
 ~*RButton:: RecClick("R")
 ^!+h:: RecHover()           ; mark a hover point (menus/tooltips can't be clicked)
+^!+i:: RecAskInput()        ; mark an ask-for-input point (label it; playback asks up front)
 ^!+x:: StopRecording()      ; backup stop — works even if the REC bar is covered
 #HotIf
 
@@ -168,7 +170,15 @@ g.Show()
 btnRec.Focus()           ; land on Record so pressing Enter starts recording
 recovered := OfferRecovery()   ; restore an interrupted recording, if any
 if (A_Args.Length >= 1) {
-    if recovered
+    if (StrLower(A_Args[1]) = "/record") {
+        ; "Record My Steps" (macro / hotkey): jump straight into recording a
+        ; new workflow. Recovery still wins — auto-recording on top of just-
+        ; recovered steps would append to them behind the user's back.
+        if recovered
+            SB("Recovered steps kept — click Record when you're ready to add more.")
+        else
+            StartRecording()
+    } else if recovered
         SB("Recovered steps kept — the file passed on the command line was not loaded.")
     else
         LoadStartupFile(A_Args[1])
@@ -415,6 +425,8 @@ StepDialog(existing := "") {
                          "Give up after this many seconds (blank = 10):"],
             "wait",     ["How long to pause, in milliseconds (1000 = 1 second):", ""],
             "text",     ["Text to type into the focused window:", ""],
+            "ask",      ["What should I ask you for? — the input's label, e.g. 'Customer name':",
+                         "Suggested answer, prefilled in the ask box — optional:"],
             "keys",     ["Keys to press — AHK v2 syntax, e.g. {Enter}, {Tab 2}, ^s:", ""],
             "click",    ["Window:", "What to click — its name exactly as shown on screen:"],
             "dblclick", ["Window:", "What to double-click — its name exactly as shown on screen:"],
@@ -428,7 +440,7 @@ StepDialog(existing := "") {
         laB.Text := labels[t][2]
         laB.Visible := needB
         edB.Visible := needB
-        btnGrab.Visible := (t != "run" && t != "wait" && t != "text" && t != "keys")
+        btnGrab.Visible := (t != "run" && t != "wait" && t != "text" && t != "ask" && t != "keys")
         btnPick.Visible := (t = "click" || t = "dblclick" || t = "rclick" || t = "hover")   ; element-name steps
         btnBrowse.Visible := (t = "run")
     }
@@ -536,7 +548,7 @@ StepDialog(existing := "") {
             MsgBox("Give the element's name as shown on screen — or record it instead.", "Add Step", "Owner" d.Hwnd)
             return
         }
-        if !(t = "focus" || t = "waitwin" || t = "move" || isPointer)
+        if !(t = "focus" || t = "waitwin" || t = "move" || t = "ask" || isPointer)
             b := ""
         result := [t, a, b, isPointer ? preservedC : ""]
         d.Destroy()
@@ -613,10 +625,14 @@ SaveNameDialog(defaultName := "") {
 RunOwnedDialog(d) {
     global g
     ThemeApply(d)
+    ; Capture the hwnd BEFORE Show: an instant OK/Enter can destroy the Gui
+    ; before d.Hwnd is read again, and a property read on a destroyed Gui
+    ; throws "Gui has no window" (a raw hwnd stays safe to wait on).
+    hwnd := d.Hwnd
     d.Show()
     g.Opt("+Disabled")
-    WinActivate("ahk_id " d.Hwnd)
-    WinWaitClose("ahk_id " d.Hwnd)
+    try WinActivate("ahk_id " hwnd)
+    WinWaitClose("ahk_id " hwnd)
     g.Opt("-Disabled")
     WinActivate("ahk_id " g.Hwnd)
 }
@@ -656,7 +672,7 @@ StartRecording() {
     recStartCount := steps.Length
     StartKeyHook()
     g.Hide()
-    UpdateRecBar("Hover: Ctrl+Alt+Shift+H   ·   Stop: Ctrl+Alt+Shift+X")
+    UpdateRecBar("Ctrl+Alt+Shift:  H hover  ·  I ask input  ·  X stop")
     ShowBottomLeft(recBar)                    ; bottom-left, clear of the taskbar
     SetTimer(RecTick, 250)
 }
@@ -902,6 +918,70 @@ RecHover() {
     SetTimer((*) => RecDeferredMax(hwnd, info.crit), -(DllCall("GetDoubleClickTime") + 150))
 }
 
+; Mark an ASK-FOR-INPUT at the current focus — Ctrl+Alt+Shift+I while recording.
+; A small dialog labels the input (typing into it isn't captured — RecChar and
+; RecKeyDown ignore the Studio's own windows via ClassifyWindow). Playback asks
+; for every labeled input BEFORE the run starts and types the answer at this
+; step's position, so a recorded workflow can take a fresh value each run.
+; If the focused window is new to the take, a Focus step is pushed first so the
+; answer lands in the same app the user was in when they pressed the hotkey.
+RecAskInput() {
+    global recording, recLastHwnd, recLastCrit
+    if !recording
+        return
+    hwnd := WinExist("A")
+    info := ClassifyWindow(hwnd)
+    FlushTypedText()
+    label := AskLabelDialog()
+    if (hwnd && WinExist("ahk_id " hwnd))       ; hand focus back either way, so
+        WinActivate("ahk_id " hwnd)             ; the recording continues seamlessly
+    if (label = "") {
+        UpdateRecBar("Ask-for-input cancelled")
+        return
+    }
+    if (IsObject(info) && info.crit != recLastCrit) {
+        RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
+        recLastCrit := info.crit
+        recLastHwnd := hwnd
+    }
+    RecPush(["ask", label, "", ""], "Ask for `"" label "`"")
+}
+
+; Themed always-on-top dialog naming an ask-for-input step's label.
+; Returns the trimmed label, or "" if cancelled. No owner — the Studio
+; window is hidden while recording.
+AskLabelDialog() {
+    result := ""
+    d := Gui("+AlwaysOnTop", "Ask me for input")
+    d.SetFont("s10", "Segoe UI")
+    d.AddText("xm w400", "Label this input — what should playback ask you for?")
+    hint := d.AddText("xm y+4 w400", "e.g.  Customer name   ·   Order number   ·   Today's notes")
+    ed := d.AddEdit("xm y+10 w400")
+    btnOK := d.AddButton("xm y+14 w120 Default", "OK")
+    btnCancel := d.AddButton("x+8 w120", "Cancel")
+    OK(*) {
+        v := Trim(ed.Value)
+        if (v = "")
+            return
+        result := v
+        d.Destroy()
+    }
+    btnOK.OnEvent("Click", OK)
+    btnCancel.OnEvent("Click", (*) => d.Destroy())
+    d.OnEvent("Close", (*) => d.Destroy())
+    d.OnEvent("Escape", (*) => d.Destroy())
+    ThemeApply(d)
+    ThemeDim(hint)
+    hwnd := d.Hwnd, edHwnd := ed.Hwnd   ; pre-Show: reads on a destroyed Gui throw
+    d.Show()
+    try {                               ; dialog may be dismissed before these run
+        WinActivate("ahk_id " hwnd)
+        ControlFocus(edHwnd, "ahk_id " hwnd)
+    }
+    WinWaitClose("ahk_id " hwnd)
+    return result
+}
+
 ; Full path of the item selected in an Explorer window, or "".
 ExplorerSelection(hwnd) {
     try {
@@ -973,6 +1053,8 @@ RecKeyDown(h, vk, sc) {
         return                              ; the stop-recording hotkey, not a workflow step
     if (key = "h" && ctrl && alt && shift)
         return                              ; the mark-hover hotkey, not a workflow step
+    if (key = "i" && ctrl && alt && shift)
+        return                              ; the ask-for-input hotkey, not a workflow step
     mods := (ctrl ? "^" : "") (alt ? "!" : "") (win ? "#" : "")
     if (key = "Backspace" && mods = "") {
         if (typedBuf != "") {               ; natural correction: un-type the last char
@@ -1180,6 +1262,12 @@ ShowHelp(*) {
         . "       To capture a HOVER (e.g. to open a menu that only appears`n"
         . "       when the mouse rests on something), point at it and press`n"
         . "       Ctrl+Alt+Shift+H — a Hover step is added where the mouse is.`n"
+        . "       To make playback ASK YOU for a value that changes each run`n"
+        . "       (a name, a number, today's notes), press Ctrl+Alt+Shift+I`n"
+        . "       and label the input — the run asks for every labeled input`n"
+        . "       up front, then types your answer at that spot. Looping a`n"
+        . "       workflow with inputs can even take a whole list at once`n"
+        . "       (typed in, or a CSV whose columns are the labels).`n"
         . "  3.  Stop with the REC bar's Stop button, by saying `"click stop`",`n"
         . "       or by pressing Ctrl+Alt+Shift+X. Then trim or edit the steps —`n"
         . "       double-click a row to edit, and click Add to insert a pause if`n"
@@ -1196,7 +1284,7 @@ ShowHelp(*) {
         . "⚠ were captured by position only and are the first thing to fix if`n"
         . "playback misses.`n`n"
         . "Notes: don't type passwords while recording; drags and scrolling`n"
-        . "aren't captured (hover is — see Ctrl+Alt+Shift+H above). Every`n"
+        . "aren't captured (hover and ask-for-input are — see above). Every`n"
         . "button is voice-clickable — say `"click`" plus`n"
         . "its word: `"click record`", `"click add`", `"click test`", `"click save`".`n`n"
         . "See everything you've made in one place: say `"open voice kit`".",

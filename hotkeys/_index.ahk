@@ -7,3 +7,5 @@
 #Include "%A_ScriptDir%\hotkeys\Snippets.ahk"
 
 #Include "%A_ScriptDir%\hotkeys\ToggleTimer.ahk"
+
+#Include "%A_ScriptDir%\hotkeys\RecordMySteps.hotkey.ahk"

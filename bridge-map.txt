@@ -12,3 +12,4 @@
 ;
 ; Format: KEYCOMBO|PHRASE|FILE|CREATED
 Ctrl+Alt+Shift+A|Toggle Timer|hotkeys\ToggleTimer.ahk|2026-07-07
+Ctrl+Alt+Shift+W|open record my steps|hotkeys\RecordMySteps.hotkey.ahk|2026-07-23
