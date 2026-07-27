@@ -407,6 +407,8 @@ StepDialog(existing := "") {
     btnGrab := d.AddButton("xm y+12 w210", "Grab a Window (3 sec)")
     btnPick := d.AddButton("x+8 w210", "Pick element (3 sec)")
     btnBrowse := d.AddButton("xm yp w180", "Browse for File...")   ; same row; shown only for 'run'
+    btnSpot := d.AddButton("xm y+8 w210", "Pick a spot (3 sec)")   ; click a POSITION, no name needed
+    laC := d.AddText("xm y+6 w480", "")                            ; the picked spot, dimmed
     btnOK := d.AddButton("xm y+14 w120 Default", "OK")
     btnCancel := d.AddButton("x+8 w120", "Cancel")
 
@@ -416,6 +418,7 @@ StepDialog(existing := "") {
         if (t = "else" || t = "endif") {
             laA.Visible := edA.Visible := laB.Visible := edB.Visible := false
             btnGrab.Visible := btnPick.Visible := btnBrowse.Visible := false
+            btnSpot.Visible := laC.Visible := false
             return
         }
         ; collect: a label (the sheet column); the "named box" variant also
@@ -429,6 +432,7 @@ StepDialog(existing := "") {
             btnGrab.Visible := false
             btnPick.Visible := needElem
             btnBrowse.Visible := false
+            btnSpot.Visible := laC.Visible := false
             return
         }
         ; if: a window to check for, plus an element name for the "on screen" tests.
@@ -441,6 +445,7 @@ StepDialog(existing := "") {
             btnGrab.Visible := true          ; Grab fills in the window for you
             btnPick.Visible := needElem      ; Pick fills in the element (and its window)
             btnBrowse.Visible := false
+            btnSpot.Visible := laC.Visible := false
             return
         }
         labels := Map(
@@ -468,7 +473,9 @@ StepDialog(existing := "") {
         laB.Visible := needB
         edB.Visible := needB
         btnGrab.Visible := (t != "run" && t != "wait" && t != "text" && t != "ask" && t != "keys")
-        btnPick.Visible := (t = "click" || t = "dblclick" || t = "rclick" || t = "hover")   ; element-name steps
+        isPtr := (t = "click" || t = "dblclick" || t = "rclick" || t = "hover")
+        btnPick.Visible := isPtr                 ; capture by element name...
+        btnSpot.Visible := laC.Visible := isPtr  ; ...or by position (no name needed)
         btnBrowse.Visible := (t = "run")
     }
 
@@ -520,6 +527,48 @@ StepDialog(existing := "") {
         ; collect, whose first box is the value's label, not a window.
         if (edA.Value = "" && typeIds[dt.Value] != "collect")
             edA.Value := info.crit
+    }
+
+    ; The dim caption under the buttons: the window-relative spot (paramC)
+    ; this step carries. Also surfaces a recorded click's fallback spot when
+    ; editing — the name, when one is set, is still tried first at playback.
+    SpotCaption() {
+        laC.Text := (preservedC = "") ? ""
+            : "Spot: " preservedC " (window-relative) ⚠ — used when the name box is empty."
+    }
+
+    ; Point at an exact SPOT and capture its window-relative position — for
+    ; targets without a readable name (maps, canvases, custom toolbars).
+    ; Saves a position-only step (the ⚠ kind), with the recorder's exact
+    ; capture math so playback lands on the same pixel.
+    PickSpot(*) {
+        d.Hide()
+        g.Hide()                                   ; the always-on-top Studio would cover the target
+        Loop 3 {
+            ToolTip("Point the mouse at the exact spot, then wait...  " (4 - A_Index))
+            Sleep(1000)
+        }
+        ToolTip()
+        MouseGetPos(&mx, &my, &winHwnd)
+        info := ClassifyWindow(winHwnd)
+        rel := ""
+        if IsObject(info) {
+            try {                                  ; window can vanish mid-countdown
+                WinGetPos(&wx, &wy, , , winHwnd)
+                rel := (mx - wx) "," (my - wy)
+            }
+        }
+        g.Show()
+        d.Show()
+        WinActivate("ahk_id " d.Hwnd)
+        if (rel = "") {
+            MsgBox("Point at a spot inside your app's window — not VoiceKit or the desktop. Try again.", "Pick a spot", "Owner" d.Hwnd)
+            return
+        }
+        preservedC := rel
+        if (edA.Value = "")
+            edA.Value := info.crit
+        SpotCaption()
     }
 
     Browse(*) {
@@ -607,7 +656,7 @@ StepDialog(existing := "") {
         }
         isPointer := (t = "click" || t = "dblclick" || t = "rclick" || t = "hover")
         if (isPointer && b = "" && preservedC = "") {
-            MsgBox("Give the element's name as shown on screen — or record it instead.", "Add Step", "Owner" d.Hwnd)
+            MsgBox("Give the element's name as shown on screen — or use `"Pick a spot`" to click a position instead.", "Add Step", "Owner" d.Hwnd)
             return
         }
         if !(t = "focus" || t = "waitwin" || t = "move" || t = "ask" || isPointer)
@@ -619,6 +668,7 @@ StepDialog(existing := "") {
     dt.OnEvent("Change", UpdateFields)
     btnGrab.OnEvent("Click", Grab)
     btnPick.OnEvent("Click", Pick)
+    btnSpot.OnEvent("Click", PickSpot)
     btnBrowse.OnEvent("Click", Browse)
     btnOK.OnEvent("Click", OK)
     btnCancel.OnEvent("Click", (*) => d.Destroy())
@@ -645,12 +695,13 @@ StepDialog(existing := "") {
         edB.Value := (existing[1] = "drag")     ; drag edits its paramC path in edB
             ? ((existing.Length >= 4) ? existing[4] : "")
             : existing[3]
+        SpotCaption()                           ; show a pointer step's saved spot
     } else {
         dt.Choose(1)
         UpdateFields()
     }
 
-    RunOwnedDialog(d)               ; show modally over the Studio, then refocus it
+    RunOwnedDialog(d, laC)          ; show modally over the Studio, then refocus it
     dialogOpen := false
     return result
 }
@@ -689,9 +740,11 @@ SaveNameDialog(defaultName := "") {
 
 ; Show an owned dialog modally over the Studio: theme it, show and focus it,
 ; disable the Studio behind it, wait for it to close, then re-enable + refocus.
-RunOwnedDialog(d) {
+; dimCtrl (optional): a Text control to give the dim caption color — must go
+; through ThemeApply, which recolors every Text control after any ThemeDim.
+RunOwnedDialog(d, dimCtrl := 0) {
     global g
-    ThemeApply(d)
+    ThemeApply(d, dimCtrl)
     ; Capture the hwnd BEFORE Show: an instant OK/Enter can destroy the Gui
     ; before d.Hwnd is read again, and a property read on a destroyed Gui
     ; throws "Gui has no window" (a raw hwnd stays safe to wait on).
