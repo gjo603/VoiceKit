@@ -169,10 +169,14 @@ chkMaxWins.OnEvent("Click", SaveSettings)
 chkCoordsOnly.OnEvent("Click", SaveSettings)
 g.OnEvent("Close", CloseStudio)
 
-; ---- F9 starts recording while the main Studio window is active ----
-; (scoped by hwnd so it never fires on a dialog, MsgBox, or edit field)
+; ---- keys while the main Studio window is active ----
+; (scoped by hwnd so they never fire on a dialog, MsgBox, or edit field;
+; note the main window itself has no text inputs — if one is ever added,
+; Del must move to an LVN_KEYDOWN notify so it can't eat typed input)
 #HotIf WinActive("ahk_id " g.Hwnd)
 F9:: StartRecording()
+Del:: RemoveStep()       ; same as the Remove button — acts on the selected row
+NumpadDel:: RemoveStep()
 #HotIf
 
 RefreshWorkflowList()
