@@ -13,3 +13,11 @@ __pycache__/
 
 # Distribution build artifacts (bundled installer zip/exe) — generated, not source.
 dist/
+
+# Personal automations — per-machine user content (macros, workflow steps/sheets,
+# hotkey modules). gitignore only applies to UNTRACKED files, so VoiceKit's own
+# committed files in these folders are unaffected and keep diffing normally.
+# To add a genuinely new shipped file to the repo, use `git add -f <path>`.
+macros/*.ahk
+workflows/
+hotkeys/*.ahk

@@ -162,11 +162,11 @@ RemoveLinesContaining(file, needle) {
 ; ============================================================
 
 ; The allocatable keys. E, N, R are VoiceKit's own hotkeys, X is Workflow
-; Studio's stop-recording / loop-stop key, and H / I are its mark-hover and
-; ask-for-input keys while recording — all six stay out.
+; Studio's stop-recording / loop-stop key, and H / I / C are its mark-hover,
+; ask-for-input and collect keys while recording — all seven stay out.
 ; (mcp\voicekit_writer.py BRIDGE_POOL mirrors this string.)
 BridgeKeyPool() {
-    return "ABCDFGJKLMOPQSTUVWYZ0123456789"
+    return "ABDFGJKLMOPQSTUVWYZ0123456789"
 }
 
 ; Pool keys not yet registered in bridge-map.txt, in pool order.
@@ -328,6 +328,7 @@ HotkeyCompanionRetire(root, base) {
 DeleteWorkflowArtifacts(root, base, disp) {
     try FileDelete(root "\workflows\" base ".steps.txt")
     try FileDelete(root "\workflows\" base ".inputs.csv")
+    try FileDelete(root "\workflows\" base ".results.csv")   ; collect overflow (sheet was locked)
     stub := root "\macros\" base ".ahk"
     if (FileExist(stub) && InStr(FileRead(stub, "UTF-8"), "Workflow Studio"))
         try FileDelete(stub)

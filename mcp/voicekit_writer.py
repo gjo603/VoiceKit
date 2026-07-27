@@ -12,6 +12,7 @@ the docstrings); the conformance test is what enforces that.
 
 from __future__ import annotations
 
+import csv
 import os
 import re
 import subprocess
@@ -34,21 +35,31 @@ VOICE_MACROS = Path(os.environ.get(
                  "Start Menu", "Programs", "Voice Macros"),
 ))
 
-# Bridge-key pool from lib\_Common.ahk BridgeKeyPool — E,N,R,X,H,I excluded
-# (H and I are Workflow Studio's mark-hover and ask-for-input keys while
-# recording).
+# Bridge-key pool from lib\_Common.ahk BridgeKeyPool — E,N,R,X,H,I,C excluded
+# (H, I and C are Workflow Studio's mark-hover, ask-for-input and collect
+# keys while recording).
 # (Companion hotkeys — hotkeys\<Base>.hotkey.ahk, assigned in the Voice Kit
 # home window — draw from the same pool via bridge-map.txt registration.)
-BRIDGE_POOL = "ABCDFGJKLMOPQSTUVWYZ0123456789"
+BRIDGE_POOL = "ABDFGJKLMOPQSTUVWYZ0123456789"
 
 # Step types from lib\Workflow.ahk WfRunStep.
 STEP_TYPES = ("run", "focus", "waitwin", "wait", "text", "keys",
               "click", "dblclick", "rclick", "hover", "move", "close",
+              # drag|<window>||x1,y1,x2,y2 — press at the first point, travel,
+              # release at the second (window-relative). paramB stays empty:
+              # a drag has no element name; it is inherently positional.
+              "drag",
               # ask|<label>|<suggested answer>| — the run collects every ask
               # input up front (one dialog per unique label) and types the
               # answer at this step's position. The loop runner can batch
               # them (typed-in rows or a CSV whose columns are the labels).
               "ask",
+              # collect|<label>|<element name>| — grabs a value at this
+              # position and saves it under the label (a column in the
+              # workflow's <Base>.inputs.csv sheet). Empty element = copy the
+              # current selection; a name = read that box's accessible value
+              # in the active window.
+              "collect",
               # Optional branching (engine executes these; recorder never emits them).
               # if|<window>|<element>|<condType> where condType is one of
               # winexists / winnotexists / elementexists / elementnotexists;
@@ -607,6 +618,11 @@ def create_workflow(name: str, steps: list) -> dict:
         # into the engine's "Input" fallback; require one at create time.
         if s[0] == "ask" and not (len(s) >= 2 and str(s[1]).strip()):
             raise VoiceKitError(f"Step {i + 1}: an 'ask' step needs a label (what to ask the user for).")
+        # collect|label|element| — same rule: a blank label would collapse
+        # every collected value into the engine's "Collected" fallback column.
+        if s[0] == "collect" and not (len(s) >= 2 and str(s[1]).strip()):
+            raise VoiceKitError(f"Step {i + 1}: a 'collect' step needs a label "
+                                f"(the sheet column the value is saved under).")
         # if|window|element|condType — reject a blank window or bad condType at
         # create time (the engine would otherwise mis-branch or stop mid-run).
         if s[0] == "if":
@@ -782,7 +798,7 @@ def get_bridge_map() -> dict:
                                 "created": parts[3] if len(parts) > 3 else ""})
     used = {e["combo"].rsplit("+", 1)[-1] for e in entries}
     free = [k for k in BRIDGE_POOL if k not in used]
-    return {"entries": entries, "free_keys": free, "reserved_keys": ["E", "N", "R", "X", "H", "I"]}
+    return {"entries": entries, "free_keys": free, "reserved_keys": ["E", "N", "R", "X", "H", "I", "C"]}
 
 
 # ---------------------------------------------------------------------------
@@ -826,9 +842,23 @@ def run_automation(name: str, wait_seconds: int = 0) -> dict:
                         f"list_automations shows what exists.")
 
 
+# Hard cap on wait_seconds. Claude Desktop cancels a tool call at ~240 s;
+# a blocking wait that outlives the cancel answers a dead request, which
+# crashes the MCP session ("Request already responded to") and disconnects
+# the server. Stay well under the cancel window — for longer runs, callers
+# should fire-and-forget and check back (read_workflow_sheet / list state).
+WAIT_CAP_SECONDS = 120
+
+
 def _launch_and_report(cmd: list, launched: str, file: str, wait_seconds: int) -> dict:
     proc = subprocess.Popen(cmd)
     result = {"launched": launched, "file": file}
+    capped = min(int(wait_seconds), WAIT_CAP_SECONDS)
+    if capped < wait_seconds:
+        result["wait_capped"] = (f"wait_seconds {wait_seconds} was capped to {WAIT_CAP_SECONDS} "
+                                 f"(longer blocking waits get cancelled by the client and can "
+                                 f"wedge the connection — poll instead).")
+    wait_seconds = capped
     if wait_seconds > 0:
         try:
             rc = proc.wait(timeout=wait_seconds)
@@ -844,6 +874,121 @@ def _launch_and_report(cmd: list, launched: str, file: str, wait_seconds: int) -
         result["finished"] = False
         result["note"] = "Running on the desktop now; a failing step shows a popup naming it."
     return result
+
+
+def _workflow_labels(base: str, step_type: str) -> list[str]:
+    """Unique labels of a workflow's ask or collect steps, in step order
+    (mirrors lib\\Workflow.ahk WfAskLabels / WfCollectLabels, including the
+    blank-label fallbacks)."""
+    labels: list[str] = []
+    seen: set[str] = set()
+    for s in read_workflow(base)["steps"]:
+        if s["type"] != step_type:
+            continue
+        lab = s["a"].strip() or ("Input" if step_type == "ask" else "Collected")
+        if lab.lower() not in seen:
+            seen.add(lab.lower())
+            labels.append(lab)
+    return labels
+
+
+def run_workflow_batch(name: str, rows: list, wait_seconds: int = 0) -> dict:
+    """Run a workflow's loop once per row of `rows`, headlessly — no chooser
+    dialog, no per-pass questions. Each row is a dict answering every ask
+    label (case-insensitive keys; extras are ignored). The rows are written
+    to logs\\mcp-batch.csv and lib\\LoopRunner.ahk is launched with it as its
+    second argument; the floating Stop Looping bar still shows, so the user
+    keeps control. Collected values (collect steps) are appended to the
+    workflow's inputs sheet as usual — read them back with
+    read_workflow_sheet once the loop reports finished."""
+    base = to_base(clean_phrase(name.lower().removeprefix("loop ").strip() if
+                                name.lower().startswith("loop ") else name))
+    steps_file = REPO_ROOT / "workflows" / f"{base}.steps.txt"
+    if not steps_file.exists():
+        raise VoiceKitError(f"No workflow named '{base}' (looked for {steps_file.name}).")
+    labels = _workflow_labels(base, "ask")
+    if not labels:
+        raise VoiceKitError(
+            f"'{space_out(base)}' has no ask-for-input steps, so there's nothing to feed "
+            f"rows into — run it with run_automation('loop {space_out(base)}') instead.")
+    if not isinstance(rows, list) or not rows:
+        raise VoiceKitError("Give at least one row of inputs (a list of objects, "
+                            f"each answering: {', '.join(labels)}).")
+    clean_rows = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise VoiceKitError(f"Row {i + 1} isn't an object of label -> value.")
+        got = {str(k).strip().lower(): ("" if v is None else str(v)) for k, v in row.items()}
+        missing = [l for l in labels if l.lower() not in got]
+        if missing:
+            raise VoiceKitError(f"Row {i + 1} is missing: {', '.join(missing)}. "
+                                f"Every row must answer all inputs: {', '.join(labels)}.")
+        clean_rows.append([got[l.lower()] for l in labels])
+    batch = REPO_ROOT / "logs" / "mcp-batch.csv"
+    batch.parent.mkdir(parents=True, exist_ok=True)
+    with open(batch, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)                       # RFC-4180, CRLF — same dialect WfCsvParse reads
+        w.writerow(labels)
+        w.writerows(clean_rows)
+    r = _launch_and_report(
+        [AHK_EXE, str(REPO_ROOT / "lib" / "LoopRunner.ahk"), base, str(batch)],
+        f"loop {space_out(base)} — batch of {len(clean_rows)} row(s)",
+        str(REPO_ROOT / "lib" / "LoopRunner.ahk"), wait_seconds)
+    r["rows"] = len(clean_rows)
+    collects = _workflow_labels(base, "collect")
+    if collects:
+        r["collects"] = collects
+        r["results_note"] = (f"This workflow collects: {', '.join(collects)}. When the loop "
+                             f"finishes, call read_workflow_sheet('{space_out(base)}') to read "
+                             f"the values back.")
+    if not r.get("finished"):
+        r["note"] = ("Running one pass per row; it stops by itself after the last row. "
+                     "The user can end it early with the Stop Looping button or Ctrl+Alt+Shift+X.")
+    return r
+
+
+def _loop_running() -> bool:
+    """True while a loop / batch (lib\\LoopRunner.ahk) is running — the poll
+    signal for batches too long to block on (see WAIT_CAP_SECONDS)."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_Process -Filter \"Name='AutoHotkey64.exe'\" | "
+             "Where-Object { $_.CommandLine -like '*LoopRunner.ahk*' } | Measure-Object).Count"],
+            capture_output=True, text=True, timeout=15)
+        return out.stdout.strip() not in ("", "0")
+    except Exception:
+        return False                      # status probe only — never block the read
+
+
+def read_workflow_sheet(name: str) -> dict:
+    """A workflow's data files, parsed: the inputs sheet
+    (workflows\\<Base>.inputs.csv — ask columns plus any collect columns runs
+    have filled in) and, if present, <Base>.results.csv (the overflow file
+    written when the sheet itself was locked, e.g. open in Excel). Also
+    reports loop_running — poll this after a fire-and-forget batch: results
+    are written when the loop ends, so loop_running=False means the data
+    here is final."""
+    base = to_base(clean_phrase(name.lower().removeprefix("loop ").strip() if
+                                name.lower().startswith("loop ") else name))
+    if not (REPO_ROOT / "workflows" / f"{base}.steps.txt").exists():
+        raise VoiceKitError(f"No workflow named '{base}'.")
+    out: dict = {"base": base, "name": space_out(base), "loop_running": _loop_running()}
+    for key, fname in (("sheet", f"{base}.inputs.csv"), ("results", f"{base}.results.csv")):
+        p = REPO_ROOT / "workflows" / fname
+        if not p.exists():
+            out[key] = None
+            continue
+        with open(p, "r", encoding="utf-8-sig", newline="") as f:
+            recs = list(csv.reader(f))
+        header = [h.strip() for h in recs[0]] if recs else []
+        rows = [dict(zip(header, rec + [""] * (len(header) - len(rec))))
+                for rec in recs[1:] if any(c.strip() for c in rec)]
+        out[key] = {"file": str(p), "columns": header, "rows": rows}
+    if out["sheet"] is None and out["results"] is None:
+        out["note"] = ("No data yet — the sheet appears once inputs are batched or a run "
+                       "collects values.")
+    return out
 
 
 def _run_inline_ahk(script: str, timeout: int = 15) -> None:
@@ -1018,10 +1163,11 @@ def delete_automation(name: str, type: str) -> dict:
         if steps_file.exists():
             steps_file.unlink()
             result["removed"].append(str(steps_file))
-        sheet = REPO_ROOT / "workflows" / f"{base}.inputs.csv"   # loop inputs sheet
-        if sheet.exists():
-            sheet.unlink()
-            result["removed"].append(str(sheet))
+        for data in (f"{base}.inputs.csv", f"{base}.results.csv"):   # sheet + results overflow
+            p = REPO_ROOT / "workflows" / data
+            if p.exists():
+                p.unlink()
+                result["removed"].append(str(p))
         if is_stub:
             macro.unlink()
             result["removed"].append(str(macro))

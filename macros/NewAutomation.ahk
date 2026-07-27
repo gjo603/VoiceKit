@@ -469,9 +469,11 @@ DraftSystemPrompt() {
         . "- wait: a = milliseconds to pause.`n"
         . "- text: a = text to type into the focused window.`n"
         . "- ask: a = a short label for a value the USER should supply when the workflow runs (e.g. 'Customer name'); b = suggested answer (optional). All ask inputs are collected in dialogs before the run starts, and the answer is typed into the focused window at this step's position. Use ask instead of text whenever the description implies the value changes each run.`n"
+        . "- collect: a = a short label for a value the workflow should GRAB from the screen and save (it becomes a column in the workflow's results sheet); b = the exact on-screen name of the box to read (optional — leave empty to copy whatever text the previous steps left SELECTED, e.g. after a select-all or a double-click on a word). Use collect when the description implies reading or saving something the app shows.`n"
         . "- keys: a = keys in AutoHotkey v2 Send syntax, e.g. {Enter}, {Tab 2}, ^s.`n"
         . "- click / dblclick / rclick: a = window; b = the EXACT on-screen name of the thing to click (button caption, link text, menu item).`n"
         . "- hover: a = window; b = the on-screen name to rest the mouse over (moves there and pauses so a hover menu/tooltip appears; follow with a click on what it reveals).`n"
+        . '- drag: a = window; c = "x1,y1,x2,y2" window-relative press and release points (selects a region by dragging). Only use when the description gives exact pixel coordinates; never invent them.' "`n"
         . "- move: a = window; b = one of left, right, top, bottom, max.`n"
         . "- close: a = window to close.`n"
         . '- if: a = window; b = element name ("" unless the condition checks an element); c = one of winexists, winnotexists, elementexists, elementnotexists.' "`n"
@@ -514,8 +516,8 @@ ParseDraftInner(raw, &perr) {
         perr := "The AI returned an empty step list"
         return ""
     }
-    validTypes := Map("run",1, "focus",1, "waitwin",1, "wait",1, "text",1, "ask",1, "keys",1,
-        "click",1, "dblclick",1, "rclick",1, "hover",1, "move",1, "close",1, "if",1, "else",1, "endif",1)
+    validTypes := Map("run",1, "focus",1, "waitwin",1, "wait",1, "text",1, "ask",1, "collect",1, "keys",1,
+        "click",1, "dblclick",1, "rclick",1, "hover",1, "drag",1, "move",1, "close",1, "if",1, "else",1, "endif",1)
     validConds := Map("winexists",1, "winnotexists",1, "elementexists",1, "elementnotexists",1)
     steps := []
     for i, el in arr {
@@ -540,14 +542,23 @@ ParseDraftInner(raw, &perr) {
             perr := "Draft step " i " is an 'ask' with no label"
             return ""
         }
+        if (t = "collect" && Trim(a) = "") {
+            perr := "Draft step " i " is a 'collect' with no label"
+            return ""
+        }
         if (t = "if") {
             c := StrLower(c)
             if !validConds.Has(c) {
                 perr := "Draft step " i " has a bad if-condition ('" c "')"
                 return ""
             }
+        } else if (t = "drag") {
+            if !(c ~= "^\s*-?\d+\s*,\s*-?\d+\s*,\s*-?\d+\s*,\s*-?\d+\s*$") {
+                perr := "Draft step " i " is a 'drag' without an x1,y1,x2,y2 path"
+                return ""
+            }
         } else if (t != "click" && t != "dblclick" && t != "rclick" && t != "hover")
-            c := ""                       ; paramC is only meaningful for if + click/hover steps
+            c := ""                       ; paramC is only meaningful for if + click/hover/drag steps
         steps.Push([t, a, b, c])
     }
     if (berr := DraftBalanceError(steps)) {

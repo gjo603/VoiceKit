@@ -19,6 +19,8 @@ work unchanged; this is a third path.
 | `create_workflow` | The recorder's output, **authored** instead of recorded: `workflows\<Name>.steps.txt` + generated stub + shortcut. |
 | `list_automations`, `read_workflow`, `read_ai_prompt`, `get_bridge_map` | Inspect what exists (exact voice phrases, full AI prompts). |
 | `run_automation` | **Trigger** any spoken automation now — the MCP equivalent of "open \<name\>". `loop <name>` starts a workflow's loop companion (repeats until the user stops it). Optional `wait_seconds` to wait and report the outcome. |
+| `run_workflow_batch` | **Run a workflow once per row of inputs**, no dialogs — "send a personalized message to each of these people". Pass `rows` (one object per run, keys = the workflow's ask labels); the loop runs headlessly with the floating Stop bar still up, and `collect` steps save each pass's values to the workflow's sheet. |
+| `read_workflow_sheet` | Read a workflow's data back: its inputs sheet (ask columns + collect columns filled by runs) and any results overflow file — how collected values return to you after a batch. |
 | `press_hotkey` | **Trigger** an always-on hotkey module by synthesizing its registered combo (bridge-map entries only; needs the resident VoiceKit running). |
 | `delete_automation` | Remove an automation and its artifacts (VoiceKit's own tools are protected). |
 

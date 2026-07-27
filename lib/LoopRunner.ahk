@@ -9,6 +9,10 @@
 ;  where <Base> is the workflow's file base (e.g. MorningTabs).
 ;  Voice: "open loop <name>".
 ;
+;  A second argument makes it a HEADLESS BATCH (the MCP add-on's
+;  run_workflow_batch): "<Base>" "<batch.csv>" — the CSV's rows are
+;  the inputs, one pass per row, no chooser dialog.
+;
 ;  Stop: the floating "Stop Looping" button (voice: "click stop
 ;  looping") or Ctrl+Alt+Shift+X.
 ;
@@ -20,11 +24,12 @@
 #Include "%A_LineFile%\..\WorkflowLoop.ahk"
 
 base := A_Args.Length >= 1 ? A_Args[1] : ""
+batch := A_Args.Length >= 2 ? A_Args[2] : ""
 if (base = "") {
     MsgBox("No workflow was specified to loop.", "VoiceKit loop", "Iconx 262144")
     ExitApp()
 }
-RunWorkflowLoop(A_ScriptDir "\..\workflows\" base ".steps.txt", SpaceOut(base))
+RunWorkflowLoop(A_ScriptDir "\..\workflows\" base ".steps.txt", SpaceOut(base), , batch)
 ExitApp()
 
 ; "MorningTabs" -> "Morning Tabs" for the status bar (matches the spoken phrase).

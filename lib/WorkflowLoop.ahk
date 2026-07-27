@@ -29,6 +29,12 @@
 ;  back to asking each pass, and sets the pause between runs
 ;  (remembered per workflow in logs\settings.ini [Loop]). With a
 ;  batch, the loop runs the rows in order and stops by itself.
+;
+;  Workflows with `collect` steps write what they grabbed back to
+;  the sheet after the loop: a batch fed BY the sheet fills the
+;  collect columns of each row that ran; any other pass appends a
+;  row (inputs used + values collected). If the sheet is locked
+;  (open in Excel), results go to <Base>.results.csv instead.
 ; ============================================================
 #Include "%A_LineFile%\..\Workflow.ahk"
 #Include "%A_LineFile%\..\Theme.ahk"
@@ -37,7 +43,11 @@ global wfLoopStop := false
 
 ; Run stepsFile top-to-bottom repeatedly, pausing delayMs between passes,
 ; until stopped or a step fails. Shows a small always-on-top status bar.
-RunWorkflowLoop(stepsFile, phrase, delayMs := 1500) {
+; batchFile (the MCP's run_workflow_batch, via LoopRunner's 2nd argument)
+; skips the chooser entirely: the CSV's rows are the batch — one pass per
+; row, the workflow's remembered pause, Stop bar still up. Passing the
+; workflow's own sheet as batchFile fills collected values into its rows.
+RunWorkflowLoop(stepsFile, phrase, delayMs := 1500, batchFile := "") {
     global wfLoopStop
     wfLoopStop := false
 
@@ -56,17 +66,39 @@ RunWorkflowLoop(stepsFile, phrase, delayMs := 1500) {
     ; per row), or fall back to asking every pass. rows = "" means no
     ; batch. The chooser also sets the pause between passes.
     rows := ""
+    fromSheet := false
+    SplitPath(stepsFile, &fname, &fdir)
+    base := RegExReplace(fname, "i)\.steps\.txt$")
+    sheetPath := fdir "\" base ".inputs.csv"
     labels := WfAskLabels(steps)
-    if labels.Length {
-        SplitPath(stepsFile, &fname, &fdir)
-        base := RegExReplace(fname, "i)\.steps\.txt$")
-        plan := WfLoopInputPlan(labels, phrase, base, fdir "\" base ".inputs.csv")
+    if (batchFile != "") {
+        ; Headless batch: the CSV must name every input in its header, same
+        ; validation as the chooser's import. No dialogs — this path is for
+        ; programmatic callers (Claude via MCP); the Stop bar still shows.
+        err := ""
+        batchRows := ""
+        try batchRows := WfLoopCsvRows(labels, FileRead(batchFile, "UTF-8"), &err)
+        catch
+            err := "Couldn't read the batch file:`n" batchFile
+        if !IsObject(batchRows) {
+            MsgBox("Can't run the batch.`n`n" err, "VoiceKit loop", "Iconx 262144")
+            return
+        }
+        rows := batchRows
+        fromSheet := (StrLower(batchFile) = StrLower(sheetPath))
+        delayMs := Round(Number(WfLoopDelayLoad(base)) * 1000)   ; the remembered pause
+    } else if labels.Length {
+        plan := WfLoopInputPlan(labels, phrase, base, sheetPath)
         if !IsObject(plan)
             return                               ; cancelled
-        if (plan.mode = "rows")
+        if (plan.mode = "rows") {
             rows := plan.rows
+            fromSheet := plan.fromSheet          ; sheet rows get results written back beside them
+        }
         delayMs := plan.delayMs
     }
+    colLabels := WfCollectLabels(steps)
+    results := []                                ; {src, ins, out} per completed pass that collected
 
     ; Make each pass abortable from the inside: the engine polls this
     ; between steps and inside its waits, so Stop cuts in mid-pass (a
@@ -99,7 +131,21 @@ RunWorkflowLoop(stepsFile, phrase, delayMs := 1500) {
             break
         i += 1
         barCount.Text := IsObject(rows) ? ("row " i "/" rows.Length) : ("run " i)
-        ok := RunWorkflowSteps(steps, IsObject(rows) ? rows[i] : "")
+        ; Ask-each-pass mode gathers HERE (not inside the engine) so the
+        ; answers can be saved beside anything the pass collects.
+        passVals := ""
+        if (!IsObject(rows) && labels.Length) {
+            passVals := WfGatherInputs(steps)
+            if !IsObject(passVals)
+                break                      ; cancelled an ask dialog — stop quietly
+        }
+        collected := Map()
+        collected.CaseSense := false
+        ok := RunWorkflowSteps(steps, IsObject(rows) ? rows[i] : passVals, collected)
+        if (ok && collected.Count)
+            results.Push({src: (fromSheet && rows[i].HasProp("srcRec")) ? rows[i].srcRec : 0
+                , ins: IsObject(rows) ? rows[i] : (IsObject(passVals) ? passVals : Map())
+                , out: collected})
         if !ok                             ; a step failed (its popup already showed) or Stop cut the pass short
             break
         if (IsObject(rows) && i >= rows.Length)
@@ -108,9 +154,36 @@ RunWorkflowLoop(stepsFile, phrase, delayMs := 1500) {
     }
     bar.Destroy()
     wfRunAbortCheck := ""                  ; runs outside the loop are not abortable
-    if (IsObject(rows) && ok && !wfLoopStop && i >= rows.Length)
-        MsgBox("Done — ran '" phrase "' for all " rows.Length " row" (rows.Length = 1 ? "" : "s") ".",
-            "VoiceKit loop", "262144")
+    ; Save whatever the completed passes collected — even after a stop or a
+    ; failed pass, the earlier rows' results are worth keeping.
+    resNote := "", resPath := ""
+    if results.Length {
+        r := WfSheetApplyResults(sheetPath, labels, colLabels, results)
+        resNote := (r.err = "") ? "Collected values saved to " r.name "." : r.err
+        resPath := r.err = "" ? r.path : ""
+    }
+    ; A loop that saved collected values ends with a voice-clickable offer
+    ; to open the file — completed batches and stopped-midway runs alike.
+    if (IsObject(rows) && ok && !wfLoopStop && i >= rows.Length) {
+        done := "Done — ran '" phrase "' for all " rows.Length " row" (rows.Length = 1 ? "" : "s") "."
+        if (resPath != "") {
+            if (MsgBox(done "`n`n" resNote "`n`nOpen it now?", "VoiceKit loop", "YesNo 262144") = "Yes")
+                WfLoopOpenFile(resPath)
+        } else
+            MsgBox(done (resNote != "" ? "`n`n" resNote : ""), "VoiceKit loop", "262144")
+    } else if (resPath != "") {
+        if (MsgBox(resNote "`n`nOpen it now?", "VoiceKit loop", "YesNo 262144") = "Yes")
+            WfLoopOpenFile(resPath)
+    } else if (resNote != "")
+        TrayTip(resNote, "VoiceKit", "Iconi")
+}
+
+; Open a CSV in its default app (Excel if present), falling back to
+; Notepad when .csv has no association.
+WfLoopOpenFile(path) {
+    try Run('"' path '"')
+    catch
+        try Run('notepad.exe "' path '"')
 }
 
 ; ------------------------------------------------------------
@@ -185,14 +258,16 @@ WfLoopInputPlan(labels, phrase, base, sheetPath) {
     }
     ; Every way of starting the loop funnels through here so the pause
     ; is validated and remembered no matter which button was clicked.
-    Start(mode, rowsArr) {
+    ; fromSheet marks a batch read from the workflow's own sheet — only
+    ; those rows may have collected values written back beside them.
+    Start(mode, rowsArr, fromSheet := false) {
         ms := Delay()
         if (ms < 0) {
             hint.Text := "The pause needs to be a number of seconds — e.g. 1.5"
             return false
         }
         WfLoopDelaySave(base, ms)
-        result := {mode: mode, delayMs: ms}
+        result := {mode: mode, delayMs: ms, fromSheet: fromSheet}
         if IsObject(rowsArr)
             result.rows := rowsArr
         d.Destroy()
@@ -211,7 +286,7 @@ WfLoopInputPlan(labels, phrase, base, sheetPath) {
             MsgBox("The sheet isn't ready to run yet.`n`n" err, "VoiceKit loop", "Icon! Owner" dh)
             return
         }
-        Start("rows", rows)
+        Start("rows", rows, true)
     }
     SheetEdit(*) {
         if !FileExist(sheetPath) {
@@ -221,9 +296,7 @@ WfLoopInputPlan(labels, phrase, base, sheetPath) {
                 return
             }
         }
-        try Run('"' sheetPath '"')                       ; default .csv app (Excel if present)
-        catch
-            try Run('notepad.exe "' sheetPath '"')
+        WfLoopOpenFile(sheetPath)
         hint.Text := "The top row is the column names — fill one row per run underneath, save, then come back and click 'Run from my sheet'."
         Refresh()
     }
@@ -338,6 +411,10 @@ WfLoopCsvRows(labels, text, &err) {
             continue
         row := Map()
         row.CaseSense := false
+        row.srcRec := A_Index + 1   ; a PROPERTY (not an item): which CSV record
+                                    ; this row came from, so collected values can
+                                    ; be written back beside it when the batch
+                                    ; came from the workflow's own sheet
         for l in labels {
             j := cols[l]
             row[l] := (j <= rec.Length) ? rec[j] : ""
@@ -356,17 +433,10 @@ WfLoopCsvRows(labels, text, &err) {
 WfLoopSheetCreate(path, labels) {
     line := ""
     for l in labels
-        line .= (A_Index > 1 ? "," : "") WfLoopCsvField(l)
+        line .= (A_Index > 1 ? "," : "") WfCsvField(l)   ; quoting lives in Workflow.ahk now
     f := FileOpen(path, "w", "UTF-8")
     f.Write(line "`r`n")
     f.Close()
-}
-
-; Quote a CSV field when it holds a comma, quote or newline (RFC-4180).
-WfLoopCsvField(s) {
-    if !RegExMatch(s, '[,"`n`r]')
-        return s
-    return '"' StrReplace(s, '"', '""') '"'
 }
 
 ; ---- the pause between runs, remembered per workflow ----
@@ -454,58 +524,8 @@ WfLoopTypeRows(labels) {
     return result
 }
 
-; Minimal RFC-4180 CSV parser: quoted fields may hold commas, doubled
-; quotes and even newlines. Returns an array of records (arrays of strings).
-WfCsvParse(text) {
-    text := StrReplace(StrReplace(text, "`r`n", "`n"), "`r", "`n")
-    recs := []
-    rec := []
-    field := ""
-    inQ := false
-    len := StrLen(text)
-    i := 1
-    while (i <= len) {
-        ch := SubStr(text, i, 1)
-        if inQ {
-            if (ch = '"') {
-                if (SubStr(text, i + 1, 1) = '"') {   ; doubled quote -> literal quote
-                    field .= '"'
-                    i += 2
-                    continue
-                }
-                inQ := false
-                i += 1
-                continue
-            }
-            field .= ch
-            i += 1
-            continue
-        }
-        switch ch {
-            case '"':
-                if (field = "")
-                    inQ := true
-                else
-                    field .= ch                       ; stray quote mid-field: keep it
-            case ",":
-                rec.Push(field)
-                field := ""
-            case "`n":
-                rec.Push(field)
-                field := ""
-                recs.Push(rec)
-                rec := []
-            default:
-                field .= ch
-        }
-        i += 1
-    }
-    if (field != "" || rec.Length) {                  ; file didn't end with a newline
-        rec.Push(field)
-        recs.Push(rec)
-    }
-    return recs
-}
+; (WfCsvParse and the CSV field quoting now live in Workflow.ahk — the
+; engine needs them too, for writing collected values to the sheet.)
 
 ; Ask the running loop to stop. Takes effect immediately: the engine's
 ; abort hook reads this flag between steps and inside its waits, so the
