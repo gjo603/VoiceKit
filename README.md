@@ -2,6 +2,16 @@
 
 A small system, not a pile of macros. Voice Access does exactly one job: turn speech into a trigger. AutoHotkey v2 does everything else. Two phrases carry the whole thing: **"open voice kit"** (the home window — everything you can say, searchable, with Run / Edit / Delete) and **"open new automation"** (pick what should happen, answer one dialog, and VoiceKit writes the automation itself — no code by default).
 
+## Install in one click
+
+**[⬇ Download VoiceKit-Setup.exe](https://github.com/gjo603/VoiceKit/releases/latest/download/VoiceKit-Setup.exe)** — then double-click the download. That's the whole install: it unpacks itself, installs VoiceKit, and starts it. Nothing else is needed (AutoHotkey is bundled).
+
+- Windows shows a one-time SmartScreen prompt because the file is unsigned: click **More info → Run anyway**.
+- Prefer a zip? **[Download VoiceKit-Setup.zip](https://github.com/gjo603/VoiceKit/releases/latest/download/VoiceKit-Setup.zip)**, extract it, and double-click `Install-VoiceKit.cmd` inside.
+- **Updating later:** use the same links again — they always point at the newest release, and updating preserves your automations, snippets, hotkeys, and settings.
+
+After installing, start **Voice Access** (Win+Ctrl+S) and say **"open voice kit"**.
+
 ## Got the bundled installer? (VoiceKit-Setup.zip / .exe)
 
 If someone sent you **VoiceKit-Setup.zip**, you need nothing else installed:
