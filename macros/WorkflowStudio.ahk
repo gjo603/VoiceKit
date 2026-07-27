@@ -49,15 +49,23 @@ ih := ""                ; InputHook while recording
 typedBuf := ""          ; keystrokes waiting to become a Type step
 lastCharTick := 0
 lastClick := {tick: 0, x: 0, y: 0, idx: 0}
+recDragPend := 0        ; set on left-button-down (the just-recorded click step +
+                        ; press point); button-up turns it into a drag step if
+                        ; the mouse travelled far enough — see RecDragEnd
 recMaxed := Map()       ; window crits already maximize-handled this take
 recStartCount := 0      ; steps.Length when recording started (for the stop summary)
+recLastAct := 0         ; tick of the last captured input — the pause-capture anchor
+recSuppress := false    ; true while the recorder itself is typing (an ask step's
+                        ; practice answer) — RecChar/RecKeyDown ignore that input
 
 ; Advanced if/else/endif entries live at the END so they're never the default
 ; and don't clutter ordinary recording. The four "if" rows all save as type
 ; "if"; typeConds carries the condition kind (paramC of the step).
-typeIds    := ["focus", "run", "waitwin", "wait", "text", "ask", "keys", "click", "dblclick", "rclick", "hover", "move", "close"
+typeIds    := ["focus", "run", "waitwin", "wait", "text", "ask", "keys", "click", "dblclick", "rclick", "hover", "drag", "move", "close"
+             , "collect", "collect"
              , "if", "if", "if", "if", "else", "endif"]
-typeConds  := ["", "", "", "", "", "", "", "", "", "", "", "", ""
+typeConds  := ["", "", "", "", "", "", "", "", "", "", "", "", "", ""
+             , "", "elem"
              , "winexists", "winnotexists", "elementexists", "elementnotexists", "", ""]
 typeLabels := ["Focus window (launch it if needed)"
              , "Open app / file / website"
@@ -70,8 +78,11 @@ typeLabels := ["Focus window (launch it if needed)"
              , "Double-click something in a window"
              , "Right-click something in a window"
              , "Hover over something in a window (reveals menus / tooltips)"
+             , "Drag the mouse (press, move, release — e.g. select part of the screen)"
              , "Position window (left / right / top / bottom / max)"
              , "Close window"
+             , "Collect the selected text (saves it to the workflow's sheet)"
+             , "Collect what's in a named box (saves it to the workflow's sheet)"
              , "— If a window IS open …"
              , "— If a window is NOT open …"
              , "— If something IS on screen …"
@@ -82,9 +93,11 @@ typeLabels := ["Focus window (launch it if needed)"
 ; ---- click capture + stop hotkey (active only while recording) ----
 #HotIf recording
 ~*LButton:: RecClick("L")
+~*LButton up:: RecDragEnd()  ; a press that travels before releasing becomes a Drag step
 ~*RButton:: RecClick("R")
 ^!+h:: RecHover()           ; mark a hover point (menus/tooltips can't be clicked)
 ^!+i:: RecAskInput()        ; mark an ask-for-input point (label it; playback asks up front)
+^!+c:: RecCollect()         ; mark a collect point (select text first; playback copies it to the sheet)
 ^!+x:: StopRecording()      ; backup stop — works even if the REC bar is covered
 #HotIf
 
@@ -281,7 +294,7 @@ RefreshLV() {
         Loop shown
             indent .= "      "
         desc := WfDesc(s)
-        if ((t = "click" || t = "dblclick" || t = "rclick" || t = "hover") && s[3] = "" && s[4] != "")
+        if ((t = "click" || t = "dblclick" || t = "rclick" || t = "hover" || t = "drag") && s[3] = "" && s[4] != "")
             desc .= "      ⚠ by position only — may break if the window moves"
         lv.Add(, i, indent desc)
         if (t = "if")
@@ -405,6 +418,19 @@ StepDialog(existing := "") {
             btnGrab.Visible := btnPick.Visible := btnBrowse.Visible := false
             return
         }
+        ; collect: a label (the sheet column); the "named box" variant also
+        ; takes the element to read.
+        if (t = "collect") {
+            needElem := (cond = "elem")
+            laA.Text := "Save the value as — the column name in your sheet, e.g. 'Price':"
+            laA.Visible := edA.Visible := true
+            laB.Text := "Name of the box to read, exactly as shown on screen:"
+            laB.Visible := edB.Visible := needElem
+            btnGrab.Visible := false
+            btnPick.Visible := needElem
+            btnBrowse.Visible := false
+            return
+        }
         ; if: a window to check for, plus an element name for the "on screen" tests.
         if (t = "if") {
             needElem := (cond = "elementexists" || cond = "elementnotexists")
@@ -432,6 +458,7 @@ StepDialog(existing := "") {
             "dblclick", ["Window:", "What to double-click — its name exactly as shown on screen:"],
             "rclick",   ["Window:", "What to right-click — its name exactly as shown on screen:"],
             "hover",    ["Window:", "What to hover over — its name exactly as shown on screen:"],
+            "drag",     ["Window:", "Drag path — start then end, window-relative pixels: x1,y1,x2,y2"],
             "move",     ["Window to position:", "Where: left / right / top / bottom / max"],
             "close",    ["Window to close:", ""])
         needB := (labels[t][2] != "")
@@ -489,7 +516,9 @@ StepDialog(existing := "") {
             return
         }
         edB.Value := name
-        if (edA.Value = "")                         ; also capture the window it's in, if not set yet
+        ; Also capture the window it's in, if not set yet — but not for
+        ; collect, whose first box is the value's label, not a window.
+        if (edA.Value = "" && typeIds[dt.Value] != "collect")
             edA.Value := info.crit
     }
 
@@ -509,6 +538,20 @@ StepDialog(existing := "") {
         }
         a := Trim(edA.Value)
         b := Trim(edB.Value)
+        ; collect: label required; the named-box variant needs its element too.
+        if (t = "collect") {
+            if (a = "") {
+                MsgBox("Give the value a name — it becomes a column in your sheet.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            if (cond = "elem" && b = "") {
+                MsgBox("Give the name of the box to read, as shown on screen.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            result := ["collect", a, (cond = "elem" ? b : ""), ""]
+            d.Destroy()
+            return
+        }
         ; if: window required; element required for the "on screen" conditions.
         if (t = "if") {
             if (a = "") {
@@ -543,6 +586,25 @@ StepDialog(existing := "") {
                 return
             }
         }
+        ; drag: the edB box carries the coordinate path, which lives in paramC
+        ; on disk (paramB stays empty — a drag has no element name).
+        if (t = "drag") {
+            path := (b != "") ? b : preservedC
+            xy := StrSplit(path, ",")
+            bad := (xy.Length != 4)
+            if !bad {
+                for part in xy
+                    if !IsInteger(Trim(part))
+                        bad := true
+            }
+            if bad {
+                MsgBox("Give the drag path as four numbers — start then end, window-relative: x1,y1,x2,y2 (e.g. 100,200,400,200) — or record it by dragging.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            result := ["drag", a, "", Trim(xy[1]) "," Trim(xy[2]) "," Trim(xy[3]) "," Trim(xy[4])]
+            d.Destroy()
+            return
+        }
         isPointer := (t = "click" || t = "dblclick" || t = "rclick" || t = "hover")
         if (isPointer && b = "" && preservedC = "") {
             MsgBox("Give the element's name as shown on screen — or record it instead.", "Add Step", "Owner" d.Hwnd)
@@ -571,13 +633,18 @@ StepDialog(existing := "") {
             if (id = "if") {                 ; pick the if-row whose condition matches
                 if (typeConds[i] = exCond)
                     idx := i
+            } else if (id = "collect") {     ; selection vs named-box variant
+                if ((typeConds[i] = "elem") = (existing[3] != ""))
+                    idx := i
             } else
                 idx := i
         }
         dt.Choose(idx)
         UpdateFields()
         edA.Value := existing[2]
-        edB.Value := existing[3]
+        edB.Value := (existing[1] = "drag")     ; drag edits its paramC path in edB
+            ? ((existing.Length >= 4) ? existing[4] : "")
+            : existing[3]
     } else {
         dt.Choose(1)
         UpdateFields()
@@ -644,7 +711,7 @@ RunOwnedDialog(d) {
 ; ============================================================
 StartRecording() {
     global recording, recLastHwnd, recLastCrit, typedBuf, lastClick, g, recBar, chkCloseTabs, steps
-    global recMaxed, recStartCount
+    global recMaxed, recStartCount, recLastAct, recSuppress, recDragPend
     if recording
         return
     ; Recording APPENDS to the current step list, so an accidental start
@@ -668,11 +735,14 @@ StartRecording() {
     recLastHwnd := 0
     recLastCrit := ""
     lastClick := {tick: 0, x: 0, y: 0, idx: 0}
+    recDragPend := 0                ; never inherit a half-finished gesture
     recMaxed := Map()
     recStartCount := steps.Length
+    recLastAct := 0                 ; no pause before a take's first action
+    recSuppress := false            ; never inherit a stuck suppression flag
     StartKeyHook()
     g.Hide()
-    UpdateRecBar("Ctrl+Alt+Shift:  H hover  ·  I ask input  ·  X stop")
+    UpdateRecBar("Ctrl+Alt+Shift:  H hover  ·  I ask input  ·  C collect  ·  X stop")
     ShowBottomLeft(recBar)                    ; bottom-left, clear of the taskbar
     SetTimer(RecTick, 250)
 }
@@ -691,20 +761,25 @@ StopRecording() {
     WinActivate("ahk_id " g.Hwnd)
     if steps.Length
         lv.Modify(steps.Length, "Select Focus Vis")
-    posOnly := 0
+    posOnly := 0, pauses := 0
     Loop Max(0, steps.Length - recStartCount) {      ; count THIS take only
         s := steps[recStartCount + A_Index]
         if ((s[1] = "click" || s[1] = "dblclick" || s[1] = "rclick" || s[1] = "hover") && s[3] = "" && s[4] != "")
             posOnly += 1
+        else if (s[1] = "wait")                      ; in-take waits are all auto-captured pauses
+            pauses += 1
     }
+    pNote := !pauses ? ""
+        : "  Kept " pauses " pause" (pauses = 1 ? "" : "s") " as Wait step" (pauses = 1 ? "" : "s")
+        . " so playback matches your pace — edit or delete any."
     if (steps.Length = recStartCount)
         SB("Nothing was captured — recording sees window switches, clicks and typing in normal app windows (the Start menu and taskbar don't count). Try again.")
     else if (posOnly && chkCoordsOnly.Value)
-        SB("Recorded — " posOnly " step" (posOnly = 1 ? "" : "s") " captured by position (⚠), as chosen. They replay by screen location, so keep the same window layout — the Maximize option helps.")
+        SB("Recorded — " posOnly " step" (posOnly = 1 ? "" : "s") " captured by position (⚠), as chosen. They replay by screen location, so keep the same window layout — the Maximize option helps." pNote)
     else if posOnly
-        SB("Recorded — " posOnly " click" (posOnly = 1 ? " was" : "s were") " captured by position only (⚠ in the list) because nothing readable was under the mouse. They replay less reliably — prefer clicking labeled controls.")
+        SB("Recorded — " posOnly " click" (posOnly = 1 ? " was" : "s were") " captured by position only (⚠ in the list) because nothing readable was under the mouse. They replay less reliably — prefer clicking labeled controls." pNote)
     else
-        SB("Recorded — trim or edit steps if needed, then click Test and Save.")
+        SB("Recorded — trim or edit steps if needed, then click Test and Save." pNote)
 }
 
 RecPush(step, note) {
@@ -719,6 +794,32 @@ UpdateRecBar(note) {
     global recNote, recCount, steps
     recNote.Text := Abbrev(note, 52)
     recCount.Text := steps.Length " steps"
+}
+
+; Reproduce the user's own pacing. Called right before a captured action is
+; pushed: if a meaningful pause separated it from the previous captured input,
+; save that pause as an ordinary (visible, editable, deletable) Wait step, so
+; playback waits roughly as long as the recording did — for the page to load,
+; the autocomplete list to appear, the menu to open. The anchor (recLastAct)
+; is the time of the previous INPUT event, never of a step push: flushing the
+; typed-text buffer pushes its Type step long after the typing happened, and
+; must not count as fresh activity. Below the floor the engine's built-in
+; pacing already covers the gap — click/hover/focus steps window-wait and
+; settle (~0.4–1.5 s) before acting, while keystroke steps get only a 150 ms
+; beat, so keyboard boundaries use the lower floor. Long distractions (a
+; phone call mid-recording) are capped; the first action of a take gets no
+; Wait at all — that gap is just the user getting ready, not the app.
+RecMarkPause(kind := "mouse", atTick := 0) {
+    global recLastAct
+    if !recLastAct
+        return
+    if !atTick
+        atTick := A_TickCount
+    gap := atTick - recLastAct
+    if (gap < (kind = "key" ? 700 : 1500))
+        return
+    gap := Round(Min(gap, 30000) / 100) * 100        ; ~0.1 s grain, 30 s cap
+    RecPush(["wait", String(gap), "", ""], "Paused " WfDurDesc(gap) " — kept as a Wait step")
 }
 
 ; ---- crash-safe autosave of an in-progress recording ----
@@ -772,7 +873,7 @@ OfferRecovery() {
 }
 
 RecTick() {
-    global recording, typedBuf, lastCharTick, recLastHwnd, recLastCrit
+    global recording, typedBuf, lastCharTick, recLastHwnd, recLastCrit, recLastAct
     if !recording
         return
     if (typedBuf != "" && A_TickCount - lastCharTick > 1500)
@@ -785,8 +886,10 @@ RecTick() {
     if (!IsObject(info) || info.crit = recLastCrit)
         return
     FlushTypedText()
+    RecMarkPause()                  ; e.g. idle until an app popped this window itself
     recLastCrit := info.crit
     RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
+    recLastAct := A_TickCount
     RecEnsureMax(hwnd, info.crit)
 }
 
@@ -825,7 +928,7 @@ RecDeferredMax(hwnd, crit) {
 }
 
 RecClick(btn) {
-    global recording, steps, recLastHwnd, recLastCrit, lastClick, chkCoordsOnly
+    global recording, steps, recLastHwnd, recLastCrit, lastClick, chkCoordsOnly, recLastAct, recDragPend
     if !recording
         return
     MouseGetPos(&mx, &my, &hwnd)
@@ -833,6 +936,10 @@ RecClick(btn) {
     if !IsObject(info)
         return
     FlushTypedText()
+    ; The second press of a live double-click also lands here; its gap since
+    ; the first press is under the double-click time, far below the floor,
+    ; so RecMarkPause stays silent and can't split the pair.
+    RecMarkPause()
     if (info.crit != recLastCrit) {
         RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
         recLastCrit := info.crit
@@ -853,7 +960,9 @@ RecClick(btn) {
             UpdateRecBar("Double-click " steps[lastClick.idx][3])
         }
         WriteAutosave()
+        recLastAct := now
         lastClick := {tick: 0, x: 0, y: 0, idx: 0}
+        recDragPend := 0        ; the step is a dblclick/run now — button-up must not touch it
         return
     }
     elem := ""
@@ -869,13 +978,52 @@ RecClick(btn) {
     stepType := (btn = "R") ? "rclick" : "click"
     RecPush([stepType, info.crit, elem, rel],
         (btn = "R" ? "Right-click " : "Click ") (elem != "" ? "`"" elem "`"" : "at " rel))
-    if (btn = "L")
+    if (btn = "L") {
         lastClick := {tick: now, x: mx, y: my, idx: steps.Length}
+        ; Arm the drag watcher: if the button releases far from here, the
+        ; click step just pushed is rewritten into a Drag step (RecDragEnd).
+        recDragPend := {idx: steps.Length, x: mx, y: my, hwnd: hwnd, crit: info.crit}
+    }
+    recLastAct := now
     ; Maximize LATER, not now: this hotkey runs on button-DOWN, and moving
     ; the window mid-gesture would break the user's own click/double-click
     ; (see RecDeferredMax). The captured element/coords above deliberately
     ; reflect the geometry the user actually clicked in.
     SetTimer((*) => RecDeferredMax(hwnd, info.crit), -(DllCall("GetDoubleClickTime") + 150))
+}
+
+; Left-button-UP: finish click-vs-drag disambiguation. RecClick records every
+; left press as a click step immediately (it can't know yet); if the button
+; releases beyond the travel threshold, that step is rewritten in place into
+; drag|<window>||x1,y1,x2,y2 — press and release points, window-relative, so
+; playback re-selects the same region (text selections, marquee selections,
+; sliders). Both points use the window's position at RELEASE time: one
+; consistent frame, and if the window moved mid-drag the user's own gesture
+; was landing in the moved window anyway. Like every coordinate step it's
+; positional (⚠ in the list) — same window layout required.
+RecDragEnd() {
+    global recording, steps, recDragPend, lastClick, recLastAct
+    if (!recording || !IsObject(recDragPend))
+        return
+    p := recDragPend
+    recDragPend := 0
+    MouseGetPos(&ux, &uy)
+    ; Travel threshold: well past double-click slop (8 px), so hand jitter on
+    ; a normal click never fabricates a drag, but a one-word text selection
+    ; (~15+ px) still counts.
+    if (Abs(ux - p.x) < 12 && Abs(uy - p.y) < 12)
+        return                                       ; a click — leave the step as recorded
+    if (p.idx > steps.Length || steps[p.idx][1] != "click")
+        return                                       ; something else rewrote it (e.g. Explorer run)
+    if !WinExist("ahk_id " p.hwnd)
+        return
+    WinGetPos(&wx, &wy, , , "ahk_id " p.hwnd)
+    path := (p.x - wx) "," (p.y - wy) "," (ux - wx) "," (uy - wy)
+    steps[p.idx] := ["drag", p.crit, "", path]
+    lastClick := {tick: 0, x: 0, y: 0, idx: 0}       ; a drag can't be half of a double-click
+    UpdateRecBar("Drag from (" (p.x - wx) "," (p.y - wy) ") to (" (ux - wx) "," (uy - wy) ")")
+    WriteAutosave()
+    recLastAct := A_TickCount
 }
 
 ; Mark a HOVER at the current mouse position — Ctrl+Alt+Shift+H while recording.
@@ -885,7 +1033,7 @@ RecClick(btn) {
 ; window-relative position kept as the fallback. The engine's hover step moves
 ; the pointer there and pauses so the menu/tooltip appears.
 RecHover() {
-    global recording, recLastHwnd, recLastCrit, chkCoordsOnly
+    global recording, recLastHwnd, recLastCrit, chkCoordsOnly, recLastAct
     if !recording
         return
     MouseGetPos(&mx, &my, &hwnd)
@@ -895,6 +1043,7 @@ RecHover() {
         return
     }
     FlushTypedText()
+    RecMarkPause()
     if (info.crit != recLastCrit) {
         RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
         recLastCrit := info.crit
@@ -912,6 +1061,7 @@ RecHover() {
     rel := (mx - wx) "," (my - wy)
     RecPush(["hover", info.crit, elem, rel],
         "Hover " (elem != "" ? "`"" elem "`"" : "at " rel))
+    recLastAct := A_TickCount
     ; Maximize AFTER capturing (like the click path) so the recorded coords/name
     ; reflect the geometry the mouse was actually over; the deferred timer avoids
     ; reflowing the window synchronously under the just-pressed hotkey.
@@ -920,44 +1070,117 @@ RecHover() {
 
 ; Mark an ASK-FOR-INPUT at the current focus — Ctrl+Alt+Shift+I while recording.
 ; A small dialog labels the input (typing into it isn't captured — RecChar and
-; RecKeyDown ignore the Studio's own windows via ClassifyWindow). Playback asks
-; for every labeled input BEFORE the run starts and types the answer at this
-; step's position, so a recorded workflow can take a fresh value each run.
-; If the focused window is new to the take, a Focus step is pushed first so the
-; answer lands in the same app the user was in when they pressed the hotkey.
+; RecKeyDown ignore the Studio's own windows via ClassifyWindow) and takes an
+; optional PRACTICE ANSWER: the recorder itself types it into the app right
+; away — unrecorded, via the recSuppress flag — so the app gets real input to
+; react to (autocomplete, validation, enabled buttons) without the sample also
+; replaying at run time on top of the asked answer. The practice answer is
+; saved as the step's suggestion, so run dialogs come pre-filled with it.
+; Playback asks for every labeled input BEFORE the run starts and types the
+; answer at this step's position, so a recorded workflow takes a fresh value
+; each run. If the focused window is new to the take, a Focus step is pushed
+; first so the answer lands in the same app the user was in at the hotkey.
 RecAskInput() {
-    global recording, recLastHwnd, recLastCrit
+    global recording, recLastHwnd, recLastCrit, recLastAct, recSuppress
     if !recording
         return
+    pressTick := A_TickCount        ; any pause ends at the hotkey press — time
+                                    ; spent in the label dialog is not app time
     hwnd := WinExist("A")
     info := ClassifyWindow(hwnd)
     FlushTypedText()
-    label := AskLabelDialog()
+    ans := AskLabelDialog()
     if (hwnd && WinExist("ahk_id " hwnd))       ; hand focus back either way, so
         WinActivate("ahk_id " hwnd)             ; the recording continues seamlessly
-    if (label = "") {
+    if !IsObject(ans) {
+        recLastAct := A_TickCount   ; dialog time must not leak into the next gap
         UpdateRecBar("Ask-for-input cancelled")
         return
     }
+    RecMarkPause("key", pressTick)  ; before the anchor reset — it reads recLastAct
+    recLastAct := A_TickCount
     if (IsObject(info) && info.crit != recLastCrit) {
         RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
         recLastCrit := info.crit
         recLastHwnd := hwnd
     }
-    RecPush(["ask", label, "", ""], "Ask for `"" label "`"")
+    RecPush(["ask", ans.label, ans.sample, ""], "Ask for `"" ans.label "`"")
+    ; Type the practice answer into the app for the user — suppressed, so the
+    ; keyboard hook never turns it into a Type step (playback types the asked
+    ; answer at exactly this spot instead).
+    if (ans.sample != "" && hwnd && WinExist("ahk_id " hwnd)) {
+        recSuppress := true
+        try {
+            WinActivate("ahk_id " hwnd)
+            Sleep(300)              ; same settle beat playback's focus step takes
+            SendText(ans.sample)
+        } finally {
+            recSuppress := false
+        }
+        UpdateRecBar("Ask for `"" ans.label "`" — typed the practice answer")
+    }
+    recLastAct := A_TickCount       ; the auto-typing isn't part of the next gap
 }
 
-; Themed always-on-top dialog naming an ask-for-input step's label.
-; Returns the trimmed label, or "" if cancelled. No owner — the Studio
-; window is hidden while recording.
-AskLabelDialog() {
+; Mark a COLLECT point at the current focus — Ctrl+Alt+Shift+C while
+; recording, pressed AFTER selecting the text to grab. The selecting
+; itself is recorded (double-click a word, Ctrl+A, ...), so playback
+; re-selects the same way and the collect step copies the selection into
+; the workflow's sheet under this label. The dialog previews what is
+; selected right now — grabbed under recSuppress, so the preview's own
+; Ctrl+C is never recorded. A Focus step is pushed first if the window
+; is new to the take, like ask.
+RecCollect() {
+    global recording, recLastHwnd, recLastCrit, recLastAct, recSuppress
+    if !recording
+        return
+    pressTick := A_TickCount        ; any pause ends at the hotkey press
+    hwnd := WinExist("A")
+    info := ClassifyWindow(hwnd)
+    FlushTypedText()
+    preview := ""
+    if IsObject(info) {
+        recSuppress := true
+        try {
+            KeyWait("Ctrl", "T2"), KeyWait("Alt", "T2"), KeyWait("Shift", "T2")
+            e := ""
+            preview := WfCopySelection(&e)      ; same grab playback will do
+        } finally {
+            recSuppress := false
+        }
+    }
+    label := CollectLabelDialog(preview)
+    if (hwnd && WinExist("ahk_id " hwnd))       ; hand focus back either way
+        WinActivate("ahk_id " hwnd)
+    if (label = "") {
+        recLastAct := A_TickCount   ; dialog time must not leak into the next gap
+        UpdateRecBar("Collect cancelled")
+        return
+    }
+    RecMarkPause("key", pressTick)  ; before the anchor reset — it reads recLastAct
+    recLastAct := A_TickCount
+    if (IsObject(info) && info.crit != recLastCrit) {
+        RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
+        recLastCrit := info.crit
+        recLastHwnd := hwnd
+    }
+    RecPush(["collect", label, "", ""], "Collect `"" label "`"")
+}
+
+; Themed dialog naming a collect step's value — the column it becomes in
+; the workflow's sheet. Shows what's selected right now so the user knows
+; the grab will work. Returns the trimmed label, or "" if cancelled.
+CollectLabelDialog(preview) {
     result := ""
-    d := Gui("+AlwaysOnTop", "Ask me for input")
+    d := Gui("+AlwaysOnTop", "Collect this value")
     d.SetFont("s10", "Segoe UI")
-    d.AddText("xm w400", "Label this input — what should playback ask you for?")
-    hint := d.AddText("xm y+4 w400", "e.g.  Customer name   ·   Order number   ·   Today's notes")
+    d.AddText("xm w400", "Save the selected text as — the column name in your sheet:")
+    hint := d.AddText("xm y+4 w400", "e.g.  Price   ·   Tracking number   ·   Status")
     ed := d.AddEdit("xm y+10 w400")
-    btnOK := d.AddButton("xm y+14 w120 Default", "OK")
+    pv := d.AddText("xm y+10 w400 r3", preview != ""
+        ? "Selected right now:  " Abbrev(StrReplace(StrReplace(preview, "`r", ""), "`n", "  "), 90)
+        : "Nothing seems to be selected right now — usually you select the text FIRST, then press Ctrl+Alt+Shift+C. You can still add the step: playback copies whatever the steps before it leave selected.")
+    btnOK := d.AddButton("xm y+12 w120 Default", "OK")
     btnCancel := d.AddButton("x+8 w120", "Cancel")
     OK(*) {
         v := Trim(ed.Value)
@@ -972,6 +1195,46 @@ AskLabelDialog() {
     d.OnEvent("Escape", (*) => d.Destroy())
     ThemeApply(d)
     ThemeDim(hint)
+    ThemeDim(pv)
+    hwnd := d.Hwnd, edHwnd := ed.Hwnd   ; pre-Show: reads on a destroyed Gui throw
+    d.Show()
+    try {                               ; dialog may be dismissed before these run
+        WinActivate("ahk_id " hwnd)
+        ControlFocus(edHwnd, "ahk_id " hwnd)
+    }
+    WinWaitClose("ahk_id " hwnd)
+    return result
+}
+
+; Themed always-on-top dialog for an ask-for-input step: the label (required)
+; and an optional practice answer. Returns {label, sample} or "" if cancelled.
+; No owner — the Studio window is hidden while recording.
+AskLabelDialog() {
+    result := ""
+    d := Gui("+AlwaysOnTop", "Ask me for input")
+    d.SetFont("s10", "Segoe UI")
+    d.AddText("xm w400", "Label this input — what should playback ask you for?")
+    hint := d.AddText("xm y+4 w400", "e.g.  Customer name   ·   Order number   ·   Today's notes")
+    ed := d.AddEdit("xm y+10 w400")
+    d.AddText("xm y+14 w400", "Answer to use while recording  (optional):")
+    hint2 := d.AddText("xm y+4 w400 r3", "VoiceKit types this into the app for you now, WITHOUT recording it — so the app reacts normally while you record, and only the real answer is typed when the workflow runs. It's also offered as the suggested answer.")
+    edSample := d.AddEdit("xm y+6 w400")
+    btnOK := d.AddButton("xm y+14 w120 Default", "OK")
+    btnCancel := d.AddButton("x+8 w120", "Cancel")
+    OK(*) {
+        v := Trim(ed.Value)
+        if (v = "")
+            return
+        result := {label: v, sample: edSample.Value}
+        d.Destroy()
+    }
+    btnOK.OnEvent("Click", OK)
+    btnCancel.OnEvent("Click", (*) => d.Destroy())
+    d.OnEvent("Close", (*) => d.Destroy())
+    d.OnEvent("Escape", (*) => d.Destroy())
+    ThemeApply(d)
+    ThemeDim(hint)
+    ThemeDim(hint2)
     hwnd := d.Hwnd, edHwnd := ed.Hwnd   ; pre-Show: reads on a destroyed Gui throw
     d.Show()
     try {                               ; dialog may be dismissed before these run
@@ -1026,19 +1289,27 @@ StopKeyHook() {
 }
 
 RecChar(h, char) {
-    global recording, typedBuf, lastCharTick
-    if (!recording || Ord(char) < 32)
+    global recording, typedBuf, lastCharTick, recLastAct, recSuppress
+    if (!recording || recSuppress || Ord(char) < 32)
         return
     if !IsObject(ClassifyWindow(WinExist("A")))   ; ignore typing into Start menu / own UI
         return
+    ; A new burst of typing starts here; whatever it later flushes into a Type
+    ; step, the pause the user took BEFORE typing belongs in front of it — and
+    ; every flush trigger pushes the Type step next, so the Wait lands right
+    ; before it. Pauses WITHIN a burst don't split it (the buffer only flushes
+    ; after 1.5 s idle, and a fresh burst after that gets its own Wait).
+    if (typedBuf = "")
+        RecMarkPause("key")
     typedBuf .= char
     lastCharTick := A_TickCount
+    recLastAct := lastCharTick
     UpdateRecBar("Typing: `"" typedBuf "`"")
 }
 
 RecKeyDown(h, vk, sc) {
-    global recording, typedBuf
-    if !recording
+    global recording, typedBuf, recLastAct, recSuppress
+    if (!recording || recSuppress)
         return
     key := GetKeyName(Format("vk{:x}sc{:x}", vk, sc))
     if (key = "" || key ~= "i)^(L|R)?(Shift|Ctrl|Control|Alt|Win)$")
@@ -1055,13 +1326,18 @@ RecKeyDown(h, vk, sc) {
         return                              ; the mark-hover hotkey, not a workflow step
     if (key = "i" && ctrl && alt && shift)
         return                              ; the ask-for-input hotkey, not a workflow step
+    if (key = "c" && ctrl && alt && shift)
+        return                              ; the mark-collect hotkey, not a workflow step
     mods := (ctrl ? "^" : "") (alt ? "!" : "") (win ? "#" : "")
     if (key = "Backspace" && mods = "") {
         if (typedBuf != "") {               ; natural correction: un-type the last char
             typedBuf := SubStr(typedBuf, 1, -1)
+            recLastAct := A_TickCount       ; a correction is activity too
             UpdateRecBar("Typing: `"" typedBuf "`"")
         } else {
+            RecMarkPause("key")
             RecPush(["keys", "{Backspace}", "", ""], "Press Backspace")
+            recLastAct := A_TickCount
         }
         return
     }
@@ -1071,8 +1347,11 @@ RecKeyDown(h, vk, sc) {
     if (mods != "" && !isSpecial && StrLen(key) != 1)
         return                              ; modifier + exotic key (volume etc.) — skip
     FlushTypedText()
+    RecMarkPause("key")             ; e.g. typed a name, waited for the
+                                    ; suggestion list, THEN pressed Down
     combo := mods (shift ? "+" : "") "{" key "}"
     RecPush(["keys", combo, "", ""], "Press " combo)
+    recLastAct := A_TickCount
 }
 
 FlushTypedText() {
@@ -1155,8 +1434,23 @@ TestRun(*) {
     }
     g.Hide()
     Sleep(500)
-    ok := RunWorkflowSteps(steps)
+    ; Collect steps run for real during a test (so their grabbing is
+    ; verified), but the values are only SHOWN — a test never writes to
+    ; the workflow's sheet.
+    collected := Map()
+    collected.CaseSense := false
+    ok := RunWorkflowSteps(steps, , collected)
     g.Show()
+    if (ok && collected.Count) {
+        got := ""
+        for l, v in collected
+            got .= (got != "" ? "`n" : "") l ":  " Abbrev(StrReplace(StrReplace(v, "`r", ""), "`n", "  "), 80)
+        MsgBox("Test run completed — all " steps.Length " steps ran.`n`n"
+            . "Collected (a real run saves these to your sheet):`n" got,
+            "Workflow Studio", "Owner" g.Hwnd)
+        SB("Test run completed — all " steps.Length " steps ran.")
+        return
+    }
     SB(ok ? "Test run completed — all " steps.Length " steps ran."
           : "Test run stopped — a step failed (details were just shown).")
 }
@@ -1255,7 +1549,7 @@ DeleteWorkflow(*) {
 ShowHelp(*) {
     MsgBox("Recording (the easy way):`n"
         . "  1.  Click Record (or press F9) — the Studio hides, a REC bar floats bottom-left.`n"
-        . "  2.  Just do the thing. Window switches, clicks and typing are captured.`n"
+        . "  2.  Just do the thing. Window switches, clicks, drags and typing are captured.`n"
         . "       Clicks are remembered by the NAME of what you clicked, so they`n"
         . "       keep working when windows move. Double-clicking a file in`n"
         . "       Explorer records `"Open <that file>`" with its full path.`n"
@@ -1273,8 +1567,10 @@ ShowHelp(*) {
         . "       double-click a row to edit, and click Add to insert a pause if`n"
         . "       an app needs time to load.`n"
         . "  4.  Test plays it. Save makes it a voice command: say `"open <name>`".`n`n"
-        . "Playback is patient: it waits up to 10 seconds for each window to`n"
-        . "appear, so you rarely need manual Wait steps.`n`n"
+        . "Playback matches your pace: pauses you take while recording (for`n"
+        . "a page to load, a menu to appear) are saved as editable Wait steps`n"
+        . "— delete any you don't want. It's patient beyond that too, waiting`n"
+        . "up to 10 seconds for each window to appear.`n`n"
         . "Tips: `"Close browser tabs before recording`" starts from a fresh`n"
         . "browser (leftover tabs shift things). `"Maximize windows while`n"
         . "recording`" locks in one window layout — playback re-maximizes the`n"
@@ -1283,8 +1579,9 @@ ShowHelp(*) {
         . "maps, canvases and games where names aren't reliable. Steps marked`n"
         . "⚠ were captured by position only and are the first thing to fix if`n"
         . "playback misses.`n`n"
-        . "Notes: don't type passwords while recording; drags and scrolling`n"
-        . "aren't captured (hover and ask-for-input are — see above). Every`n"
+        . "Notes: don't type passwords while recording; dragging (press, move,`n"
+        . "release — selecting text or a region) is captured as a Drag step`n"
+        . "(by position, so it's marked ⚠), but scrolling isn't. Every`n"
         . "button is voice-clickable — say `"click`" plus`n"
         . "its word: `"click record`", `"click add`", `"click test`", `"click save`".`n`n"
         . "See everything you've made in one place: say `"open voice kit`".",

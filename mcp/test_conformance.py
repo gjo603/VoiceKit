@@ -25,10 +25,14 @@ STEPS = [
     ("click", "Untitled - Notepad", "File | Save As...", "120,44"),
     ("hover", "Untitled - Notepad", "Format", ""),          # hover by element name
     ("hover", "ahk_exe notepad.exe", "", "50,60"),          # hover by position only
+    ("drag", "ahk_exe notepad.exe", "", "10,20,300,220"),   # drag: press/travel/release path
     ("run", 'explorer.exe "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"', "", ""),
     ("run", r'C:\Program Files\App "x".exe', "", ""),
     ("keys", "^s", "", ""),
     ("wait", "800", "", ""),
+    ("ask", "Customer name", "Acme, Inc", ""),              # input, with a suggestion
+    ("collect", "Order number", "", ""),                    # collect the selection
+    ("collect", "Total | price", "Amount box", ""),         # collect a named box's value
     # if/else/endif branching (condType in paramC): must round-trip too.
     ("if", "ahk_exe notepad.exe", "", "winexists"),
     ("text", "then branch", "", ""),

@@ -14,8 +14,55 @@
 ;  UP FRONT (one dialog per unique label, before step 1 runs),
 ;  and the answer is typed at the step's position like a `text`
 ;  step. Cancelling any dialog cancels the whole run quietly.
+;
+;  The `collect` step (collect|<label>|<element name>|) is the
+;  mirror image: it GRABS a value at its position and saves it
+;  under the label — with no element name it copies the current
+;  selection (clipboard preserved), with one it reads that named
+;  box's accessible value in the active window. Collected values
+;  land in the workflow's sheet (<Base>.inputs.csv): a single run
+;  appends a row (inputs used + values collected); a loop fed by
+;  the sheet fills the collect columns of the row that ran.
 ; ============================================================
 #Include "%A_LineFile%\..\Acc.ahk"
+
+; Optional abort hook: a host (the loop runner's Stop button) sets this to
+; a callable returning true when the run should stop. The engine polls it
+; between steps and inside its long waits (Wait steps, window waits, the
+; settle pauses), so a stop cuts in mid-run instead of after the pass.
+; An aborted run returns false QUIETLY — no failure popup, like cancel.
+global wfRunAbortCheck := ""
+
+; True when the host asked the current run to stop.
+WfAborted() {
+    global wfRunAbortCheck
+    return IsObject(wfRunAbortCheck) && wfRunAbortCheck.Call()
+}
+
+; Sleep in slices so the abort hook can cut it short. False if aborted.
+WfSleep(ms) {
+    left := ms
+    while (left > 0) {
+        if WfAborted()
+            return false
+        chunk := Min(100, left)
+        Sleep(chunk)
+        left -= chunk
+    }
+    return !WfAborted()
+}
+
+; WinWait, sliced the same way. Returns the HWND, or 0 on timeout/abort.
+WfWinWait(crit, timeoutSec) {
+    deadline := A_TickCount + Round(timeoutSec * 1000)
+    loop {
+        if (hwnd := WinExist(crit))
+            return hwnd
+        if (WfAborted() || A_TickCount >= deadline)
+            return 0
+        Sleep(100)
+    }
+}
 
 ; Run a saved workflow file. Returns true if every step ran.
 RunWorkflow(stepsFile) {
@@ -23,7 +70,30 @@ RunWorkflow(stepsFile) {
         MsgBox("Workflow file not found:`n" stepsFile, "VoiceKit workflow", "Iconx 262144")   ; 262144 = always-on-top
         return false
     }
-    return RunWorkflowSteps(WorkflowLoad(stepsFile))
+    steps := WorkflowLoad(stepsFile)
+    ; Gather inputs HERE rather than inside RunWorkflowSteps, so a run that
+    ; also collects values can save the inputs it used beside the results.
+    askVals := ""
+    askLabels := WfAskLabels(steps)
+    if askLabels.Length {
+        askVals := WfGatherInputs(steps)
+        if !IsObject(askVals)
+            return false                ; cancelled — quiet, no error popup
+    }
+    collected := Map()
+    collected.CaseSense := false
+    ok := RunWorkflowSteps(steps, askVals, collected)
+    ; A finished run that collected values appends one row (inputs used +
+    ; values collected) to the workflow's sheet — the same file loop batches
+    ; read from and fill in.
+    if (ok && collected.Count) {
+        r := WfSheetApplyResults(WfSheetPath(stepsFile), askLabels, WfCollectLabels(steps),
+            [{src: 0, ins: IsObject(askVals) ? askVals : Map(), out: collected}])
+        TrayTip(r.err = ""
+            ? "Saved " collected.Count " collected value" (collected.Count = 1 ? "" : "s") " to " r.name
+            : r.err, "VoiceKit", "Iconi")
+    }
+    return ok
 }
 
 ; Parse a steps file into an array of [type, paramA, paramB, paramC].
@@ -45,11 +115,13 @@ WorkflowLoad(stepsFile) {
 ; steps add optional branching: an `if` whose condition is false skips its
 ; block (to the matching `else`, or past `endif`); everything else runs
 ; straight through, so ordinary (recorded) workflows behave exactly as before.
-RunWorkflowSteps(steps, askVals := "") {
+RunWorkflowSteps(steps, askVals := "", collected := "") {
     ; Collect every `ask` input before anything runs, so the user answers
     ; up front and the rest of the run is hands-free. A caller (the loop
     ; runner feeding CSV rows) may pass a ready Map(label -> answer)
-    ; instead, which skips the dialogs entirely.
+    ; instead, which skips the dialogs entirely. `collected` is the mirror:
+    ; pass a Map and every `collect` step deposits its value there under
+    ; its label — callers decide what to do with them (sheet, display).
     if !IsObject(askVals) {
         askVals := WfGatherInputs(steps)
         if !IsObject(askVals)
@@ -57,9 +129,37 @@ RunWorkflowSteps(steps, askVals := "") {
     }
     i := 1, n := steps.Length
     while (i <= n) {
+        if WfAborted()                  ; host asked the run to stop — quiet, like cancel
+            return false
         s := steps[i], t := s[1]
         if (t = "ask") {                ; type the answer collected up front
             SendText(askVals.Get(WfAskLabel(s), ""))
+            Sleep(150)
+            i += 1
+            continue
+        }
+        if (t = "collect") {            ; grab a value here and remember it by label
+            cerr := ""
+            val := ""
+            if (Trim(s[3]) != "") {     ; read the named box's content (in the active window)
+                hwndA := WinExist("A")
+                r := hwndA ? AccValueByName(hwndA, s[3]) : {found: false, value: ""}
+                if !r.found
+                    cerr := "Couldn't find a box named `"" s[3] "`" in the active window."
+                else
+                    val := r.value
+            } else {
+                val := WfCopySelection(&cerr)
+            }
+            if (cerr != "") {
+                if WfAborted()
+                    return false
+                MsgBox("Workflow stopped at step " i " of " n ".`n`n"
+                    . WfDesc(s) "`n`n" cerr, "VoiceKit workflow", "Icon! 262144")
+                return false
+            }
+            if IsObject(collected)
+                collected[WfCollectLabel(s)] := val
             Sleep(150)
             i += 1
             continue
@@ -91,13 +191,15 @@ RunWorkflowSteps(steps, askVals := "") {
         catch as e
             err := "Unexpected error: " e.Message
         if (err != "") {
+            if WfAborted()              ; the Stop cut this step's wait short — not a real failure
+                return false
             MsgBox("Workflow stopped at step " i " of " n ".`n`n"
                 . WfDesc(s) "`n`n" err, "VoiceKit workflow", "Icon! 262144")   ; 262144 = always-on-top
             return false
         }
         i += 1
     }
-    return true
+    return !WfAborted()     ; a stop during the LAST step must still report "didn't finish"
 }
 
 ; The label an `ask` step is keyed by ("Input" if somehow blank — the
@@ -123,6 +225,46 @@ WfAskLabels(steps) {
         }
     }
     return labels
+}
+
+; The label a `collect` step saves its value under ("Collected" if somehow
+; blank — every authoring surface requires one).
+WfCollectLabel(s) {
+    label := Trim(s[2])
+    return label != "" ? label : "Collected"
+}
+
+; Unique `collect` labels in step order — the sheet's output columns.
+WfCollectLabels(steps) {
+    seen := Map()
+    seen.CaseSense := false
+    labels := []
+    for s in steps {
+        if (s[1] != "collect")
+            continue
+        l := WfCollectLabel(s)
+        if !seen.Has(l) {
+            seen[l] := true
+            labels.Push(l)
+        }
+    }
+    return labels
+}
+
+; Copy whatever is selected right now, preserving the user's clipboard.
+; err is set when nothing landed on the clipboard (nothing selected, or
+; the app puts nothing textual there).
+WfCopySelection(&err) {
+    err := ""
+    saved := ClipboardAll()
+    A_Clipboard := ""
+    Send("^c")
+    ok := ClipWait(1)
+    text := ok ? A_Clipboard : ""
+    A_Clipboard := saved
+    if !ok
+        err := "Nothing was copied — the steps before this one should leave the text selected."
+    return text
 }
 
 ; Ask the user for every `ask` step's answer, in step order, one dialog per
@@ -175,7 +317,16 @@ WfAskInputDialog(label, suggestion := "") {
         WinActivate("ahk_id " hwnd)
         ControlFocus(edHwnd, "ahk_id " hwnd)
     }
-    WinWaitClose("ahk_id " hwnd)
+    ; Wait for the dialog, but let the abort hook close it: in the loop's
+    ; "ask me before each run" mode, clicking Stop Looping while a question
+    ; is up should end things right there — a quiet cancel.
+    while WinExist("ahk_id " hwnd) {
+        if WfAborted() {
+            try d.Destroy()
+            break
+        }
+        Sleep(100)
+    }
     return result
 }
 
@@ -259,53 +410,62 @@ WfRunStep(s) {
         case "focus":
             if WinExist(a) {
                 WinActivate(a)
-                Sleep(300)          ; let the app take focus before keys arrive
+                WfSleep(300)        ; let the app take focus before keys arrive
                 return ""
             }
             if (b = "") {
-                ; Recordings capture no timing, so a window that appears a
-                ; beat later (a dialog, a loading app) is normal — wait for
-                ; it like waitwin does instead of failing instantly.
-                if !WinWait(a, , 10)
+                ; Recorded timing is coarse (and older recordings captured
+                ; none at all), so a window that appears a beat later (a
+                ; dialog, a loading app) is normal — wait for it like
+                ; waitwin does instead of failing instantly.
+                if !WfWinWait(a, 10)
                     return "Window not found (and no launch command is set): " a
                 WinActivate(a)
-                Sleep(300)
+                WfSleep(300)
                 return ""
             }
             try Run(b)
             catch
                 return "Couldn't launch: " b
-            if !WinWait(a, , 10)
+            if !WfWinWait(a, 10)
                 return "Launched, but the window never appeared: " a
             WinActivate(a)
-            Sleep(300)
+            WfSleep(300)
         case "waitwin":
             timeout := 10
             if (b != "")
                 try timeout := Number(b)
-            if !WinWait(a, , timeout)
+            if !WfWinWait(a, timeout)
                 return "Window didn't appear within " timeout "s: " a
             WinActivate(a)
-            Sleep(300)
+            WfSleep(300)
         case "wait":
-            try Sleep(Integer(a))
+            ms := 0
+            try ms := Integer(a)
             catch
                 return "Not a number of milliseconds: " a
+            WfSleep(ms)             ; sliced, so a loop Stop cuts it short
         case "text":
             SendText(a)
+            Sleep(150)          ; same beat the ask/click steps give the app
         case "keys":
             try Send(a)
             catch
                 return "Bad key syntax (see AHK v2 Send docs): " a
+            ; Recorded keystroke steps replay machine-fast: without a beat
+            ; between them, {Down} after typed text races the app's own UI
+            ; (an autocomplete list that hasn't populated yet). Bigger gaps
+            ; the user actually took are recorded as Wait steps.
+            Sleep(150)
         case "click", "dblclick", "rclick":
             ; a = window, b = element name (may be ""), c = "x,y" window-relative fallback
-            if (!WinExist(a) && !WinWait(a, , 10))   ; same grace as focus/waitwin
+            if (!WinExist(a) && !WfWinWait(a, 10))   ; same grace as focus/waitwin
                 return "Window not found: " a
             WinActivate(a)
             if (b = "")
                 WfPosOnlySettle(a)    ; blind click — wait for the app to be ready
             else
-                Sleep(400)
+                WfSleep(400)
             CoordMode("Mouse", "Screen")
             btn := (t = "rclick") ? "Right" : "Left"
             n := (t = "dblclick") ? 2 : 1
@@ -331,19 +491,19 @@ WfRunStep(s) {
             ; a = window, b = element name (may be ""), c = "x,y" window-relative
             ; fallback. Move the pointer there and dwell so hover-triggered UI
             ; (submenus, tooltips) has time to appear; the next step acts on it.
-            if (!WinExist(a) && !WinWait(a, , 10))   ; same grace as click/focus
+            if (!WinExist(a) && !WfWinWait(a, 10))   ; same grace as click/focus
                 return "Window not found: " a
             WinActivate(a)
             if (b = "")
                 WfPosOnlySettle(a)    ; blind hover — same readiness wait as clicks
             else
-                Sleep(400)
+                WfSleep(400)
             CoordMode("Mouse", "Screen")
             if (b != "") {
                 loc := AccFindByName(WinExist(a), b)
                 if IsObject(loc) {
                     MouseMove(loc.x + loc.w // 2, loc.y + loc.h // 2, 0)
-                    Sleep(700)                       ; dwell so the hover registers
+                    WfSleep(700)                     ; dwell so the hover registers
                     return ""
                 }
                 if (c = "")
@@ -356,7 +516,40 @@ WfRunStep(s) {
                 return "Bad hover position: " c
             WinGetPos(&wx, &wy, , , a)
             MouseMove(wx + Trim(xy[1]), wy + Trim(xy[2]), 0)
-            Sleep(700)
+            WfSleep(700)
+        case "drag":
+            ; a = window, c = "x1,y1,x2,y2" window-relative press/release points
+            ; (paramB is reserved — a drag has no element name; it's inherently
+            ; positional, like a position-only click, and gets the same care).
+            if (!WinExist(a) && !WfWinWait(a, 10))   ; same grace as click/focus
+                return "Window not found: " a
+            WinActivate(a)
+            WfPosOnlySettle(a)      ; drags always fire blind at recorded coords
+            p := StrSplit(c, ",")
+            if (p.Length != 4 || !IsInteger(Trim(p[1])) || !IsInteger(Trim(p[2]))
+                || !IsInteger(Trim(p[3])) || !IsInteger(Trim(p[4])))
+                return "Bad drag path (need x1,y1,x2,y2): " c
+            WinGetPos(&wx, &wy, , , a)
+            x1 := wx + Trim(p[1]), y1 := wy + Trim(p[2])
+            x2 := wx + Trim(p[3]), y2 := wy + Trim(p[4])
+            CoordMode("Mouse", "Screen")
+            ; Press, travel in small increments, release. Apps only treat a
+            ; gesture as a drag when they see intermediate move events past
+            ; the system drag threshold — a single teleporting MouseMove
+            ; (SendMode Input) would select nothing in many of them.
+            MouseMove(x1, y1, 0)
+            Sleep(100)              ; let the app see the hover before the press
+            Click("Down")
+            Sleep(100)              ; and register the press before movement
+            segs := 16
+            Loop segs {
+                MouseMove(x1 + (x2 - x1) * A_Index // segs,
+                          y1 + (y2 - y1) * A_Index // segs, 0)
+                Sleep(10)
+            }
+            Sleep(100)              ; settle on the end point before releasing
+            Click("Up")
+            Sleep(150)              ; same beat the click steps give the app
         case "move":
             if !WinExist(a)
                 return "Window not found: " a
@@ -398,7 +591,9 @@ WfRunStep(s) {
 ; deterministic with fixed caps; content that loads later still needs an
 ; explicit Wait step before the click.
 WfPosOnlySettle(win) {
-    WinWaitActive(win, , 3)
+    deadline := A_TickCount + 3000                   ; WinWaitActive, sliced for the abort hook
+    while (!WinActive(win) && A_TickCount < deadline && !WfAborted())
+        Sleep(100)
     try {
         pid := WinGetPID(win)
         ; SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION — enough for
@@ -406,11 +601,17 @@ WfPosOnlySettle(win) {
         ; full query rights. A failed open just skips straight to the pause.
         hProc := DllCall("OpenProcess", "uint", 0x101000, "int", 0, "uint", pid, "ptr")
         if hProc {
-            DllCall("user32\WaitForInputIdle", "ptr", hProc, "uint", 5000)
+            deadline := A_TickCount + 5000           ; sliced too (258 = WAIT_TIMEOUT)
+            loop {
+                if (DllCall("user32\WaitForInputIdle", "ptr", hProc, "uint", 250) != 258)
+                    break
+                if (WfAborted() || A_TickCount >= deadline)
+                    break
+            }
             DllCall("CloseHandle", "ptr", hProc)
         }
     }
-    Sleep(1200)
+    WfSleep(1200)
 }
 
 ; One-line description of a step (Studio list + error messages).
@@ -421,15 +622,18 @@ WfDesc(s) {
         case "run":      return "Open  " a
         case "focus":    return "Focus  " a (b != "" ? "    (launches: " b ")" : "")
         case "waitwin":  return "Wait for window  " a "    (up to " (b != "" ? b : "10") "s)"
-        case "wait":     return "Wait  " a " ms"
+        case "wait":     return "Wait  " WfDurDesc(a)
         case "text":     return "Type  `"" a "`""
         case "ask":      return "Ask me for  `"" a "`""
             . (b != "" ? "    (suggested: " b ")" : "") "    — the answer is typed here"
+        case "collect":  return "Collect  `"" a "`""
+            . (b != "" ? "    (what's in the box named `"" b "`")" : "    (copies the selected text)")
         case "keys":     return "Press keys  " a
         case "click":    return "Click  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a
         case "dblclick": return "Double-click  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a
         case "rclick":   return "Right-click  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a
         case "hover":    return "Hover over  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a
+        case "drag":     return "Drag  " WfDragDesc(c) "    in  " a
         case "move":     return "Position  " a "  ->  " b
         case "close":    return "Close  " a
         case "if":       return "If  " WfCondDesc(c, a, b)     ; a=window, b=element, c=condType
@@ -437,6 +641,25 @@ WfDesc(s) {
         case "endif":    return "End if"
     }
     return t "  " a "  " b
+}
+
+; Friendly form of a drag step's "x1,y1,x2,y2" path. Junk is shown raw —
+; like WfDurDesc, this renders the error popup and must never throw.
+WfDragDesc(c) {
+    p := StrSplit(c, ",")
+    if (p.Length != 4)
+        return "(" c ")"
+    return "from (" Trim(p[1]) "," Trim(p[2]) ") to (" Trim(p[3]) "," Trim(p[4]) ")"
+}
+
+; Friendly duration for a wait step's milliseconds: "2.6 s", "2 s", "800 ms".
+; Integer math only (no float formatting surprises), and junk is shown raw —
+; WfDesc must never throw, it renders the error popup for a failing step.
+WfDurDesc(ms) {
+    if (!IsInteger(ms) || ms < 1000)
+        return ms " ms"
+    whole := ms // 1000, tenth := Mod(ms // 100, 10)
+    return whole (tenth ? "." tenth : "") " s"
 }
 
 ; Human-readable form of an `if` condition. cond = condType, win = window,
@@ -463,4 +686,193 @@ WfDecode(s) {
     s := StrReplace(s, "%0D", "`r")
     s := StrReplace(s, "%7C", "|")
     return StrReplace(s, "%25", "%")
+}
+
+; ============================================================
+;  CSV + the workflow's sheet (<Base>.inputs.csv)
+;  The sheet is the workflow's data file: ask labels are its
+;  input columns, collect labels its output columns. The loop
+;  reads batches from it; collect steps write results back.
+; ============================================================
+
+; Minimal RFC-4180 CSV parser: quoted fields may hold commas, doubled
+; quotes and even newlines. Returns an array of records (arrays of strings).
+WfCsvParse(text) {
+    text := StrReplace(StrReplace(text, "`r`n", "`n"), "`r", "`n")
+    recs := []
+    rec := []
+    field := ""
+    inQ := false
+    len := StrLen(text)
+    i := 1
+    while (i <= len) {
+        ch := SubStr(text, i, 1)
+        if inQ {
+            if (ch = '"') {
+                if (SubStr(text, i + 1, 1) = '"') {   ; doubled quote -> literal quote
+                    field .= '"'
+                    i += 2
+                    continue
+                }
+                inQ := false
+                i += 1
+                continue
+            }
+            field .= ch
+            i += 1
+            continue
+        }
+        switch ch {
+            case '"':
+                if (field = "")
+                    inQ := true
+                else
+                    field .= ch                       ; stray quote mid-field: keep it
+            case ",":
+                rec.Push(field)
+                field := ""
+            case "`n":
+                rec.Push(field)
+                field := ""
+                recs.Push(rec)
+                rec := []
+            default:
+                field .= ch
+        }
+        i += 1
+    }
+    if (field != "" || rec.Length) {                  ; file didn't end with a newline
+        rec.Push(field)
+        recs.Push(rec)
+    }
+    return recs
+}
+
+; Quote a CSV field when it holds a comma, quote or newline (RFC-4180).
+WfCsvField(s) {
+    if !RegExMatch(s, '[,"`n`r]')
+        return s
+    return '"' StrReplace(s, '"', '""') '"'
+}
+
+; The workflow's sheet path, derived from its steps file.
+WfSheetPath(stepsFile) {
+    return RegExReplace(stepsFile, "i)\.steps\.txt$") ".inputs.csv"
+}
+
+; Ensure the sheet's header row (recs[1]) names every label; returns
+; Map(label -> column index). Matching is case-insensitive on trimmed
+; header cells, exactly like the loop's CSV reader; missing labels are
+; appended as new columns (existing columns are never moved or renamed).
+WfSheetEnsureCols(recs, labels) {
+    hdr := recs[1]
+    cols := Map()
+    cols.CaseSense := false
+    for j, h in hdr
+        if (Trim(h) != "" && !cols.Has(Trim(h)))
+            cols[Trim(h)] := j
+    out := Map()
+    out.CaseSense := false
+    for l in labels {
+        if !cols.Has(l) {
+            hdr.Push(l)
+            cols[l] := hdr.Length
+        }
+        out[l] := cols[l]
+    }
+    return out
+}
+
+; Set one cell, padding the record out to the column if it's short.
+WfSheetSetCell(rec, idx, val) {
+    while (rec.Length < idx)
+        rec.Push("")
+    rec[idx] := val
+}
+
+; Serialize records back to a CSV file — UTF-8 BOM + CRLF so Excel is happy.
+WfSheetWrite(path, recs) {
+    out := ""
+    for rec in recs {
+        line := ""
+        for j, v in rec
+            line .= (j > 1 ? "," : "") WfCsvField(v)
+        out .= line "`r`n"
+    }
+    f := FileOpen(path, "w", "UTF-8")
+    f.Write(out)
+    f.Close()
+}
+
+; Write collected results into the workflow's sheet. Each result is
+; {src, ins, out}: src > 1 fills the collect columns of that record index
+; (a loop pass fed by the sheet's own row — 1 is the header), src = 0
+; appends a new row holding the inputs used plus the values collected.
+; Creates the sheet if needed; input columns come before collect columns;
+; extra columns and existing cells are preserved. Returns {name, err} —
+; name is the file the results actually landed in: if the sheet can't be
+; read or written (open in Excel, which locks CSVs), the results are
+; appended to <Base>.results.csv beside it so nothing is lost. Never
+; overwrites a file it couldn't read.
+WfSheetApplyResults(sheetPath, askLabels, colLabels, results) {
+    readOk := true
+    recs := []
+    if FileExist(sheetPath) {
+        try recs := WfCsvParse(FileRead(sheetPath, "UTF-8"))
+        catch
+            readOk := false
+    }
+    if readOk {
+        if !recs.Length
+            recs.Push([])                              ; header row, filled in below
+        inCols := WfSheetEnsureCols(recs, askLabels)
+        outCols := WfSheetEnsureCols(recs, colLabels)
+        for r in results {
+            if (r.src > 1 && r.src <= recs.Length) {
+                for l, ci in outCols
+                    WfSheetSetCell(recs[r.src], ci, r.out.Get(l, ""))
+            } else {
+                rec := []
+                for l, ci in inCols
+                    WfSheetSetCell(rec, ci, r.ins.Get(l, ""))
+                for l, ci in outCols
+                    WfSheetSetCell(rec, ci, r.out.Get(l, ""))
+                recs.Push(rec)
+            }
+        }
+        try {
+            WfSheetWrite(sheetPath, recs)
+            SplitPath(sheetPath, &name)
+            return {name: name, err: "", path: sheetPath}
+        }
+    }
+    ; Sheet unreadable or unwritable — append the results to a side file.
+    alt := RegExReplace(sheetPath, "i)\.inputs\.csv$") ".results.csv"
+    try {
+        altRecs := FileExist(alt) ? WfCsvParse(FileRead(alt, "UTF-8")) : []
+        if !altRecs.Length {
+            hdr := []
+            for l in askLabels
+                hdr.Push(l)
+            for l in colLabels
+                hdr.Push(l)
+            altRecs.Push(hdr)
+        }
+        inCols := WfSheetEnsureCols(altRecs, askLabels)
+        outCols := WfSheetEnsureCols(altRecs, colLabels)
+        for r in results {
+            rec := []
+            for l, ci in inCols
+                WfSheetSetCell(rec, ci, r.ins.Get(l, ""))
+            for l, ci in outCols
+                WfSheetSetCell(rec, ci, r.out.Get(l, ""))
+            altRecs.Push(rec)
+        }
+        WfSheetWrite(alt, altRecs)
+        SplitPath(alt, &name)
+        return {name: name, err: "", path: alt}
+    } catch {
+        return {name: "", err: "Couldn't save the collected values — the sheet and its results file "
+            . "are both locked (close them in Excel and run again).", path: ""}
+    }
 }

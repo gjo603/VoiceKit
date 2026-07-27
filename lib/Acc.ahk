@@ -35,6 +35,15 @@ AccName(acc, child := 0) {
         return ""
 }
 
+; Accessible VALUE of an element ("" if it has none) — the CONTENT of an
+; edit / combo / URL bar (accName is its label, accValue what's inside).
+; Plain IDispatch, like accName — no vtable tricks needed.
+AccValue(acc, child := 0) {
+    try return acc.accValue[child]
+    catch
+        return ""
+}
+
 ; Screen rectangle of an element -> {x,y,w,h}, or "" if hidden.
 ; Uses the raw vtable (slot 22 = accLocation): IDispatch doesn't
 ; marshal its four long* out-params reliably. 64-bit ABI: the
@@ -89,6 +98,19 @@ AccFindByName(hwnd, name, budgetMs := 3000) {
 }
 
 AccFindOnce(hwnd, name, deadline) {
+    dummy := false
+    node := AccNodeOnce(hwnd, name, deadline, false, &dummy)
+    return IsObject(node) ? node.loc : ""
+}
+
+; Same visible-element-by-name search, but returns the accessible NODE
+; ({acc, child, loc}) so callers can also read its value, not just click it.
+; requireValue skips matches whose accValue is empty — a label and the box
+; beside it often SHARE a name (oleacc derives the box's name from the
+; label), and a value reader wants the box, not the label. When only
+; empty-valued matches exist, foundEmpty is set so the caller can tell
+; "empty box" from "no such element".
+AccNodeOnce(hwnd, name, deadline, requireValue, &foundEmpty) {
     AccPin()
     if DllCall("oleacc\AccessibleObjectFromWindow", "ptr", hwnd, "uint", 0xFFFFFFFC   ; OBJID_CLIENT
         , "ptr", AccIID(), "ptr*", &p := 0) != 0 || !p
@@ -102,8 +124,11 @@ AccFindOnce(hwnd, name, deadline) {
         node := stack.Pop()
         if (AccName(node.acc, node.child) = name) {
             loc := AccLocation(node.acc, node.child)
-            if IsObject(loc)
-                return loc
+            if IsObject(loc) {
+                if (!requireValue || AccValue(node.acc, node.child) != "")
+                    return {acc: node.acc, child: node.child, loc: loc}
+                foundEmpty := true
+            }
         }
         if (node.child = 0 && node.depth < 14) {
             for kid in AccChildren(node.acc)
@@ -111,6 +136,24 @@ AccFindOnce(hwnd, name, deadline) {
         }
     }
     return ""
+}
+
+; Find a visible element by name (retrying like AccFindByName) and read its
+; accessible VALUE. Prefers a match that HAS a value (see AccNodeOnce);
+; if only empty-valued matches exist by the deadline, that's a legitimate
+; empty box — found=true, value="". found=false means nothing of that name
+; appeared at all within the budget.
+AccValueByName(hwnd, name, budgetMs := 3000) {
+    deadline := A_TickCount + budgetMs
+    foundEmpty := false
+    loop {
+        node := AccNodeOnce(hwnd, name, deadline, true, &foundEmpty)
+        if IsObject(node)
+            return {found: true, value: AccValue(node.acc, node.child)}
+        if (A_TickCount > deadline)
+            return {found: foundEmpty, value: ""}
+        Sleep(250)
+    }
 }
 
 AccIID() {

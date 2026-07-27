@@ -40,9 +40,11 @@ class WorkflowStep(BaseModel):
       wait     -> ms
       text     -> text
       ask      -> label (+ suggestion)   collects an input from the user
+      collect  -> label (+ element)      grabs a value and saves it to the sheet
       keys     -> keys
       click/dblclick/rclick -> window + element (name on screen)   [or xy]
       hover    -> window + element (or xy) — moves the mouse there and pauses
+      drag     -> window + xy "x1,y1,x2,y2" — press, travel, release (selects a region)
       move     -> window + position (left/right/top/bottom/max)
       close    -> window
       if       -> window + condition (+ element for the *element* conditions)
@@ -53,8 +55,8 @@ class WorkflowStep(BaseModel):
     condition holds; pair it with an optional `else` and a closing `endif`.
     """
 
-    type: Literal["run", "focus", "waitwin", "wait", "text", "ask", "keys",
-                  "click", "dblclick", "rclick", "hover", "move", "close",
+    type: Literal["run", "focus", "waitwin", "wait", "text", "ask", "collect", "keys",
+                  "click", "dblclick", "rclick", "hover", "drag", "move", "close",
                   "if", "else", "endif"]
     window: Optional[str] = Field(
         None, description="Window criterion: 'ahk_exe notepad.exe', 'ahk_class CabinetWClass', "
@@ -71,16 +73,20 @@ class WorkflowStep(BaseModel):
         None, description="ask: what to ask the user for (e.g. 'Customer name'). Every ask input "
         "is collected in dialogs BEFORE the run starts; the answer is typed at this step's "
         "position. Loop runs can batch the answers (typed-in rows or a CSV whose columns are "
-        "these labels, one pass per row).")
+        "these labels, one pass per row). collect: the name the grabbed value is saved under — "
+        "a column in the workflow's <Base>.inputs.csv sheet (single runs append a row; a loop "
+        "fed by the sheet fills the row that ran).")
     suggestion: Optional[str] = Field(
         None, description="ask: optional answer to prefill in the input dialog.")
     keys: Optional[str] = Field(
         None, description="keys: an AutoHotkey Send string, e.g. '{Enter}', '{Tab 2}', '^s'.")
     element: Optional[str] = Field(
         None, description="click/dblclick/rclick/hover: the on-screen name of what to click or "
-        "hover over (button caption, link text, file name). Preferred — survives windows moving.")
+        "hover over (button caption, link text, file name). Preferred — survives windows moving. "
+        "collect: the named box whose content to read (omit to copy the current selection instead).")
     xy: Optional[str] = Field(
-        None, description="click/dblclick/rclick/hover: fallback window-relative 'x,y' when there's no name.")
+        None, description="click/dblclick/rclick/hover: fallback window-relative 'x,y' when there's no name. "
+        "drag: required, the window-relative press and release points 'x1,y1,x2,y2'.")
     position: Optional[Literal["left", "right", "top", "bottom", "max"]] = Field(
         None, description="move: where to snap the window.")
     condition: Optional[Literal["winexists", "winnotexists",
@@ -111,6 +117,11 @@ class WorkflowStep(BaseModel):
         if t == "ask":
             _need(self.label, "ask", "label")
             return (t, self.label, self.suggestion or "", "")
+        if t == "collect":
+            _need(self.label, "collect", "label")
+            # on disk: collect|label|element| — empty element = copy the
+            # current selection; a name = read that box's accessible value.
+            return (t, self.label, self.element or "", "")
         if t == "keys":
             _need(self.keys, "keys", "keys")
             return (t, self.keys, "", "")
@@ -119,6 +130,14 @@ class WorkflowStep(BaseModel):
             if not self.element and not self.xy:
                 raise ValueError(f"{t} step needs 'element' (preferred) or 'xy'")
             return (t, self.window, self.element or "", self.xy or "")
+        if t == "drag":
+            _need(self.window, "drag", "window")
+            _need(self.xy, "drag", "xy")
+            parts = [p.strip() for p in self.xy.split(",")]
+            if len(parts) != 4 or not all(p.lstrip("-").isdigit() for p in parts):
+                raise ValueError("drag step needs 'xy' as 'x1,y1,x2,y2' — press then release, window-relative")
+            # on disk: drag|window||x1,y1,x2,y2 (no element name — positional)
+            return (t, self.window, "", ",".join(parts))
         if t == "move":
             _need(self.window, "move", "window")
             _need(self.position, "move", "position")
@@ -282,8 +301,10 @@ def run_automation(
     name: Annotated[str, "Any spoken automation: a workflow, launch macro, AI action, "
                     "or VoiceKit tool — e.g. 'Morning Tabs'. 'loop Morning Tabs' starts "
                     "the workflow's loop companion (repeats until the user stops it)."],
-    wait_seconds: Annotated[int, "0 (default) = fire-and-forget. >0 = wait up to this "
-                            "long for it to finish and report the outcome."] = 0,
+    wait_seconds: Annotated[int, "0 (default) = fire-and-forget. >0 = wait up to this long "
+                            "for it to finish and report the outcome. Capped at 120 — longer "
+                            "blocking waits get cancelled by the client and can wedge the "
+                            "connection; for long runs use 0 and check back."] = 0,
 ) -> dict:
     """Trigger an automation now — the MCP equivalent of the user saying
     'open <name>'. NOTE: this drives the real desktop (moves windows, types,
@@ -292,6 +313,42 @@ def run_automation(
     until stopped (Stop Looping button / Ctrl+Alt+Shift+X / a failing step) —
     only start one when the user asked for looping."""
     return _guard(vk.run_automation, name, wait_seconds)
+
+
+@mcp.tool
+def run_workflow_batch(
+    name: Annotated[str, "The workflow to run, e.g. 'Send Invoice' (with or without a "
+                    "leading 'loop')."],
+    rows: Annotated[list[dict[str, str]], "One object per run: keys are the workflow's ask "
+                    "labels (case-insensitive; see read_workflow), values are that pass's "
+                    "answers. Every row must answer every label."],
+    wait_seconds: Annotated[int, "0 (default) = fire-and-forget. >0 = wait up to this long "
+                            "for the whole batch to finish and report the outcome. Capped at "
+                            "120 — for batches longer than ~2 minutes pass 0, then poll "
+                            "read_workflow_sheet: loop_running=False means it's done and any "
+                            "collected values are final."] = 0,
+) -> dict:
+    """Run a workflow once per row of inputs — the programmatic version of its
+    loop, with no dialogs. Use this for 'do X for each of these' requests:
+    e.g. a personalized message per person, one pass per row. NOTE: this
+    drives the real desktop; the floating Stop Looping bar lets the user end
+    it early, and a failing step stops the batch with a popup. If the
+    workflow has collect steps, each pass's values are saved to its sheet —
+    read them back with read_workflow_sheet when the batch is done."""
+    return _guard(vk.run_workflow_batch, name, rows, wait_seconds)
+
+
+@mcp.tool
+def read_workflow_sheet(
+    name: Annotated[str, "The workflow whose data to read, e.g. 'Send Invoice'."],
+) -> dict:
+    """Read a workflow's data files: its inputs sheet (ask columns plus any
+    collect columns that runs have filled) and, if present, its results
+    overflow file. This is how collected values get back to you after
+    run_workflow_batch or a user-driven loop. Also returns loop_running —
+    after a fire-and-forget batch, poll this: results are written when the
+    loop ends, so loop_running=False means the data is final."""
+    return _guard(vk.read_workflow_sheet, name)
 
 
 @mcp.tool
