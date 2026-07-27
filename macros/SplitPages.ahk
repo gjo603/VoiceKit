@@ -40,8 +40,12 @@ if !(src ~= "i)\.pdf$") {
     ExitApp()
 }
 
-splitDir := A_Temp "\VoiceKitSplit"
-try DirDelete(splitDir, true)
+; A fresh per-run subfolder: if a previous run's viewer never let go of a
+; page file, the old folder can't fully delete — a unique name keeps that
+; leftover from ever colliding with this run's pages.
+splitBase := A_Temp "\VoiceKitSplit"
+try DirDelete(splitBase, true)               ; best-effort sweep of old runs
+splitDir := splitBase "\run " A_Now
 pageCount := SplitPdf(src, splitDir)         ; shows its own error dialog on failure
 if (pageCount = "")
     ExitApp()
@@ -71,10 +75,13 @@ Loop pageCount {
     k := 2
     while FileExist(target)                  ; two receipts, same words? keep both
         target := destDir "\" name " (" k++ ").pdf"
-    FileMove(pageFile, target)
-    saved += 1
+    ok := SavePage(pageFile, target)
+    while (!ok && RetrySaveDialog(i))
+        ok := SavePage(pageFile, target)
+    if ok
+        saved += 1
 }
-try DirDelete(splitDir, true)
+try DirDelete(splitBase, true)
 Log(root, "split-pages | " saved " of " pageCount " | " src)
 InfoDialog(stopped ? "Stopped" : "Done ✓",
     saved " page" (saved = 1 ? "" : "s") " saved into:`n" destDir
@@ -108,9 +115,9 @@ PageDialog(i, n, today) {
     ThemeDim(ex)
     hwnd := d.Hwnd
     ShowBottomRight(d)                       ; corner placement — never covers the page
-    WinActivate("ahk_id " hwnd)              ; focused over the just-opened viewer
-    edDesc.Focus()                           ; caret in the input field, ready to type
-    WinWaitClose("ahk_id " hwnd)
+    try WinActivate("ahk_id " hwnd)          ; focused over the just-opened viewer
+    try edDesc.Focus()                       ; caret ready (try: a voice click can
+    WinWaitClose("ahk_id " hwnd)             ; destroy the dialog before this line)
     return state
 }
 
@@ -127,20 +134,71 @@ WaitViewer(i) {
     Sleep(400)
 }
 
-; Description -> safe file-name fragment (strip illegal chars, tidy spaces).
+; Description -> safe file-name fragment (strip illegal chars, tidy spaces;
+; capped so a pasted paragraph can't push the path past Windows' limit).
 CleanFileText(s) {
     s := RegExReplace(s, '[\\/:*?"<>|]', "")
     s := RegExReplace(Trim(s), "\s+", " ")
-    return Trim(s, " .")
+    return Trim(SubStr(s, 1, 120), " .")
 }
 
-; Close the viewer window showing temp page i (title contains the file name).
+; Close the viewer window showing temp page i (title contains the file name),
+; and wait for it to actually vanish — WinClose only POSTS the close, and the
+; save (and the next page's open) must not race a viewer mid-shutdown.
 ClosePreview(i) {
     prev := A_TitleMatchMode
     SetTitleMatchMode(2)
-    if WinExist("page " Format("{:03}", i))
+    if WinExist("page " Format("{:03}", i)) {
         try WinClose()
+        WinWaitClose("page " Format("{:03}", i), , 2)
+    }
     SetTitleMatchMode(prev)
+}
+
+; Move the finished page into place. A bare FileMove here raced the viewer:
+; the window may be gone while the process still holds the file for another
+; beat (Acrobat especially), and a rename is blocked while ANY handle without
+; delete-sharing is open — so runs started throwing once closes lagged.
+; Retry briefly; if the lock outlives that, fall back to copying (a viewer's
+; read lock blocks renaming, not reading) and let the end-of-run temp
+; cleanup collect the original instead.
+SavePage(pageFile, target) {
+    Loop 8 {
+        try {
+            FileMove(pageFile, target)
+            return true
+        }
+        Sleep(150)
+    }
+    try {
+        FileCopy(pageFile, target)
+        return true
+    }
+    return false
+}
+
+; Shown only when SavePage gave up — the page (or the destination folder)
+; is still busy. Voice-clickable, Try Again is the accented default.
+RetrySaveDialog(i) {
+    retry := false
+    d := Gui("+AlwaysOnTop", "Split Pages")
+    d.SetFont("s10", "Segoe UI")
+    d.MarginX := 20, d.MarginY := 16
+    d.SetFont("s12 bold")
+    d.AddText("xm", "Page " i " couldn't be saved")
+    d.SetFont("s10 norm")
+    d.AddText("xm y+8 w440", "The file is still busy — usually the PDF viewer hasn't let go of it yet. Close any window still showing the page, then try again. Skipping leaves this page out; the original document keeps every page either way.")
+    btnRetry := d.AddButton("xm y+14 w150 h34 Default", "Try Again")
+    btnSkip := d.AddButton("x+8 w140 h34", "Skip Page")
+    btnRetry.OnEvent("Click", (*) => (retry := true, d.Destroy()))
+    btnSkip.OnEvent("Click", (*) => d.Destroy())
+    d.OnEvent("Close", (*) => d.Destroy())
+    d.OnEvent("Escape", (*) => d.Destroy())
+    ThemeApply(d)
+    hwnd := d.Hwnd
+    d.Show()
+    WinWaitClose("ahk_id " hwnd)
+    return retry
 }
 
 ; ------------------------------------------------------------
