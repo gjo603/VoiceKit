@@ -171,6 +171,62 @@ ThemeOnColor(wParam, lParam, msg, hwnd) {
 }
 
 ; ------------------------------------------------------------
+;  Show a themed dialog MODALLY and wait until it closes — the one
+;  copy of a tail that used to be hand-typed in every GUI (four of
+;  those copies had the dialog-lifetime bug below).
+;    owner      Gui (or hwnd) disabled while the dialog is up, then
+;               re-enabled and refocused. 0 = none.
+;    dims       a control, or an Array, to give the dim caption color —
+;               applied AFTER ThemeApply, which recolors every Text
+;               control (a ThemeDim before it would be overwritten). A
+;               function in the list is called at that point instead,
+;               for any other post-theme touch (an accent-colored phrase).
+;    focusCtrl  control to put the caret in once shown.
+;    showOpts   Gui.Show options — or a function(d) that places and
+;               shows the dialog itself (ShowBottomRight).
+;    statusCtrl passed to ThemeApply (its dim status line).
+;  Every hwnd is read BEFORE Show: a fast Enter or a voice click on the
+;  Default button can destroy the Gui the instant it appears, and a
+;  property read on a destroyed Gui throws "Gui has no window" (the
+;  dialog-lifetime trap in CLAUDE.md). The owner is re-enabled in a
+;  finally, so nothing that throws in between leaves it disabled.
+; ------------------------------------------------------------
+ThemeShowModal(d, owner := 0, dims := "", focusCtrl := 0, showOpts := "", statusCtrl := 0) {
+    ThemeApply(d, statusCtrl)
+    if IsObject(dims) {
+        for c in (dims is Array ? dims : [dims]) {
+            if (c is Func)
+                c()
+            else if IsObject(c)
+                ThemeDim(c)
+        }
+    }
+    hwnd := d.Hwnd
+    fHwnd := focusCtrl ? focusCtrl.Hwnd : 0
+    oHwnd := !owner ? 0 : IsObject(owner) ? owner.Hwnd : owner
+    disabled := false
+    try {
+        if (showOpts is Func)
+            showOpts(d)
+        else
+            d.Show(showOpts)
+        if oHwnd {
+            try WinSetEnabled(false, "ahk_id " oHwnd)
+            disabled := true
+        }
+        try WinActivate("ahk_id " hwnd)
+        if fHwnd
+            try ControlFocus(fHwnd, "ahk_id " hwnd)
+        WinWaitClose("ahk_id " hwnd)          ; an already-gone hwnd simply returns
+    } finally {
+        if disabled {
+            try WinSetEnabled(true, "ahk_id " oHwnd)
+            try WinActivate("ahk_id " oHwnd)
+        }
+    }
+}
+
+; ------------------------------------------------------------
 ;  Small floating-bar helpers (shared by the REC bar and the
 ;  loop bar — both are caption-less +AlwaysOnTop ToolWindows).
 ; ------------------------------------------------------------
@@ -181,11 +237,17 @@ ThemeOnColor(wParam, lParam, msg, hwnd) {
 ; Measured/moved with WinGetPos/WinMove, which use PHYSICAL pixels like
 ; MonitorGetWorkArea — Gui.GetPos returns DPI-scaled units, and mixing the
 ; two sat the bar on top of the taskbar on >100%-DPI displays.
+; All three placement helpers read the Gui's HWND once, BEFORE any Show (the
+; dialog-lifetime trap in CLAUDE.md), and pass it BARE: a pure HWND finds the
+; still-hidden window whatever DetectHiddenWindows says; "ahk_id " would not.
 ShowBottomLeft(bar, margin := 12) {
     MonitorGetWorkArea(MonitorGetPrimary(), &l, &t, &r, &b)
+    hwnd := bar.Hwnd                        ; captured BEFORE Show (dialog-lifetime trap)
     bar.Show("NoActivate Hide")
-    WinGetPos(, , , &h, bar.Hwnd)
-    WinMove(l + margin, b - h - margin, , , bar.Hwnd)
+    try {
+        WinGetPos(, , , &h, hwnd)
+        WinMove(l + margin, b - h - margin, , , hwnd)
+    }
     bar.Show("NoActivate")
 }
 
@@ -194,9 +256,12 @@ ShowBottomLeft(bar, margin := 12) {
 ; here take typed/dictated input.
 ShowBottomCenter(bar, margin := 16) {
     MonitorGetWorkArea(MonitorGetPrimary(), &l, &t, &r, &b)
+    hwnd := bar.Hwnd                        ; captured BEFORE Show (dialog-lifetime trap)
     bar.Show("Hide")
-    WinGetPos(, , &w, &h, bar.Hwnd)
-    WinMove(l + ((r - l - w) // 2), b - h - margin, , , bar.Hwnd)
+    try {
+        WinGetPos(, , &w, &h, hwnd)
+        WinMove(l + ((r - l - w) // 2), b - h - margin, , , hwnd)
+    }
     bar.Show()
 }
 
@@ -205,9 +270,12 @@ ShowBottomCenter(bar, margin := 16) {
 ; ShowBottomCenter, because the user types into it.
 ShowBottomRight(bar, margin := 16) {
     MonitorGetWorkArea(MonitorGetPrimary(), &l, &t, &r, &b)
+    hwnd := bar.Hwnd                        ; captured BEFORE Show (dialog-lifetime trap)
     bar.Show("Hide")
-    WinGetPos(, , &w, &h, bar.Hwnd)
-    WinMove(r - w - margin, b - h - margin, , , bar.Hwnd)
+    try {
+        WinGetPos(, , &w, &h, hwnd)
+        WinMove(r - w - margin, b - h - margin, , , hwnd)
+    }
     bar.Show()
 }
 

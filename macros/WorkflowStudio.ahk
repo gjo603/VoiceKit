@@ -33,7 +33,9 @@ CoordMode("Mouse", "Screen")
 
 root := RegExReplace(A_ScriptDir, "\\[^\\]+$")
 EnsureDir(root "\workflows")
-EnsureStudioShortcut()
+; Self-heal the Start Menu entry so "open workflow studio" works even on
+; installs made before this feature existed.
+EnsureVoiceShortcut(VoiceShortcutName("WorkflowStudio"), A_ScriptFullPath)
 
 ; ---- state ----
 steps := []             ; array of [type, paramA, paramB, paramC]
@@ -61,17 +63,32 @@ recSuppress := false    ; true while the recorder itself is typing (an ask step'
 ; Advanced if/else/endif entries live at the END so they're never the default
 ; and don't clutter ordinary recording. The four "if" rows all save as type
 ; "if"; typeConds carries the condition kind (paramC of the step).
-typeIds    := ["focus", "run", "waitwin", "wait", "text", "ask", "keys", "click", "dblclick", "rclick", "hover", "drag", "move", "close"
-             , "collect", "collect"
-             , "if", "if", "if", "if", "else", "endif"]
-typeConds  := ["", "", "", "", "", "", "", "", "", "", "", "", "", ""
-             , "", "elem"
-             , "winexists", "winnotexists", "elementexists", "elementnotexists", "", ""]
+; The "Wait until …" rows all save as type "waitfor" and share their condition
+; vocabulary with the "if" rows below — anything testable is also waitable.
+; They sit next to the dumb millisecond Wait on purpose: someone hunting for
+; "wait" should see the versions that don't need a guessed number.
+typeIds    := ["focus", "run", "waitwin", "wait"
+             , "waitfor", "waitfor", "waitfor", "waitfor", "waitfor"
+             , "text", "fill", "ask", "keys", "click", "dblclick", "rclick", "hover", "drag", "move", "close"
+             , "collect", "collect", "set", "capture"
+             , "if", "if", "if", "if", "if", "if", "else", "endif"]
+typeConds  := ["", "", "", ""
+             , "elementexists", "elementnotexists", "winnotexists", "textvisible", "clipboardchanged"
+             , "", "", "", "", "", "", "", "", "", "", ""
+             , "", "elem", "", ""
+             , "winexists", "winnotexists", "elementexists", "elementnotexists"
+             , "textvisible", "textnotvisible", "", ""]
 typeLabels := ["Focus window (launch it if needed)"
              , "Open app / file / website"
              , "Wait for a window to appear"
-             , "Wait (pause for milliseconds)"
+             , "Wait (pause for milliseconds, or a random range like 600-1400)"
+             , "Wait until something appears on screen"
+             , "Wait until something disappears from screen"
+             , "Wait until a window closes"
+             , "Wait until some text appears on screen"
+             , "Wait until something new is copied (clipboard)"
              , "Type text"
+             , "Fill in a box by its label (types the value, then checks it took)"
              , "Ask me for input (asks before the run; types the answer here)"
              , "Press keys (e.g. {Enter}, ^s)"
              , "Left-click something in a window (by its name)"
@@ -83,10 +100,14 @@ typeLabels := ["Focus window (launch it if needed)"
              , "Close window"
              , "Collect the selected text (saves it to the workflow's sheet)"
              , "Collect what's in a named box (saves it to the workflow's sheet)"
+             , "Set a value (reuse it anywhere later as {{name}})"
+             , "Run a command and save its output"
              , "— If a window IS open …"
              , "— If a window is NOT open …"
              , "— If something IS on screen …"
              , "— If something is NOT on screen …"
+             , "— If some text IS on screen …"
+             , "— If some text is NOT on screen …"
              , "— Otherwise (else) …"
              , "— End if"]
 
@@ -127,11 +148,20 @@ g.SetFont("s10")
 chkCloseTabs := g.AddCheckBox("xm y+14", "Close browser tabs before recording")
 chkMaxWins := g.AddCheckBox("xm y+6", "Maximize windows while recording  (steadier playback)")
 chkCoordsOnly := g.AddCheckBox("xm y+6", "Record clicks by position only  (skip element names — for maps, canvases, games)")
+chkRawInput := g.AddCheckBox("xm y+6", "Record raw input only  (no auto Waits, window switches, or maximizing — just what you do)")
+; The one PLAYBACK setting on this panel: every other box above changes what
+; gets recorded. It lives here because this is where workflows are authored,
+; and it is stored under [Workflow] (not [Studio]) because the engine reads
+; it — every run, not just the ones started from the Studio.
+chkJitter := g.AddCheckBox("xm y+6", "Vary click positions slightly when running  (clicking the same pixel every pass looks automated)")
 
 g.SetFont("s11")
-btnRec  := g.AddButton("xm y+8 w214 h44 Default", "●  Record (F9)")   ; Default: Enter starts recording
-btnTest := g.AddButton("x+12 w150 h44",   "▶  Test")
-btnSave := g.AddButton("x+12 w214 h44",   "🖫  Save")
+btnRec  := g.AddButton("xm y+8 w200 h44 Default", "●  Record (F9)")   ; Default: Enter starts recording
+btnTest := g.AddButton("x+10 w120 h44",   "▶  Test")
+btnSave := g.AddButton("x+10 w160 h44",   "🖫  Save")
+; "and Close" spelled out, not "&" — an ampersand in a button caption is a
+; keyboard-mnemonic marker, and the caption IS what Voice Access matches on.
+btnSaveClose := g.AddButton("x+10 w210 h44", "🖫  Save and Close")
 
 g.SetFont("s9")
 statusBar := g.AddText("xm y+14 w648 h30", "")
@@ -162,11 +192,14 @@ btnUp.OnEvent("Click", MoveUp)
 btnDown.OnEvent("Click", MoveDown)
 btnRec.OnEvent("Click", (*) => StartRecording())
 btnTest.OnEvent("Click", TestRun)
-btnSave.OnEvent("Click", SaveWorkflow)
+btnSave.OnEvent("Click", (*) => SaveWorkflow())
+btnSaveClose.OnEvent("Click", (*) => SaveWorkflow(true))
 btnHelp.OnEvent("Click", ShowHelp)
 chkCloseTabs.OnEvent("Click", SaveSettings)
 chkMaxWins.OnEvent("Click", SaveSettings)
 chkCoordsOnly.OnEvent("Click", SaveSettings)
+chkRawInput.OnEvent("Click", SaveSettings)
+chkJitter.OnEvent("Click", SaveSettings)
 g.OnEvent("Close", CloseStudio)
 
 ; ---- keys while the main Studio window is active ----
@@ -408,20 +441,94 @@ StepDialog(existing := "") {
     edA := d.AddEdit("xm w480")
     laB := d.AddText("xm y+10 w480", "")
     edB := d.AddEdit("xm w480")
+    laT := d.AddText("xm y+10 w480", "")        ; timeout — "Wait until …" rows only
+    edT := d.AddEdit("xm w120")
     btnGrab := d.AddButton("xm y+12 w210", "Grab a Window (3 sec)")
     btnPick := d.AddButton("x+8 w210", "Pick element (3 sec)")
     btnBrowse := d.AddButton("xm yp w180", "Browse for File...")   ; same row; shown only for 'run'
     btnSpot := d.AddButton("xm y+8 w210", "Pick a spot (3 sec)")   ; click a POSITION, no name needed
     laC := d.AddText("xm y+6 w480", "")                            ; the picked spot, dimmed
+    laVars := d.AddText("xm y+2 w480 r2", "")                      ; values usable here, dimmed
     btnOK := d.AddButton("xm y+14 w120 Default", "OK")
     btnCancel := d.AddButton("x+8 w120", "Cancel")
 
+    ; The named values this workflow already defines, so the user can see what
+    ; {{...}} they can type rather than having to remember. Hidden for step
+    ; types where no field is substituted.
+    ShowVarHint(t) {
+        global steps
+        if (t = "else" || t = "endif" || t = "ask" || t = "wait") {
+            laVars.Text := ""
+            return
+        }
+        names := WfVarNames(steps)
+        ; Line 2: the built-ins (Workflow.ahk WfBuiltinVar) — {{selected_file}}
+        ; is the one file selected in File Explorer when the run starts.
+        laVars.Text := (names.Length
+            ? "Values you can use here:  {{" JoinList(names, "}}   {{") "}}"
+            : "Tip: an Ask, Collect, Set or Run-a-command step names a value you can reuse here as {{name}}.")
+            . ((t = "capture" || t = "run")      ; command lines: WfSubst quotes the selection
+                ? "`nBuilt in:  {{selected_file}}  {{selected_files}}  (quoted for you here)  {{date}}"
+                : "`nBuilt in:  {{selected_file}}  {{selected_files}}  {{clipboard}}  {{date}}")
+    }
+
+    ; Element/text conditions need something to look FOR; the window ones don't.
+    CondNeedsElem(cond) {
+        return cond = "elementexists" || cond = "elementnotexists"
+            || cond = "textvisible" || cond = "textnotvisible"
+    }
+    CondIsText(cond) {
+        return cond = "textvisible" || cond = "textnotvisible"
+    }
+
     UpdateFields(*) {
         t := typeIds[dt.Value], cond := typeConds[dt.Value]
+        ShowVarHint(t)
+        laT.Visible := edT.Visible := false      ; only the "Wait until" rows use it
+        edT.Move(, , 120)                        ; fill widens it for its value
         ; else / endif are block markers — no fields at all.
         if (t = "else" || t = "endif") {
             laA.Visible := edA.Visible := laB.Visible := edB.Visible := false
             btnGrab.Visible := btnPick.Visible := btnBrowse.Visible := false
+            btnSpot.Visible := laC.Visible := false
+            return
+        }
+        ; set: name a value here, use it as {{name}} in any later step.
+        if (t = "set") {
+            laA.Text := "Name this value — you'll use it later as {{name}}:"
+            laA.Visible := edA.Visible := true
+            laB.Text := "Value — can include other values, e.g. Hi {{First Name}}, or {{clipboard}}:"
+            laB.Visible := edB.Visible := true
+            btnGrab.Visible := btnPick.Visible := btnBrowse.Visible := false
+            btnSpot.Visible := laC.Visible := false
+            return
+        }
+        ; capture: a name, the command line, and a timeout (paramC, in the
+        ; timeout box — like waitfor's seconds, not the second box).
+        if (t = "capture") {
+            laA.Text := "Name the output — you'll use it later as {{name}}:"
+            laA.Visible := edA.Visible := true
+            laB.Text := "Command line, e.g.  python `"C:\tools\invoice.py`" {{selected_file}}"
+            laB.Visible := edB.Visible := true
+            laT.Text := "Give up after this many seconds (blank = 30):"
+            laT.Visible := edT.Visible := true
+            btnGrab.Visible := btnPick.Visible := btnBrowse.Visible := false
+            btnSpot.Visible := laC.Visible := false
+            return
+        }
+        ; fill: window, the box's label (Pick element fills it — point at the
+        ; BOX, not the text beside it), and the value, which rides in paramC
+        ; and so uses the third box, widened.
+        if (t = "fill") {
+            laA.Text := "Window:"
+            laA.Visible := edA.Visible := true
+            laB.Text := "The box's label, exactly as shown — Amount#2 = the 2nd box with that label (## = a real #):"
+            laB.Visible := edB.Visible := true
+            laT.Text := "Value to put in it — can use {{name}} (blank clears the box):"
+            laT.Visible := edT.Visible := true
+            edT.Move(, , 480)
+            btnGrab.Visible := btnPick.Visible := true
+            btnBrowse.Visible := false
             btnSpot.Visible := laC.Visible := false
             return
         }
@@ -439,15 +546,37 @@ StepDialog(existing := "") {
             btnSpot.Visible := laC.Visible := false
             return
         }
-        ; if: a window to check for, plus an element name for the "on screen" tests.
+        ; waitfor: block until something is actually true, instead of betting on
+        ; a number of milliseconds. Same conditions as `if`, plus a timeout.
+        if (t = "waitfor") {
+            needWin := (cond != "clipboardchanged")
+            needElem := CondNeedsElem(cond)
+            laA.Text := "Window to watch — 'ahk_exe app.exe' or part of its title:"
+            laA.Visible := edA.Visible := needWin
+            laB.Text := CondIsText(cond)
+                ? "Text to wait for, as it appears on screen:"
+                : "Name of the thing to wait for, exactly as shown on screen:"
+            laB.Visible := edB.Visible := needElem
+            laT.Text := "Give up after this many seconds (blank = 10):"
+            laT.Visible := edT.Visible := true
+            btnGrab.Visible := needWin
+            btnPick.Visible := (cond = "elementexists" || cond = "elementnotexists")
+            btnBrowse.Visible := false
+            btnSpot.Visible := laC.Visible := false
+            return
+        }
+        ; if: a window to check for, plus an element name / text for the
+        ; "on screen" tests.
         if (t = "if") {
-            needElem := (cond = "elementexists" || cond = "elementnotexists")
+            needElem := CondNeedsElem(cond)
             laA.Text := "Window to check for — 'ahk_exe app.exe' or part of its title:"
             laA.Visible := edA.Visible := true
-            laB.Text := "Name of the thing to check for, exactly as shown on screen:"
+            laB.Text := CondIsText(cond)
+                ? "Text to check for, as it appears on screen:"
+                : "Name of the thing to check for, exactly as shown on screen:"
             laB.Visible := edB.Visible := needElem
             btnGrab.Visible := true          ; Grab fills in the window for you
-            btnPick.Visible := needElem      ; Pick fills in the element (and its window)
+            btnPick.Visible := (cond = "elementexists" || cond = "elementnotexists")
             btnBrowse.Visible := false
             btnSpot.Visible := laC.Visible := false
             return
@@ -458,7 +587,7 @@ StepDialog(existing := "") {
             "run",      ["What to open — a program, file, folder path, or https:// address:", ""],
             "waitwin",  ["Window to wait for (it gets focused when it appears):",
                          "Give up after this many seconds (blank = 10):"],
-            "wait",     ["How long to pause, in milliseconds (1000 = 1 second):", ""],
+            "wait",     ["How long to pause, in milliseconds (1000 = 1 second) — or a range like 600-1400 for a random pause:", ""],
             "text",     ["Text to type into the focused window:", ""],
             "ask",      ["What should I ask you for? — the input's label, e.g. 'Customer name':",
                          "Suggested answer, prefilled in the ask box — optional:"],
@@ -512,7 +641,7 @@ StepDialog(existing := "") {
         }
         ToolTip()
         MouseGetPos(&mx, &my, &winHwnd)
-        el := AccFromPoint(mx, my)                 ; query while the windows are hidden
+        name := PickNameAt(mx, my, winHwnd)        ; query while the windows are hidden
         info := ClassifyWindow(winHwnd)            ; "" for VoiceKit's own window / desktop / shell
         g.Show()
         d.Show()
@@ -521,16 +650,26 @@ StepDialog(existing := "") {
             MsgBox("Point at your app's window — not VoiceKit or the desktop. Try again.", "Pick element", "Owner" d.Hwnd)
             return
         }
-        name := IsObject(el) ? AccName(el.acc, el.child) : ""
         if (name = "") {
             MsgBox("Couldn't read a name there. Point at a button, link, menu item or other labeled control — or type its name.", "Pick element", "Owner" d.Hwnd)
             return
         }
-        edB.Value := name
+        ; A fill label reads "#<digits>" at its end as "the Nth box" and "##"
+        ; as a literal "#" (WfFillLabel) — so a picked name is written with
+        ; every "#" doubled, or "Unit #2" would silently mean "the 2nd box
+        ; labelled Unit".
+        edB.Value := (typeIds[dt.Value] = "fill") ? StrReplace(name, "#", "##") : name
         ; Also capture the window it's in, if not set yet — but not for
         ; collect, whose first box is the value's label, not a window.
         if (edA.Value = "" && typeIds[dt.Value] != "collect")
             edA.Value := info.crit
+        ; The recorder drops names this long (CaptureTarget) — paragraph-length
+        ; text changes between runs, so it isn't a stable thing to click by.
+        ; Here the user picked it on purpose, so keep it but say so.
+        if (StrLen(name) > 100)
+            MsgBox("That name is " StrLen(name) " characters long — text that long usually changes "
+                . "between runs, so a click by name may miss. Keep just a distinctive part of it, "
+                . "or use Pick a spot instead.", "Pick element", "Icon! Owner" d.Hwnd)
     }
 
     ; The dim caption under the buttons: the window-relative spot (paramC)
@@ -555,13 +694,8 @@ StepDialog(existing := "") {
         ToolTip()
         MouseGetPos(&mx, &my, &winHwnd)
         info := ClassifyWindow(winHwnd)
-        rel := ""
-        if IsObject(info) {
-            try {                                  ; window can vanish mid-countdown
-                WinGetPos(&wx, &wy, , , winHwnd)
-                rel := (mx - wx) "," (my - wy)
-            }
-        }
+        ; "" when the window vanished mid-countdown
+        rel := IsObject(info) ? WinRelPoint(winHwnd, mx, my) : ""
         g.Show()
         d.Show()
         WinActivate("ahk_id " d.Hwnd)
@@ -591,6 +725,70 @@ StepDialog(existing := "") {
         }
         a := Trim(edA.Value)
         b := Trim(edB.Value)
+        ; set: a name plus the value it stands for. Handled before the generic
+        ; path below, which would otherwise blank paramB.
+        if (t = "set") {
+            if (a = "") {
+                MsgBox("Give the value a name — that's what you'll type as {{name}} later.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            if (InStr(a, "{") || InStr(a, "}")) {
+                MsgBox("Just the name here — no braces. Write  Greeting , then use  {{Greeting}}  in later steps.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            result := ["set", a, b, ""]
+            d.Destroy()
+            return
+        }
+        ; capture: name + command required; the timeout box is paramC (blank =
+        ; the engine's 30 s). Handled here because the generic path below
+        ; would blank paramC.
+        if (t = "capture") {
+            if (a = "") {
+                MsgBox("Give the output a name — that's what you'll type as {{name}} later.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            if (InStr(a, "{") || InStr(a, "}")) {
+                MsgBox("Just the name here — no braces. Write  Invoice Data , then use  {{Invoice Data}}  in later steps.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            if (b = "") {
+                MsgBox("Give the command to run.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            secs := Trim(edT.Value)
+            if (secs != "" && (!IsNumber(secs) || Number(secs) <= 0)) {
+                MsgBox("The timeout must be a number of seconds, e.g. 120 — or blank for 30.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            result := ["capture", a, b, secs]
+            d.Destroy()
+            return
+        }
+        ; fill: window + label required; the value (paramC) is kept exactly as
+        ; typed — spaces included — and may be blank (clears the box). A line
+        ; break is refused, as the engine would at run time.
+        if (t = "fill") {
+            if (a = "") {
+                MsgBox("Give the window the box is in — Grab a Window fills it in.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            if (b = "") {
+                MsgBox("Give the box's label as shown on screen — or point Pick element at the box.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            if ((lerr := WfFillLabel(b).err) != "") {
+                MsgBox(lerr, "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            if RegExMatch(edT.Value, "[\r\n]") {
+                MsgBox("The value can't contain a line break (it would press Enter and could submit the form). Use a Type text step for multi-line text.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            result := ["fill", a, b, edT.Value]
+            d.Destroy()
+            return
+        }
         ; collect: label required; the named-box variant needs its element too.
         if (t = "collect") {
             if (a = "") {
@@ -605,15 +803,45 @@ StepDialog(existing := "") {
             d.Destroy()
             return
         }
-        ; if: window required; element required for the "on screen" conditions.
+        ; waitfor: window + what to watch for + a timeout. The condType and the
+        ; seconds share paramC ("<condType>[,<seconds>]"), so this has to run
+        ; before the generic path below — a clipboard wait has no window at all.
+        if (t = "waitfor") {
+            needWin := (cond != "clipboardchanged")
+            needElem := CondNeedsElem(cond)
+            if (needWin && a = "") {
+                MsgBox("Give the window to watch.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            if (needElem && b = "") {
+                MsgBox(CondIsText(cond)
+                    ? "Give the text to wait for, as it appears on screen."
+                    : "Give the name of the thing to wait for, as shown on screen.",
+                    "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            secs := Trim(edT.Value)
+            if (secs != "" && (!IsNumber(secs) || Number(secs) <= 0)) {
+                MsgBox("The timeout must be a number of seconds, e.g. 30 — or blank for 10.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            result := ["waitfor", (needWin ? a : ""), (needElem ? b : ""),
+                cond (secs != "" ? "," secs : "")]
+            d.Destroy()
+            return
+        }
+        ; if: window required; element/text required for the "on screen" conditions.
         if (t = "if") {
             if (a = "") {
                 MsgBox("Give the window to check for.", "Add Step", "Owner" d.Hwnd)
                 return
             }
-            needElem := (cond = "elementexists" || cond = "elementnotexists")
+            needElem := CondNeedsElem(cond)
             if (needElem && b = "") {
-                MsgBox("Give the name of the thing to check for, as shown on screen.", "Add Step", "Owner" d.Hwnd)
+                MsgBox(CondIsText(cond)
+                    ? "Give the text to check for, as it appears on screen."
+                    : "Give the name of the thing to check for, as shown on screen.",
+                    "Add Step", "Owner" d.Hwnd)
                 return
             }
             result := ["if", a, (needElem ? b : ""), cond]     ; if|window|element|condType
@@ -624,8 +852,12 @@ StepDialog(existing := "") {
             MsgBox("Fill in the first box.", "Add Step", "Owner" d.Hwnd)
             return
         }
-        if (t = "wait" && !IsInteger(a)) {
-            MsgBox("Milliseconds must be a whole number, e.g. 1500.", "Add Step", "Owner" d.Hwnd)
+        ; A range (600-1400) pauses a random amount inside it — the same
+        ; parser the engine uses, so what the box accepts is what runs.
+        if (t = "wait" && WfWaitMs(a).err != "") {
+            MsgBox("Milliseconds must be a whole number, e.g. 1500 — or a range like 600-1400 "
+                . "to pause a random amount in between (useful when a workflow loops against a "
+                . "website: identical pauses every pass look automated).", "Add Step", "Owner" d.Hwnd)
             return
         }
         if (t = "waitwin" && b != "" && !IsInteger(b)) {
@@ -681,10 +913,12 @@ StepDialog(existing := "") {
     if IsObject(existing) {
         idx := 1
         exCond := (existing.Length >= 4) ? existing[4] : ""
+        if (existing[1] = "waitfor")         ; paramC is "<condType>[,<seconds>]"
+            exCond := WfWaitParts(exCond).cond
         for i, id in typeIds {
             if (id != existing[1])
                 continue
-            if (id = "if") {                 ; pick the if-row whose condition matches
+            if (id = "if" || id = "waitfor") {   ; pick the row whose condition matches
                 if (typeConds[i] = exCond)
                     idx := i
             } else if (id = "collect") {     ; selection vs named-box variant
@@ -699,13 +933,17 @@ StepDialog(existing := "") {
         edB.Value := (existing[1] = "drag")     ; drag edits its paramC path in edB
             ? ((existing.Length >= 4) ? existing[4] : "")
             : existing[3]
+        if (existing[1] = "waitfor")            ; the seconds half of paramC
+            edT.Value := WfWaitParts((existing.Length >= 4) ? existing[4] : "").secs
+        if (existing[1] = "capture" || existing[1] = "fill")   ; paramC whole: the timeout / the value
+            edT.Value := (existing.Length >= 4) ? existing[4] : ""
         SpotCaption()                           ; show a pointer step's saved spot
     } else {
         dt.Choose(1)
         UpdateFields()
     }
 
-    RunOwnedDialog(d, laC)          ; show modally over the Studio, then refocus it
+    ThemeShowModal(d, g, [laC, laVars])  ; modal over the Studio, then refocus it
     dialogOpen := false
     return result
 }
@@ -738,27 +976,43 @@ SaveNameDialog(defaultName := "") {
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
 
-    RunOwnedDialog(d)
+    ThemeShowModal(d, g)
     return result
 }
 
-; Show an owned dialog modally over the Studio: theme it, show and focus it,
-; disable the Studio behind it, wait for it to close, then re-enable + refocus.
-; dimCtrl (optional): a Text control to give the dim caption color — must go
-; through ThemeApply, which recolors every Text control after any ThemeDim.
-RunOwnedDialog(d, dimCtrl := 0) {
+; A brand-new name that's already a saved workflow: ask before replacing it
+; (it used to be overwritten without a word). Owned by the Studio and themed
+; like its other dialogs; Cancel is the Default button, so a reflexive Enter
+; can't destroy anything. True = replace.
+ConfirmReplaceDialog(disp, count) {
     global g
-    ThemeApply(d, dimCtrl)
-    ; Capture the hwnd BEFORE Show: an instant OK/Enter can destroy the Gui
-    ; before d.Hwnd is read again, and a property read on a destroyed Gui
-    ; throws "Gui has no window" (a raw hwnd stays safe to wait on).
-    hwnd := d.Hwnd
-    d.Show()
-    g.Opt("+Disabled")
-    try WinActivate("ahk_id " hwnd)
-    WinWaitClose("ahk_id " hwnd)
-    g.Opt("-Disabled")
-    WinActivate("ahk_id " g.Hwnd)
+    doReplace := false
+    d := Gui("+AlwaysOnTop +Owner" g.Hwnd, "Replace Workflow?")
+    d.SetFont("s10", "Segoe UI")
+    d.MarginX := 18, d.MarginY := 14
+    d.SetFont("s11 bold")
+    d.AddText("xm w440", "A workflow named '" disp "' already exists.")
+    d.SetFont("s10 norm")
+    note := d.AddText("xm y+6 w440", "Replacing it overwrites its saved steps with the " count
+        . " step" (count = 1 ? "" : "s") " here — its voice phrase stays the same. This can't be undone.")
+    btnReplace := d.AddButton("xm y+14 w150 h32", "Replace It")
+    btnCancel := d.AddButton("x+8 w120 h32 Default", "Cancel")
+    btnReplace.OnEvent("Click", (*) => (doReplace := true, d.Destroy()))
+    btnCancel.OnEvent("Click", (*) => d.Destroy())
+    d.OnEvent("Close", (*) => d.Destroy())
+    d.OnEvent("Escape", (*) => d.Destroy())
+    ThemeShowModal(d, g, note, btnCancel)
+    return doReplace
+}
+
+; The exact on-disk name of a saved workflow with this base, or "". NTFS is
+; caseless, so "Morningtabs" finds MorningTabs.steps.txt — and a replace
+; keeps that spelling, so its voice phrase and Start Menu entries don't move.
+SavedWorkflowBase(base) {
+    global root
+    Loop Files root "\workflows\" base ".steps.txt"
+        return StrReplace(A_LoopFileName, ".steps.txt")
+    return ""
 }
 
 ; ============================================================
@@ -805,7 +1059,7 @@ StartRecording() {
 }
 
 StopRecording() {
-    global recording, steps, lv, g, recBar, btnRec, recStartCount, chkCoordsOnly
+    global recording, steps, lv, g, recBar, btnRec, recStartCount, chkCoordsOnly, chkRawInput
     if !recording
         return
     recording := false
@@ -835,6 +1089,8 @@ StopRecording() {
         SB("Recorded — " posOnly " step" (posOnly = 1 ? "" : "s") " captured by position (⚠), as chosen. They replay by screen location, so keep the same window layout — the Maximize option helps." pNote)
     else if posOnly
         SB("Recorded — " posOnly " click" (posOnly = 1 ? " was" : "s were") " captured by position only (⚠ in the list) because nothing readable was under the mouse. They replay less reliably — prefer clicking labeled controls." pNote)
+    else if chkRawInput.Value
+        SB("Recorded raw — no Wait or window-switch steps were added, so playback sends the keys and clicks straight to whatever window is active then.")
     else
         SB("Recorded — trim or edit steps if needed, then click Test and Save." pNote)
 }
@@ -867,8 +1123,8 @@ UpdateRecBar(note) {
 ; phone call mid-recording) are capped; the first action of a take gets no
 ; Wait at all — that gap is just the user getting ready, not the app.
 RecMarkPause(kind := "mouse", atTick := 0) {
-    global recLastAct
-    if !recLastAct
+    global recLastAct, chkRawInput
+    if (chkRawInput.Value || !recLastAct)   ; raw-input mode: no auto Wait steps at all
         return
     if !atTick
         atTick := A_TickCount
@@ -930,11 +1186,13 @@ OfferRecovery() {
 }
 
 RecTick() {
-    global recording, typedBuf, lastCharTick, recLastHwnd, recLastCrit, recLastAct
+    global recording, typedBuf, lastCharTick, recLastHwnd, recLastCrit, recLastAct, chkRawInput
     if !recording
         return
     if (typedBuf != "" && A_TickCount - lastCharTick > 1500)
         FlushTypedText()
+    if chkRawInput.Value            ; raw-input mode: no window-switch Focus steps,
+        return                      ; no maximizing — the idle flush above still runs
     hwnd := WinExist("A")
     if (!hwnd || hwnd = recLastHwnd)
         return
@@ -958,8 +1216,8 @@ RecTick() {
 ; leaves the slot open: dialogs share their app's "ahk_exe" identity, so
 ; marking them handled would block the app's real main window later.
 RecEnsureMax(hwnd, crit) {
-    global chkMaxWins, recMaxed
-    if (!chkMaxWins.Value || recMaxed.Has(crit))
+    global chkMaxWins, recMaxed, chkRawInput
+    if (chkRawInput.Value || !chkMaxWins.Value || recMaxed.Has(crit))
         return
     try {
         if !(WinGetStyle(hwnd) & 0x10000)          ; WS_MAXIMIZEBOX
@@ -984,8 +1242,75 @@ RecDeferredMax(hwnd, crit) {
     RecEnsureMax(hwnd, crit)
 }
 
+; A Focus step for the window a capture happened in, when it isn't the one
+; the take is already in — so playback lands the next action in the right
+; app. Skipped in raw-input mode (no window-switch steps there). Does NOT
+; touch recLastAct: the pause anchor tracks input events, never step pushes.
+; (RecTick keeps its own copy: it flushes and marks the pause in between.)
+RecFocusIfNew(info, hwnd) {
+    global recLastCrit, recLastHwnd, chkRawInput
+    if (chkRawInput.Value || !IsObject(info) || info.crit = recLastCrit)
+        return
+    RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
+    recLastCrit := info.crit
+    recLastHwnd := hwnd
+}
+
+; The accessible name under a screen point, for Pick element: MSAA first (the
+; names recorded workflows were built against, and what playback tries first),
+; then UI Automation. Chrome publishes no page content over MSAA, so without
+; the fallback Pick read nothing — or just the browser pane — on a web form
+; (a web form app's input screen, say), and a `fill` step's label had to be typed
+; by hand. Safe from the own-process hang: UiaFromPoint refuses a point over
+; one of the Studio's windows (and the caller hides them first anyway).
+; Recording (CaptureTarget) is deliberately unchanged: it runs on button-down
+; inside the click hotkey, where an extra cross-process lookup is felt.
+PickNameAt(mx, my, winHwnd) {
+    name := ""
+    ap := AccFromPoint(mx, my)
+    if IsObject(ap)
+        name := AccName(ap.acc, ap.child)
+    ; What MSAA says over a browser's page is the pane itself ("Chrome Legacy
+    ; Window") or the window title — not a name anything can be found by.
+    title := ""
+    try title := WinGetTitle("ahk_id " winHwnd)
+    if (name = "" || name = "Chrome Legacy Window" || name = title) {
+        u := ""
+        try u := Trim(UiaName(UiaFromPoint(mx, my)))
+        if (u != "")
+            name := u
+    }
+    return name
+}
+
+; What a pointer capture points at: {elem, rel} — the accessible name under
+; (mx, my) when nameToo (position-only mode passes false; names over 100
+; characters are dropped, as paragraph-length text isn't a stable selector)
+; and the window-relative position kept as the fallback.
+CaptureTarget(mx, my, hwnd, nameToo) {
+    elem := ""
+    if nameToo {
+        ap := AccFromPoint(mx, my)
+        if IsObject(ap)
+            elem := AccName(ap.acc, ap.child)
+        if (StrLen(elem) > 100)
+            elem := ""
+    }
+    return {elem: elem, rel: WinRelPoint(hwnd, mx, my)}
+}
+
+; Screen point -> "x,y" relative to hwnd's window (the recorder's one piece
+; of offset math), or "" when the window is gone.
+WinRelPoint(hwnd, mx, my) {
+    try {
+        WinGetPos(&wx, &wy, , , hwnd)
+        return (mx - wx) "," (my - wy)
+    }
+    return ""
+}
+
 RecClick(btn) {
-    global recording, steps, recLastHwnd, recLastCrit, lastClick, chkCoordsOnly, recLastAct, recDragPend
+    global recording, steps, recLastHwnd, recLastCrit, lastClick, chkCoordsOnly, recLastAct, recDragPend, chkRawInput
     if !recording
         return
     MouseGetPos(&mx, &my, &hwnd)
@@ -997,11 +1322,7 @@ RecClick(btn) {
     ; the first press is under the double-click time, far below the floor,
     ; so RecMarkPause stays silent and can't split the pair.
     RecMarkPause()
-    if (info.crit != recLastCrit) {
-        RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
-        recLastCrit := info.crit
-        recLastHwnd := hwnd
-    }
+    RecFocusIfNew(info, hwnd)
     now := A_TickCount
     if (btn = "L" && lastClick.idx && lastClick.idx <= steps.Length
         && now - lastClick.tick < DllCall("GetDoubleClickTime")
@@ -1022,16 +1343,13 @@ RecClick(btn) {
         recDragPend := 0        ; the step is a dblclick/run now — button-up must not touch it
         return
     }
-    elem := ""
-    if (!chkCoordsOnly.Value) {              ; position-only mode records the spot, not the name
-        ap := AccFromPoint(mx, my)
-        if IsObject(ap)
-            elem := AccName(ap.acc, ap.child)
-        if (StrLen(elem) > 100)             ; paragraph-length names aren't stable selectors
-            elem := ""
+    ; position-only mode records the spot, not the name
+    t := CaptureTarget(mx, my, hwnd, !chkCoordsOnly.Value)
+    elem := t.elem, rel := t.rel
+    if (elem = "" && rel = "") {             ; the window closed under the click
+        UpdateRecBar("Click ignored — its window closed")
+        return
     }
-    WinGetPos(&wx, &wy, , , hwnd)
-    rel := (mx - wx) "," (my - wy)
     stepType := (btn = "R") ? "rclick" : "click"
     RecPush([stepType, info.crit, elem, rel],
         (btn = "R" ? "Right-click " : "Click ") (elem != "" ? "`"" elem "`"" : "at " rel))
@@ -1090,7 +1408,7 @@ RecDragEnd() {
 ; window-relative position kept as the fallback. The engine's hover step moves
 ; the pointer there and pauses so the menu/tooltip appears.
 RecHover() {
-    global recording, recLastHwnd, recLastCrit, chkCoordsOnly, recLastAct
+    global recording, recLastHwnd, recLastCrit, chkCoordsOnly, recLastAct, chkRawInput
     if !recording
         return
     MouseGetPos(&mx, &my, &hwnd)
@@ -1101,21 +1419,13 @@ RecHover() {
     }
     FlushTypedText()
     RecMarkPause()
-    if (info.crit != recLastCrit) {
-        RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
-        recLastCrit := info.crit
-        recLastHwnd := hwnd
+    RecFocusIfNew(info, hwnd)
+    t := CaptureTarget(mx, my, hwnd, !chkCoordsOnly.Value)
+    elem := t.elem, rel := t.rel
+    if (elem = "" && rel = "") {
+        UpdateRecBar("Hover ignored — its window closed")
+        return
     }
-    elem := ""
-    if (!chkCoordsOnly.Value) {
-        ap := AccFromPoint(mx, my)
-        if IsObject(ap)
-            elem := AccName(ap.acc, ap.child)
-        if (StrLen(elem) > 100)
-            elem := ""
-    }
-    WinGetPos(&wx, &wy, , , hwnd)
-    rel := (mx - wx) "," (my - wy)
     RecPush(["hover", info.crit, elem, rel],
         "Hover " (elem != "" ? "`"" elem "`"" : "at " rel))
     recLastAct := A_TickCount
@@ -1138,7 +1448,7 @@ RecHover() {
 ; each run. If the focused window is new to the take, a Focus step is pushed
 ; first so the answer lands in the same app the user was in at the hotkey.
 RecAskInput() {
-    global recording, recLastHwnd, recLastCrit, recLastAct, recSuppress
+    global recording, recLastHwnd, recLastCrit, recLastAct, recSuppress, chkRawInput
     if !recording
         return
     pressTick := A_TickCount        ; any pause ends at the hotkey press — time
@@ -1156,11 +1466,7 @@ RecAskInput() {
     }
     RecMarkPause("key", pressTick)  ; before the anchor reset — it reads recLastAct
     recLastAct := A_TickCount
-    if (IsObject(info) && info.crit != recLastCrit) {
-        RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
-        recLastCrit := info.crit
-        recLastHwnd := hwnd
-    }
+    RecFocusIfNew(info, hwnd)
     RecPush(["ask", ans.label, ans.sample, ""], "Ask for `"" ans.label "`"")
     ; Type the practice answer into the app for the user — suppressed, so the
     ; keyboard hook never turns it into a Type step (playback types the asked
@@ -1188,7 +1494,7 @@ RecAskInput() {
 ; Ctrl+C is never recorded. A Focus step is pushed first if the window
 ; is new to the take, like ask.
 RecCollect() {
-    global recording, recLastHwnd, recLastCrit, recLastAct, recSuppress
+    global recording, recLastHwnd, recLastCrit, recLastAct, recSuppress, chkRawInput
     if !recording
         return
     pressTick := A_TickCount        ; any pause ends at the hotkey press
@@ -1216,11 +1522,7 @@ RecCollect() {
     }
     RecMarkPause("key", pressTick)  ; before the anchor reset — it reads recLastAct
     recLastAct := A_TickCount
-    if (IsObject(info) && info.crit != recLastCrit) {
-        RecPush(["focus", info.crit, info.cmd, ""], "Switch to " info.crit)
-        recLastCrit := info.crit
-        recLastHwnd := hwnd
-    }
+    RecFocusIfNew(info, hwnd)
     RecPush(["collect", label, "", ""], "Collect `"" label "`"")
 }
 
@@ -1250,16 +1552,7 @@ CollectLabelDialog(preview) {
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ThemeApply(d)
-    ThemeDim(hint)
-    ThemeDim(pv)
-    hwnd := d.Hwnd, edHwnd := ed.Hwnd   ; pre-Show: reads on a destroyed Gui throw
-    d.Show()
-    try {                               ; dialog may be dismissed before these run
-        WinActivate("ahk_id " hwnd)
-        ControlFocus(edHwnd, "ahk_id " hwnd)
-    }
-    WinWaitClose("ahk_id " hwnd)
+    ThemeShowModal(d, 0, [hint, pv], ed)    ; no owner: the Studio is hidden while recording
     return result
 }
 
@@ -1289,43 +1582,23 @@ AskLabelDialog() {
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ThemeApply(d)
-    ThemeDim(hint)
-    ThemeDim(hint2)
-    hwnd := d.Hwnd, edHwnd := ed.Hwnd   ; pre-Show: reads on a destroyed Gui throw
-    d.Show()
-    try {                               ; dialog may be dismissed before these run
-        WinActivate("ahk_id " hwnd)
-        ControlFocus(edHwnd, "ahk_id " hwnd)
-    }
-    WinWaitClose("ahk_id " hwnd)
+    ThemeShowModal(d, 0, [hint, hint2], ed)
     return result
 }
 
-; Full path of the item selected in an Explorer window, or "".
+; Full path of THE item selected in an Explorer window's active tab, or ""
+; (nothing, several, or a virtual item such as a file inside a .zip — the
+; double-click then stays a plain double-click step). lib\ExplorerSel.ahk
+; is the one copy of the tab-correct lookup; this used to read whichever tab
+; Shell.Application listed first, so a recorded double-click could become a
+; `run` of a file in a BACKGROUND tab.
 ExplorerSelection(hwnd) {
-    try {
-        for w in ComObject("Shell.Application").Windows {
-            if (w.HWND = hwnd) {
-                items := w.Document.SelectedItems()
-                if (items.Count >= 1)
-                    return items.Item(0).Path
-            }
-        }
-    }
-    return ""
+    sel := ExplorerSelectedFiles(hwnd)
+    return sel.Length = 1 ? sel[1] : ""
 }
 
-; Full path of the folder an Explorer window is showing, or "".
-ExplorerPath(hwnd) {
-    try {
-        for w in ComObject("Shell.Application").Windows {
-            if (w.HWND = hwnd)
-                return w.Document.Folder.Self.Path
-        }
-    }
-    return ""
-}
+; Full path of the folder an Explorer window's active tab is showing, or "".
+ExplorerPath(hwnd) => ExplorerFolderPath(hwnd)
 
 ; ---- keyboard capture ----
 StartKeyHook() {
@@ -1478,8 +1751,24 @@ BlockBalanceError(steps) {
     return ""
 }
 
+; {{names}} nothing in this workflow sets. A WARNING, never a block: the step
+; still runs (it types the name exactly as written), and a Set inside an
+; if-branch is perfectly legitimate — so this asks rather than refuses.
+; Silent in the normal case, when every reference resolves.
+UndefinedVarsOk(steps) {
+    global g
+    u := WfUndefinedVars(steps)
+    if !u.Length
+        return true
+    return MsgBox("These values are used but never set by this workflow:`n`n    {{"
+        . JoinList(u, "}}`n    {{") "}}`n`n"
+        . "They'll be typed exactly as written. Add an Ask, Collect or Set step "
+        . "if you meant them to hold something.`n`nCarry on anyway?",
+        "Workflow Studio", "YesNo Icon! Owner" g.Hwnd) = "Yes"
+}
+
 TestRun(*) {
-    global steps, g
+    global steps, g, currentPhrase, wfRunName, wfSelection
     StopRecording()
     if !steps.Length {
         SB("Nothing to run — record or add steps first.")
@@ -1489,6 +1778,8 @@ TestRun(*) {
         MsgBox(berr, "Workflow Studio", "Icon! Owner" g.Hwnd)
         return
     }
+    if !UndefinedVarsOk(steps)
+        return
     g.Hide()
     Sleep(500)
     ; Collect steps run for real during a test (so their grabbing is
@@ -1496,23 +1787,46 @@ TestRun(*) {
     ; the workflow's sheet.
     collected := Map()
     collected.CaseSense := false
-    ok := RunWorkflowSteps(steps, , collected)
+    vars := Map()                       ; every named value, so a test shows
+    vars.CaseSense := false             ; what each {{Name}} actually became
+    ; Name the run so its log lines and record say which workflow this was
+    ; (an unnamed one lands under "Unnamed" and tells you nothing later).
+    wfRunName := currentPhrase != "" ? StrReplace(currentPhrase, " ") : "StudioDraft"
+    ; A fresh Explorer-selection snapshot per test ({{selected_file}}): the
+    ; Studio lives on between tests, and the user may pick another file.
+    wfSelection := ""
+    ok := RunWorkflowSteps(steps, , collected, vars)
     g.Show()
-    if (ok && collected.Count) {
+    if (ok && vars.Count) {
         got := ""
-        for l, v in collected
-            got .= (got != "" ? "`n" : "") l ":  " Abbrev(StrReplace(StrReplace(v, "`r", ""), "`n", "  "), 80)
+        for l, v in vars
+            got .= (got != "" ? "`n" : "") "{{" l "}}:  "
+                . Abbrev(StrReplace(StrReplace(v, "`r", ""), "`n", "  "), 80)
+                . (collected.Has(l) ? "     (a real run saves this to your sheet)" : "")
         MsgBox("Test run completed — all " steps.Length " steps ran.`n`n"
-            . "Collected (a real run saves these to your sheet):`n" got,
-            "Workflow Studio", "Owner" g.Hwnd)
+            . "Values:`n" got, "Workflow Studio", "Owner" g.Hwnd)
         SB("Test run completed — all " steps.Length " steps ran.")
         return
     }
     SB(ok ? "Test run completed — all " steps.Length " steps ran."
+        : WfRunOutcome() = "error" ? "Test run didn't start (details were just shown)."
           : "Test run stopped — a step failed (details were just shown).")
 }
 
-SaveWorkflow(*) {
+; Write the workflow's three artifacts (+ its Start Menu entries).
+;
+; A workflow that already has a name saves straight over itself: no name
+; prompt, no "here's your phrase" popup. Nothing about a re-save needs
+; deciding or announcing — the name can't have changed and the phrase is
+; already known — so the dialogs were pure friction on the edit-test-save
+; loop. Only a brand-new workflow is asked for a name, and only it gets the
+; popup teaching the two phrases it just gained.
+;
+; closeAfter (the "Save and Close" button): exit once saved. Recording is
+; stopped and the autosave cleared by then, so this is the same clean exit
+; CloseStudio does — minus its discard prompt, which can't fire on a list
+; that was just saved.
+SaveWorkflow(closeAfter := false) {
     global steps, dirty, currentPhrase, root, g
     StopRecording()
     if !steps.Length {
@@ -1523,7 +1837,10 @@ SaveWorkflow(*) {
         MsgBox(berr, "Workflow Studio", "Icon! Owner" g.Hwnd)
         return
     }
-    phrase := SaveNameDialog(currentPhrase)
+    if !UndefinedVarsOk(steps)
+        return
+    resave := (currentPhrase != "")     ; loaded from the dropdown, or saved earlier
+    phrase := resave ? currentPhrase : SaveNameDialog()
     if (phrase = "")
         return
     base := StrReplace(phrase, " ")
@@ -1531,8 +1848,29 @@ SaveWorkflow(*) {
         MsgBox("'" base "' is a reserved Windows name and can't be used as a file. Pick another.", "Workflow Studio", "Owner" g.Hwnd)
         return
     }
+    ; VoiceKit's own tools, caselessly: a workflow stub under one of their
+    ; names would overwrite the tool's own script — the Studio's included,
+    ; whose source carries the stub marker text itself. Refused even on a
+    ; re-save (a workflow saved under such a name before this check); the
+    ; next Save then asks for a new name.
+    if VkDeleteProtected(base) {
+        MsgBox("'" phrase "' is the name of one of VoiceKit's own tools, so a workflow can't use it."
+            . (resave ? " Click Save again to give this workflow a different name." : " Pick another name."),
+            "Workflow Studio", "Icon! Owner" g.Hwnd)
+        if resave
+            currentPhrase := ""
+        return
+    }
+    ; A NEW name that's already a saved workflow used to replace it without
+    ; a word. Ask first. (Re-saving the loaded workflow is what Save is for,
+    ; and stays silent.)
+    if (!resave && (existing := SavedWorkflowBase(base)) != "") {
+        if !ConfirmReplaceDialog(SpaceOut(existing), steps.Length)
+            return
+        base := existing
+    }
     macroFile := root "\macros\" base ".ahk"
-    if (FileExist(macroFile) && !InStr(FileRead(macroFile, "UTF-8"), "Workflow Studio")) {
+    if (FileExist(macroFile) && !IsWorkflowStub(macroFile)) {
         MsgBox("A hand-written macro named '" base "' already exists. Pick another name.", "Workflow Studio", "Owner" g.Hwnd)
         return
     }
@@ -1544,21 +1882,8 @@ SaveWorkflow(*) {
     f.Write(content)
     f.Close()
 
-    stub := "#Requires AutoHotkey v2.0`n"
-        . "#SingleInstance Force`n"
-        . "; ============================================================`n"
-        . ";  " phrase "   (workflow, saved " FormatTime(A_Now, "yyyy-MM-dd") ")`n"
-        . ';  Trigger by voice:  "open ' phrase '"`n'
-        . ";`n"
-        . ";  Generated by Workflow Studio — don't edit steps here.`n"
-        . ';  Edit by voice:  "open workflow studio"  ->  pick "' phrase '"`n'
-        . ";  Steps live in:  workflows\" base ".steps.txt`n"
-        . "; ============================================================`n"
-        . '#Include "%A_ScriptDir%\..\lib\_Common.ahk"`n'
-        . '#Include "%A_ScriptDir%\..\lib\Workflow.ahk"`n'
-        . 'RunWorkflow(A_ScriptDir "\..\workflows\' base '.steps.txt")`n'
     f := FileOpen(macroFile, "w", "UTF-8")
-    f.Write(stub)
+    f.Write(WfStubContent(phrase, base))
     f.Close()
 
     ; Name the shortcut by SpaceOut(base) — the same name the dropdown,
@@ -1566,10 +1891,7 @@ SaveWorkflow(*) {
     ; apart (they did for names with a digit right after a letter, which
     ; orphaned the .lnk on delete).
     disp := SpaceOut(base)
-    vmDir := A_Programs "\Voice Macros"
-    EnsureDir(vmDir)
-    if !FileExist(vmDir "\" disp ".lnk")
-        MakeAhkShortcut(vmDir "\" disp ".lnk", macroFile)
+    EnsureVoiceShortcut(disp, macroFile)
     MakeLoopShortcut(root, base, disp)     ; companion "loop <disp>" entry (repeats until stopped)
 
     Log(root, "workflow | " phrase " | workflows\" base ".steps.txt")
@@ -1577,9 +1899,18 @@ SaveWorkflow(*) {
     dirty := false
     ClearAutosave()          ; the take is safely persisted now
     RefreshWorkflowList(disp)
-    MsgBox("Saved.`n`nRun it once:   open " disp
-        . "`nRepeat it:     open loop " disp "   (then click Stop Looping to end)"
-        . "`n`n(First time only: give Windows a few seconds to index the new Start Menu entries.)", "Workflow Studio", "Owner" g.Hwnd)
+    if !resave                       ; first save: teach the phrases it just gained
+        MsgBox("Saved.`n`nRun it once:   open " disp
+            . "`nRepeat it:     open loop " disp "   (then click Stop Looping to end)"
+            . "`n`n(First time only: give Windows a few seconds to index the new Start Menu entries.)", "Workflow Studio", "Owner" g.Hwnd)
+    else if !closeAfter
+        SB("Saved '" disp "' — " steps.Length " steps. Say `"open " disp "`" to run it.")
+    if !closeAfter
+        return
+    g.Hide()                         ; go away instantly; the tray confirms the save
+    if resave
+        Notify("Saved '" disp "' — " steps.Length " steps.")
+    ExitApp()
 }
 
 DeleteWorkflow(*) {
@@ -1623,7 +1954,10 @@ ShowHelp(*) {
         . "       or by pressing Ctrl+Alt+Shift+X. Then trim or edit the steps —`n"
         . "       double-click a row to edit, and click Add to insert a pause if`n"
         . "       an app needs time to load.`n"
-        . "  4.  Test plays it. Save makes it a voice command: say `"open <name>`".`n`n"
+        . "  4.  Test plays it. Save makes it a voice command: say `"open <name>`".`n"
+        . "       You're only asked for a name the first time — saving a workflow`n"
+        . "       you already named just overwrites it, no questions asked. `"Save`n"
+        . "       and Close`" does the same and shuts the Studio.`n`n"
         . "Playback matches your pace: pauses you take while recording (for`n"
         . "a page to load, a menu to appear) are saved as editable Wait steps`n"
         . "— delete any you don't want. It's patient beyond that too, waiting`n"
@@ -1633,14 +1967,19 @@ ShowHelp(*) {
         . "recording`" locks in one window layout — playback re-maximizes the`n"
         . "same windows, so nothing has moved. `"Record clicks by position`n"
         . "only`" ignores element names and stores just the X,Y spot — for`n"
-        . "maps, canvases and games where names aren't reliable. Steps marked`n"
+        . "maps, canvases and games where names aren't reliable. `"Record raw`n"
+        . "input only`" turns the smart extras off — no automatic Wait steps,`n"
+        . "no window-switch steps, no maximizing — for quick key sequences`n"
+        . "that should replay exactly what you pressed, into whatever window`n"
+        . "is active. Steps marked`n"
         . "⚠ were captured by position only and are the first thing to fix if`n"
         . "playback misses.`n`n"
         . "Notes: don't type passwords while recording; dragging (press, move,`n"
         . "release — selecting text or a region) is captured as a Drag step`n"
         . "(by position, so it's marked ⚠), but scrolling isn't. Every`n"
-        . "button is voice-clickable — say `"click`" plus`n"
-        . "its word: `"click record`", `"click add`", `"click test`", `"click save`".`n`n"
+        . "button is voice-clickable — say `"click`" plus its word: `"click`n"
+        . "record`", `"click add`", `"click test`", `"click save`", `"click save`n"
+        . "and close`".`n`n"
         . "See everything you've made in one place: say `"open voice kit`".",
         "Workflow Studio — help", "Owner" g.Hwnd)
 }
@@ -1697,33 +2036,51 @@ SettingsFile() {
     return root "\logs\settings.ini"
 }
 LoadSettings() {
-    global chkCloseTabs, chkMaxWins, chkCoordsOnly
+    global chkCloseTabs, chkMaxWins, chkCoordsOnly, chkRawInput, chkJitter, wfClickJitterPx
     chkCloseTabs.Value := (IniRead(SettingsFile(), "Studio", "CloseBrowserTabs", "0") = "1")
     chkMaxWins.Value := (IniRead(SettingsFile(), "Studio", "MaximizeWhileRecording", "1") = "1")
     chkCoordsOnly.Value := (IniRead(SettingsFile(), "Studio", "CoordsOnly", "0") = "1")
+    chkRawInput.Value := (IniRead(SettingsFile(), "Studio", "RawInput", "0") = "1")
+    ; [Workflow] ClickJitter is pixels, not a flag — the checkbox is the
+    ; on/off face of it, and someone who wants a different amount can put a
+    ; number in the file without the box overwriting it on load. Try-wrapped:
+    ; this runs at startup, and a hand-edited non-number must not kill the
+    ; Studio launch (every other read here compares strings and can't throw).
+    jit := 3
+    try jit := Integer(IniRead(SettingsFile(), "Workflow", "ClickJitter", "3"))
+    chkJitter.Value := (jit > 0)
+    ; Also prime the engine's in-process override: Test runs the engine in
+    ; THIS process, and WfClickJitter() caches its ini read — without this,
+    ; toggling the box wouldn't affect Test until the Studio restarted.
+    wfClickJitterPx := jit
+    SyncRawUI()
 }
 SaveSettings(*) {
-    global chkCloseTabs, chkMaxWins, chkCoordsOnly
+    global chkCloseTabs, chkMaxWins, chkCoordsOnly, chkRawInput, chkJitter, wfClickJitterPx
     EnsureDir(RegExReplace(SettingsFile(), "\\[^\\]+$"))
     IniWrite(chkCloseTabs.Value ? 1 : 0, SettingsFile(), "Studio", "CloseBrowserTabs")
     IniWrite(chkMaxWins.Value ? 1 : 0, SettingsFile(), "Studio", "MaximizeWhileRecording")
     IniWrite(chkCoordsOnly.Value ? 1 : 0, SettingsFile(), "Studio", "CoordsOnly")
+    IniWrite(chkRawInput.Value ? 1 : 0, SettingsFile(), "Studio", "RawInput")
+    ; Ticking restores the default 3 px only when it was off; a custom amount
+    ; already in the file survives a tick of any other box on this panel.
+    cur := 3
+    try cur := Integer(IniRead(SettingsFile(), "Workflow", "ClickJitter", "3"))
+    jit := chkJitter.Value ? (cur > 0 ? cur : 3) : 0
+    IniWrite(jit, SettingsFile(), "Workflow", "ClickJitter")
+    wfClickJitterPx := jit          ; keep this process's Test in step (see LoadSettings)
+    SyncRawUI()
+}
+; Raw-input mode records only what the user actually does, so the Maximize
+; option (which both resizes windows and records move|max steps) is moot
+; while it's on — gray it out to say so. Its saved value is untouched, so
+; unticking raw restores whatever the user had.
+SyncRawUI() {
+    global chkMaxWins, chkRawInput
+    chkMaxWins.Enabled := !chkRawInput.Value
 }
 
 SB(text) {
     global statusBar
     statusBar.Text := text          ; status is a themed Text control, not a StatusBar
-}
-
-Abbrev(s, n) {
-    return StrLen(s) > n ? SubStr(s, 1, n) "..." : s
-}
-
-; Self-heal the Start Menu entry so "open workflow studio" works
-; even on installs made before this feature existed.
-EnsureStudioShortcut() {
-    vmDir := A_Programs "\Voice Macros"
-    EnsureDir(vmDir)
-    if !FileExist(vmDir "\Workflow Studio.lnk")
-        MakeAhkShortcut(vmDir "\Workflow Studio.lnk", A_ScriptFullPath)
 }

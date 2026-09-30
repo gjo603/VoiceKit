@@ -16,9 +16,10 @@
 ;
 ;  Include requirements for hosts:
 ;    #Include _Common.ahk + Theme.ahk BEFORE this file (every VoiceKit
-;    GUI already does). Json.ahk is pulled in here.
+;    GUI already does). Json.ahk and Clip.ahk are pulled in here.
 ; ============================================================
 #Include "%A_LineFile%\..\Json.ahk"
+#Include "%A_LineFile%\..\Clip.ahk"
 
 ; ---- config storage ----------------------------------------
 
@@ -190,11 +191,7 @@ AIUsableTargetWin(hwnd) {
 ; text is on the clipboard. The user's clipboard is preserved either way.
 AIGrabInput(&fromSelection := false) {
     fromSelection := false
-    saved := ClipboardAll()
-    A_Clipboard := ""
-    Send("^c")
-    sel := ClipWait(0.6) ? A_Clipboard : ""
-    A_Clipboard := saved
+    sel := ClipCapture(() => Send("^c"), 0.6)     ; lib\Clip.ahk: restores in a finally
     if (sel != "") {
         fromSelection := true
         return sel
@@ -241,6 +238,7 @@ AISettingsDialog(owner := 0) {
     btnRemove := d.AddButton("x+8 w130 h34", "Remove Key")
     btnCancel := d.AddButton("x+8 w110 h34", "Cancel")
     status := d.AddText("xm y+12 w520 h28", "")
+    dHwnd := d.Hwnd         ; read now: a handler below may outlive the Gui
 
     SaveFields(*) {
         if (Trim(edKey.Value) != "")
@@ -269,8 +267,15 @@ AISettingsDialog(owner := 0) {
         status.Text := "Testing… (a tiny request is on its way)"
         err := ""
         ans := AIComplete("You are a connectivity test.", "Reply with exactly: OK", &err, 16, k, Trim(edModel.Value))
-        status.Text := (ans != "") ? "✓ Working — the key and model both answer. Click Save to keep them." : err
-        btnTest.Enabled := true
+        ; AIComplete keeps the dialog responsive while it waits, so Cancel /
+        ; Escape / X may have destroyed it meanwhile — then there's nothing
+        ; left to report into (and touching a destroyed control throws).
+        if !WinExist("ahk_id " dHwnd)
+            return
+        try {
+            status.Text := (ans != "") ? "✓ Working — the key and model both answer. Click Save to keep them." : err
+            btnTest.Enabled := true
+        }
     }
     OnRemove(*) {
         AISetKey("")
@@ -286,18 +291,7 @@ AISettingsDialog(owner := 0) {
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
 
-    ThemeApply(d, status)
-    ThemeDim(intro)
-    ThemeDim(keyHint)
-    ThemeDim(modelHint)
-    d.Show()
-    if owner
-        owner.Opt("+Disabled")
-    WinWaitClose("ahk_id " d.Hwnd)
-    if owner {
-        owner.Opt("-Disabled")
-        WinActivate("ahk_id " owner.Hwnd)
-    }
+    ThemeShowModal(d, owner, [intro, keyHint, modelHint], , , status)
     return AIConfigured()
 }
 

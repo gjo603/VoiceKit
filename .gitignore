@@ -21,3 +21,37 @@ dist/
 macros/*.ahk
 workflows/
 hotkeys/*.ahk
+# ...except the shipped defaults the live per-user files are made from.
+!hotkeys/*.default.ahk
+
+# The live per-user files (2026-09-30): every create/delete rewrites them, so
+# they are the user's data, not source. Git tracks the shipped defaults
+# (hotkeys/_index.default.ahk, bridge-map.default.txt,
+# hotkeys/Snippets.default.ahk); SeedUserFiles in lib/_Common.ahk makes the
+# live copies on start and adds any newly shipped line. (The two in hotkeys/
+# are already covered by hotkeys/*.ahk; listed for the record.)
+bridge-map.txt
+hotkeys/_index.ahk
+hotkeys/Snippets.ahk
+
+# Former samples, moved to templates/examples/ (2026-09-30). Installs made
+# before then still have live copies here; they stay the user's and must
+# never be re-tracked. (Covered by the globs above; listed for the record.)
+hotkeys/ToggleTimer.ahk
+macros/MeetingNotes.ahk
+macros/MorningTabs.ahk
+macros/WorkLayout.ahk
+macros/CleanScreenshots.ahk
+macros/OpenPublicUserFolder.ahk
+# Isolated module bodies (hotkeys\bodies\<Base>.body.ahk) — the user's own
+# code, run out of process so a crash can't take the master down.
+hotkeys/bodies/*.ahk
+
+# Self-test scratch output (tests/*.ahk write these beside themselves).
+tests/*.result
+tests/*.state
+tests/*.stop
+
+# Hand-made backup copies (e.g. lib\_Common.ahk.bak-20260805) — a stale
+# duplicate of a tracked file must never be swept into a commit.
+*.bak*

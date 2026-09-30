@@ -15,8 +15,9 @@
 #Include "%A_ScriptDir%\..\lib\AI.ahk"
 
 root := RegExReplace(A_ScriptDir, "\\[^\\]+$")
-masterPath := root "\VoiceKit.ahk"
-EnsureHomeShortcut()
+; Self-heal the "Voice Kit" Start Menu entry (the home phrase) so "open voice
+; kit" works even on installs made before this existed.
+EnsureVoiceShortcut(VoiceShortcutName("VoiceKitHome"), A_ScriptFullPath)
 
 items := []        ; everything sayable/typable, in display order
 rowItems := []     ; items currently shown, parallel to LV rows
@@ -62,7 +63,16 @@ ReloadItems()
 ThemeApply(g, statusBar)
 ThemeDim(tagline)
 g.Show()
-SB(items.Length " automations. Say any phrase in the list — or select a row for Run, Edit, Delete, or Hotkey (a Ctrl+Alt+Shift key for when you can't use your voice).")
+; A parked module is silent otherwise — and silence while hotkeys quietly
+; stop working is the exact failure this guards against. Lead with it.
+parked := IndexModules(root).quarantined
+if parked.Length
+    SB("⚠ " parked.Length " hotkey file" (parked.Length = 1 ? " is" : "s are") " turned off because "
+        . (parked.Length = 1 ? "it wouldn't" : "they wouldn't") " load: " JoinList(parked, ", ")
+        . (FileExist(SafeModeFlag(root)) ? "  (safe mode after repeated crashes)" : "")
+        . "  — fix the file, then uncomment its line in hotkeys\_index.ahk and reload with Ctrl+Alt+Shift+R.")
+else
+    SB(items.Length " automations. Say any phrase in the list — or select a row for Run, Edit, Delete, or Hotkey (a Ctrl+Alt+Shift key for when you can't use your voice).")
 
 ; ============================================================
 ;  Data
@@ -94,7 +104,7 @@ CollectItems() {
         }
         modBase := RegExReplace(e.file, "^hotkeys\\|\.ahk$", "")
         hotkeyRows.Push({say: StrLower(e.phrase), kind: "hotkey", kindLabel: "Hotkey",
-            detail: "always-on while VoiceKit runs", baseName: modBase,
+            detail: BodyStatusDetail(modBase), baseName: modBase,
             file: root "\hotkeys\" modBase ".ahk", key: e.key})
     }
     TakeCompanionKey(base) {
@@ -111,14 +121,9 @@ CollectItems() {
             detail: "repeat it:  “open loop " disp "”", baseName: base, file: A_LoopFileFullPath,
             key: TakeCompanionKey(base)})
     }
-    ; Launch macros, AI actions, and VoiceKit's own tools.
-    builtin := Map(
-        "NewAutomation",  "create any new automation",
-        "WorkflowStudio", "record or edit step workflows",
-        "RecordMySteps",  "start recording a new workflow now",
-        "AskAI",          "ask the AI anything, hands-free",
-        "VoiceKitHome",   "this window",
-        "VoiceKitHelp",   "this window (older phrase)")
+    ; Launch macros, AI actions, and VoiceKit's own tools (the one list is
+    ; lib\_Common.ahk VkBuiltinTools — caseless, like the MCP's guard).
+    builtin := VkBuiltinTools()
     Loop Files root "\macros\*.ahk" {
         base := StrReplace(A_LoopFileName, ".ahk")
         if wfBases.Has(base)
@@ -160,20 +165,44 @@ CollectItems() {
     snipFile := root "\hotkeys\Snippets.ahk"
     if FileExist(snipFile) {
         Loop Parse FileRead(snipFile, "UTF-8"), "`n", "`r" {
-            if !RegExMatch(A_LoopField, "^:\*?[^:]*:(.+?)::(.*)$", &m)
+            if !IsObject(sn := SnippetParseLine(A_LoopField))
                 continue
-            exp := Trim(m[2])
+            exp := Trim(sn.text)
             dyn := (exp = "{" || exp = "")
             preview := StrReplace(SnipDecode(exp), "`r`n", " ↵ ")   ; newlines shown inline
             det := dyn ? "dynamic snippet (runs code)"
                 : "expands to:  " Abbrev(preview, 44)
-            list.Push({say: "type " m[1], kind: "snippet", kindLabel: "Snippet",
-                detail: det, baseName: m[1], file: snipFile, key: "", dyn: dyn})
+            list.Push({say: "type " sn.abbrev, kind: "snippet", kindLabel: "Snippet",
+                detail: det, baseName: sn.abbrev, file: snipFile, key: "", dyn: dyn})
         }
     }
     for t in tools
         list.Push(t)
     return list
+}
+
+; What a hotkey module's row says. A long-running body (a queue of a few
+; hundred items) can publish where it has got to with BodyStatus() — that
+; line beats the generic "always-on" note, because it is the thing the user
+; actually opened this window to find out. "how long ago" is spelled out:
+; a line that stopped getting newer is how a body that died shows up.
+BodyStatusDetail(base) {
+    st := BodyStatusRead(base)
+    if !IsObject(st)
+        return "always-on while VoiceKit runs"
+    return Abbrev(st.text, 60) "   (" AgoText(st.age) ")"
+}
+
+AgoText(secs) {
+    if !IsInteger(secs)
+        return "last reported"
+    if (secs < 60)
+        return "just now"
+    if (secs < 3600)
+        return (secs // 60) " min ago"
+    if (secs < 86400)
+        return (secs // 3600) " hr ago"
+    return (secs // 86400) " day" ((secs // 86400) = 1 ? "" : "s") " ago"
 }
 
 ; The one-line "Opens: ..." note New Automation writes into its macros.
@@ -257,17 +286,26 @@ EditSelected(*) {
         return
     switch it.kind {
         case "workflow":
-            if WinExist("Workflow Studio ahk_class AutoHotkeyGUI") {
-                WinActivate("Workflow Studio ahk_class AutoHotkeyGUI")
-                SB("Workflow Studio is already open — pick “" StrLower(SpaceOut(it.baseName)) "” in its dropdown.")
-                return
+            ; Never over a live Studio: #SingleInstance Force would kill it, and
+            ; a Studio that's recording or testing hides its window, so only
+            ; OpenStudioSafely's hidden-aware check sees it.
+            switch OpenStudioSafely(root, it.file) {
+                case "activated":
+                    SB("Workflow Studio is already open — pick “" StrLower(SpaceOut(it.baseName)) "” in its dropdown.")
+                case "busy":
+                    SB("Workflow Studio is busy recording or testing — finish that first (Ctrl+Alt+Shift+X stops a recording).")
+                default:
+                    SB("Opening it in Workflow Studio…")
             }
-            Run('"' A_AhkPath '" "' root '\macros\WorkflowStudio.ahk" "' it.file '"')
-            SB("Opening it in Workflow Studio…")
         case "ai":
             EditPromptDialog(it.baseName)
         case "macro", "hotkey":
-            Run('notepad.exe "' it.file '"')
+            ; An isolated hotkey module keeps its steps in a body script that
+            ; runs out of process — open THAT, not the bare key binding.
+            edFile := it.file
+            if (it.kind = "hotkey" && FileExist(bodyF := HotkeyBodyFile(root, it.baseName)))
+                edFile := bodyF
+            Run('notepad.exe "' edFile '"')
             SB("Opened the script in Notepad. Careful: it's AutoHotkey v2.")
         case "snippet":
             ; A code-block snippet (like /date) is real AHK code, not plain
@@ -309,12 +347,7 @@ EditPromptDialog(base) {
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ThemeApply(d)
-    d.Show()
-    g.Opt("+Disabled")
-    WinWaitClose("ahk_id " d.Hwnd)
-    g.Opt("-Disabled")
-    WinActivate("ahk_id " g.Hwnd)
+    ThemeShowModal(d, g)
 }
 
 ; Edit a text snippet in place — its abbreviation and its (multi-line)
@@ -323,13 +356,13 @@ EditPromptDialog(base) {
 ; a text box). The on-disk text is decoded for editing and re-encoded on save
 ; (real newlines <-> `n), so multi-line snippets stay on their single line.
 EditSnippetDialog(it) {
-    global root, masterPath, g
+    global root, g
     snipFile := it.file
     oldAbbrev := it.baseName
     current := ""
     Loop Parse FileRead(snipFile, "UTF-8"), "`n", "`r" {
-        if (RegExMatch(A_LoopField, "^:\*?[^:]*:(.+?)::(.*)$", &m) && m[1] = oldAbbrev) {
-            current := SnipDecode(m[2])
+        if (IsObject(sn := SnippetParseLine(A_LoopField)) && sn.abbrev = oldAbbrev) {
+            current := SnipDecode(sn.text)
             break
         }
     }
@@ -350,34 +383,26 @@ EditSnippetDialog(it) {
 
     OK(*) {
         newAbbrev := RegExReplace(Trim(edAbbrev.Value), "\s", "")
-        if (newAbbrev = "" || InStr(newAbbrev, ":")) {
-            MsgBox("The abbreviation can't be empty or contain a colon (:).", "VoiceKit", "Icon! Owner" d.Hwnd)
-            return
-        }
         expansion := edText.Value
-        if (Trim(expansion, " `t`r`n") = "") {
-            MsgBox("Give it the text to expand into.", "VoiceKit", "Icon! Owner" d.Hwnd)
-            return
-        }
-        if (Trim(expansion) = "{") {
-            MsgBox("The text can't be just '{' — that's code syntax in the snippets file.", "VoiceKit", "Icon! Owner" d.Hwnd)
+        if ((why := SnippetValidate(newAbbrev, expansion)) != "") {
+            MsgBox(why, "VoiceKit", "Icon! Owner" d.Hwnd)
             return
         }
         ; Renaming onto another snippet's abbreviation would silently shadow it.
-        if (newAbbrev != oldAbbrev) {
-            Loop Parse FileRead(snipFile, "UTF-8"), "`n", "`r" {
-                if (RegExMatch(A_LoopField, "^:\*?[^:]*:(.+?)::", &m) && m[1] = newAbbrev) {
-                    MsgBox("A snippet  " newAbbrev "  already exists. Pick another abbreviation.", "VoiceKit", "Icon! Owner" d.Hwnd)
-                    return
-                }
-            }
+        if (newAbbrev != oldAbbrev && SnippetExists(snipFile, newAbbrev)) {
+            MsgBox("A snippet  " newAbbrev "  already exists. Pick another abbreviation.", "VoiceKit", "Icon! Owner" d.Hwnd)
+            return
         }
-        if !ReplaceSnippetLine(snipFile, oldAbbrev, newAbbrev, SnipEncode(expansion)) {
-            MsgBox("Couldn't find that snippet to update — it may have changed already. Close and reopen Voice Kit.",
+        ; Load-checked, and put back if it breaks the file — a reload would
+        ; otherwise park Snippets.ahk and switch off every snippet.
+        encoded := SnipEncode(expansion)
+        if !SnippetFileChange(snipFile, () => ReplaceSnippetLine(snipFile, oldAbbrev, newAbbrev, encoded), &err) {
+            MsgBox(err = "" ? "Couldn't find that snippet to update — it may have changed already. Close and reopen Voice Kit."
+                : "That change would stop the snippets file loading, so it wasn't saved:`n`n" err,
                 "VoiceKit", "Icon! Owner" d.Hwnd)
             return
         }
-        RunAhk(masterPath)                    ; reload so the edit is live now
+        ReloadMasterNotify(root)              ; reload so the edit is live now
         Log(root, "snippet-edit | " oldAbbrev (newAbbrev != oldAbbrev ? " -> " newAbbrev : ""))
         d.Destroy()
         ReloadItems()
@@ -393,13 +418,7 @@ EditSnippetDialog(it) {
     btnFile.OnEvent("Click", OpenFile)
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ThemeApply(d)
-    ThemeDim(hint)
-    d.Show()
-    g.Opt("+Disabled")
-    WinWaitClose("ahk_id " d.Hwnd)
-    g.Opt("-Disabled")
-    WinActivate("ahk_id " g.Hwnd)
+    ThemeShowModal(d, g, hint)
 }
 
 ; ============================================================
@@ -423,7 +442,7 @@ HotkeySelected(*) {
 }
 
 HotkeyDialog(it) {
-    global root, masterPath, g
+    global root, g
     keys := []
     if (it.key != "")
         keys.Push(it.key)                     ; current assignment stays pickable
@@ -453,7 +472,7 @@ HotkeyDialog(it) {
     btnRemove.Enabled := it.key != ""
 
     Done(msg) {
-        RunAhk(masterPath)                    ; reload so the change is live now
+        ReloadMasterNotify(root)              ; reload so the change is live now
         d.Destroy()
         ReloadItems()
         SB(msg)
@@ -466,8 +485,9 @@ HotkeyDialog(it) {
             d.Destroy()
             return
         }
-        if (it.key != "")
-            HotkeyCompanionRemove(root, it.baseName)
+        ; A change of key is a replace: HotkeyCompanionCreate load-checks the
+        ; new module BEFORE it retires the old one, so a failure really does
+        ; leave the old key working (it used to be removed first).
         err := HotkeyCompanionCreate(root, it.baseName, it.say, chosen)
         if (err != "") {
             MsgBox(err, "VoiceKit", "Icon! Owner" d.Hwnd)
@@ -486,22 +506,22 @@ HotkeyDialog(it) {
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ThemeApply(d)
-    ThemeDim(why)
-    d.Show()
-    g.Opt("+Disabled")
-    WinWaitClose("ahk_id " d.Hwnd)
-    g.Opt("-Disabled")
-    WinActivate("ahk_id " g.Hwnd)
+    ThemeShowModal(d, g, why)
 }
 
 DeleteSelected(*) {
-    global root, masterPath, g
+    global root, g
     it := Selected()
     if !IsObject(it)
         return
     if (it.kind = "tool") {
         SB("That's part of VoiceKit itself — it can't be deleted from here.")
+        return
+    }
+    ; Shipped tools listed as ordinary macros (Split Pages): Edit still opens
+    ; them, but they aren't the user's to delete.
+    if ((it.kind = "macro" || it.kind = "ai") && VkDeleteProtected(it.baseName)) {
+        SB("That's part of VoiceKit itself — it can't be deleted (Edit still opens its script).")
         return
     }
     if (it.kind = "snippet" && it.dyn) {
@@ -511,73 +531,37 @@ DeleteSelected(*) {
     if (MsgBox("Delete “" it.say "”?`n`nThis removes its files and Start Menu entries.",
         "VoiceKit", "YesNo Icon! Owner" g.Hwnd) != "Yes")
         return
+    ; The recipes live in lib\_Common.ahk, shared with the Studio and kept in
+    ; step with the MCP's delete_automation (undo backups and status files
+    ; go too, so a later automation of the same name inherits nothing).
     disp := SpaceOut(it.baseName)
     switch it.kind {
         case "workflow":
             DeleteWorkflowArtifacts(root, it.baseName, disp)
         case "ai":
-            try FileDelete(root "\macros\" it.baseName ".ahk")
-            try FileDelete(root "\prompts\" it.baseName ".prompt.txt")
-            try FileDelete(A_Programs "\Voice Macros\" disp ".lnk")
-            HotkeyCompanionRetire(root, it.baseName)      ; companion key too
+            DeleteMacroArtifacts(root, it.baseName, disp, true)   ; + its prompt
         case "macro":
-            try FileDelete(root "\macros\" it.baseName ".ahk")
-            try FileDelete(A_Programs "\Voice Macros\" disp ".lnk")
-            HotkeyCompanionRetire(root, it.baseName)
+            DeleteMacroArtifacts(root, it.baseName, disp)
         case "hotkey":
-            try FileDelete(root "\hotkeys\" it.baseName ".ahk")
-            RemoveLinesContaining(root "\hotkeys\_index.ahk", "\hotkeys\" it.baseName ".ahk")
-            RemoveLinesContaining(root "\bridge-map.txt", "|hotkeys\" it.baseName ".ahk|")
-            RunAhk(masterPath)          ; reload so the key stops working now
+            DeleteHotkeyModuleArtifacts(root, it.baseName)        ; + its body
+            ReloadMasterNotify(root)    ; reload so the key stops working now
         case "snippet":
-            RemoveSnippetLine(root "\hotkeys\Snippets.ahk", it.baseName)
-            RunAhk(masterPath)
+            snipFile := root "\hotkeys\Snippets.ahk"
+            if !SnippetFileChange(snipFile, () => RemoveSnippetLine(snipFile, it.baseName), &err) {
+                SB(err = "" ? "That snippet is already gone."
+                    : "Couldn't delete it — the snippets file wouldn't load without it: " err)
+                ReloadItems()
+                return
+            }
+            ReloadMasterNotify(root)
     }
     Log(root, "deleted " it.kind " | " it.say)
     ReloadItems()
     SB("Deleted." (it.kind = "hotkey" ? "  If you paired a voice phrase in Voice Access, remove it there too." : ""))
 }
 
-; (RemoveLinesContaining moved to lib\_Common.ahk — the companion-hotkey
-; helpers there need it too.)
-
-; Remove one hotstring by its abbreviation (line looks like :*:abbrev::text).
-RemoveSnippetLine(file, abbrev) {
-    if !FileExist(file)
-        return
-    out := ""
-    Loop Parse FileRead(file, "UTF-8"), "`n", "`r" {
-        if RegExMatch(A_LoopField, "^:\*?[^:]*:(.+?)::", &m) && (m[1] = abbrev)
-            continue
-        out .= A_LoopField "`n"
-    }
-    f := FileOpen(file, "w", "UTF-8")
-    f.Write(RTrim(out, "`n") "`n")
-    f.Close()
-}
-
-; Rewrite one hotstring in place, matched by its current abbreviation.
-; Preserves its position, its options (:*: vs ::), and any comment above it —
-; only the abbreviation and replacement change. Returns true if it was found.
-ReplaceSnippetLine(file, oldAbbrev, newAbbrev, encoded) {
-    if !FileExist(file)
-        return false
-    out := "", found := false
-    Loop Parse FileRead(file, "UTF-8"), "`n", "`r" {
-        if (!found && RegExMatch(A_LoopField, "^:([^:]*):(.+?)::", &m) && m[2] = oldAbbrev) {
-            out .= ":" m[1] ":" newAbbrev "::" encoded "`n"
-            found := true
-        } else {
-            out .= A_LoopField "`n"
-        }
-    }
-    if found {
-        f := FileOpen(file, "w", "UTF-8")
-        f.Write(RTrim(out, "`n") "`n")
-        f.Close()
-    }
-    return found
-}
+; (RemoveLinesContaining, RemoveSnippetLine and ReplaceSnippetLine live in
+; lib\_Common.ahk, beside the snippet parser they share.)
 
 ; ============================================================
 ;  Misc
@@ -585,17 +569,4 @@ ReplaceSnippetLine(file, oldAbbrev, newAbbrev, encoded) {
 SB(text) {
     global statusBar
     statusBar.Text := text
-}
-
-Abbrev(s, n) {
-    return StrLen(s) > n ? SubStr(s, 1, n) "..." : s
-}
-
-; Self-heal the "Voice Kit" Start Menu entry (the home phrase) so
-; "open voice kit" works even on installs made before this existed.
-EnsureHomeShortcut() {
-    vmDir := A_Programs "\Voice Macros"
-    EnsureDir(vmDir)
-    if !FileExist(vmDir "\Voice Kit.lnk")
-        MakeAhkShortcut(vmDir "\Voice Kit.lnk", A_ScriptFullPath)
 }

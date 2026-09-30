@@ -1,9 +1,16 @@
-# VoiceKit is a Windows-only AutoHotkey project. Normalize every text file
-# to CRLF in the working tree on checkout, so .ahk scripts, .bat files
-# (which can misbehave with LF), and pipe-delimited data land consistently
-# on any machine - even one with core.autocrlf disabled. Git still stores
-# LF internally, so history stays clean.
-* text=auto eol=crlf
+# VoiceKit is a Windows-only AutoHotkey project, but its generators (the AHK
+# writers AND mcp/voicekit_writer.py) create files with LF endings, and the
+# conformance tests compare against that. So source and data are LF in the
+# working tree too; only the Windows batch/PowerShell scripts are CRLF, since
+# cmd.exe can misparse labels and GOTOs in an LF .bat/.cmd. Git stores LF.
+* text=auto
+*.ahk text eol=lf
+*.txt text eol=lf
+*.py  text eol=lf
+*.md  text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
 
 # Known binary types (none tracked today, but future-proof the shortcuts,
 # icons and any recordings/screenshots that might get added).

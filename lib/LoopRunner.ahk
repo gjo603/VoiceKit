@@ -16,11 +16,26 @@
 ;  Stop: the floating "Stop Looping" button (voice: "click stop
 ;  looping") or Ctrl+Alt+Shift+X.
 ;
+;  EXIT CODE says how it went, so a programmatic caller isn't
+;  reduced to guessing (this used to exit 0 unconditionally, and
+;  a batch that died at step 7 reported "finished cleanly"):
+;      0  ok         every planned pass finished
+;      1  failed     a step failed — see logs\workflow-runs.ini
+;      2  stopped    the user stopped it, or cancelled a dialog
+;      3  error      it never got as far as running (bad file/batch)
+;  The full story is in logs\workflow-runs.ini under the
+;  workflow's name, with a step-by-step trace in
+;  logs\workflow-runs.log.
+;
 ;  #SingleInstance Force means only one loop runs at a time —
 ;  starting another "loop <name>" replaces the current one.
 ; ============================================================
-; WorkflowLoop.ahk pulls in Workflow.ahk (+ Acc.ahk) and Theme.ahk itself,
-; so this is the only include needed — adding the others would double-define.
+; _Common.ahk first: it registers the uncaught-error logger (logs\errors.log)
+; during its include, and loops / headless MCP batches are exactly the long
+; unattended runs where that log matters. It also supplies SpaceOut.
+; WorkflowLoop.ahk pulls in Workflow.ahk (+ Acc.ahk) and Theme.ahk itself —
+; adding those again would double-define.
+#Include "%A_LineFile%\..\_Common.ahk"
 #Include "%A_LineFile%\..\WorkflowLoop.ahk"
 
 base := A_Args.Length >= 1 ? A_Args[1] : ""
@@ -29,10 +44,15 @@ if (base = "") {
     MsgBox("No workflow was specified to loop.", "VoiceKit loop", "Iconx 262144")
     ExitApp()
 }
-RunWorkflowLoop(A_ScriptDir "\..\workflows\" base ".steps.txt", SpaceOut(base), , batch)
-ExitApp()
+outcome := RunWorkflowLoop(A_ScriptDir "\..\workflows\" base ".steps.txt", SpaceOut(base), , batch)
+ExitApp(LoopExitCode(outcome))
 
-; "MorningTabs" -> "Morning Tabs" for the status bar (matches the spoken phrase).
-SpaceOut(camel) {
-    return Trim(RegExReplace(camel, "([a-z0-9])([A-Z])", "$1 $2"))
+; Outcome string -> exit code (see the header).
+LoopExitCode(outcome) {
+    switch outcome {
+        case "ok":                    return 0
+        case "failed":                return 1
+        case "stopped", "cancelled":  return 2
+    }
+    return 3
 }

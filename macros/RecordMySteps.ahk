@@ -18,21 +18,20 @@
 ; ============================================================
 #Include "%A_ScriptDir%\..\lib\_Common.ahk"
 
-DetectHiddenWindows(true)
-studio := WinExist("Workflow Studio ahk_class AutoHotkeyGUI")
-DetectHiddenWindows(false)
-
-if studio {
-    if !DllCall("IsWindowVisible", "ptr", studio) {
-        TrayTip("Workflow Studio is busy (recording or testing). Stop with Ctrl+Alt+Shift+X first.", "VoiceKit")
-        ExitApp()
-    }
-    WinActivate("ahk_id " studio)
-    if WinWaitActive("ahk_id " studio, , 2) {
+; StudioWindow (lib\_Common.ahk) sees a hidden Studio too — the same check
+; New Automation and the home window use before they open one.
+studio := StudioWindow()
+if (studio.hwnd && !studio.visible) {
+    TrayTip("Workflow Studio is busy (recording or testing). Stop with Ctrl+Alt+Shift+X first.", "VoiceKit")
+    ExitApp()
+}
+if studio.hwnd {
+    WinActivate("ahk_id " studio.hwnd)
+    if WinWaitActive("ahk_id " studio.hwnd, , 2) {
         SendLevel(1)             ; F9 is a hook hotkey in the Studio — let it hear this
         Send("{F9}")
     }
     ExitApp()
 }
 
-Run('"' A_AhkPath '" "' A_ScriptDir '\WorkflowStudio.ahk" /record')
+OpenStudioSafely(RegExReplace(A_ScriptDir, "\\[^\\]+$"), "/record")   ; parent of \macros

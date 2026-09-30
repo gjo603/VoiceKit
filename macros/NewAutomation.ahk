@@ -20,16 +20,20 @@
 #Include "%A_ScriptDir%\..\lib\AI.ahk"
 
 root := RegExReplace(A_ScriptDir, "\\[^\\]+$")   ; parent of \macros
-masterPath := root "\VoiceKit.ahk"
 
 choice := ChooseType()
 switch choice {
     case 1: NewOpenSomething(root)
-    case 2: OpenStudioSafely(root)
-    case 3: NewSnippet(root, masterPath)
+    ; Record My Steps hands off to Workflow Studio WITHOUT killing a session
+    ; that's already open (#SingleInstance Force would silently discard
+    ; unsaved recorded steps) — lib\_Common.ahk OpenStudioSafely, which also
+    ; sees a Studio that's hidden because it's recording or testing.
+    case 2: OpenStudioSafely(root, , "Workflow Studio is busy recording or testing right now."
+                . " Finish that first (Ctrl+Alt+Shift+X stops a recording), then try again.")
+    case 3: NewSnippet(root)
     case 4: NewAIAction(root)
     case 5: NewAIDraft(root)
-    case 6: NewHotkeyModule(root, masterPath)
+    case 6: NewHotkeyModule(root)
 }
 ExitApp()
 
@@ -67,29 +71,14 @@ ChooseType() {
     g.OnEvent("Close", (*) => g.Destroy())
     g.OnEvent("Escape", (*) => g.Destroy())
 
-    ThemeApply(g)
-    for d in descs
-        ThemeDim(d)
-    hwnd := g.Hwnd
-    g.Show()
-    WinWaitClose("ahk_id " hwnd)
+    ThemeShowModal(g, 0, descs)
     return state.choice
 }
 
 ; ------------------------------------------------------------
-;  Shared dialog plumbing
+;  Shared dialog plumbing (showing a dialog modally is
+;  lib\Theme.ahk ThemeShowModal; AhkStrLit lives in _Common)
 ; ------------------------------------------------------------
-
-; Theme a dialog, show it, and wait until it's gone.
-ShowModal(d, dims := "") {
-    ThemeApply(d)
-    if IsObject(dims)
-        for c in dims
-            ThemeDim(c)
-    hwnd := d.Hwnd
-    d.Show()
-    WinWaitClose("ahk_id " hwnd)
-}
 
 ; Normalize + validate a name. Returns {phrase, base} or "" (after its
 ; own error popup, owned by the calling dialog).
@@ -102,15 +91,6 @@ ValidNewName(raw, ownerHwnd) {
         return ""
     }
     return {phrase: phrase, fileBase: base}
-}
-
-; Render a value as an AutoHotkey v2 double-quoted string literal.
-AhkStrLit(s) {
-    s := StrReplace(s, "``", "````")
-    s := StrReplace(s, '"', '``"')
-    s := StrReplace(s, "`r", "")
-    s := StrReplace(s, "`n", "``n")
-    return '"' s '"'
 }
 
 ; The calm "you're done" screen: the phrase to say, front and center.
@@ -135,13 +115,7 @@ DoneDialog(sayThis, note, scriptPath := "") {
     btnDone.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ThemeApply(d)
-    ThemeDim(lead)
-    ThemeDim(tail)
-    phraseCtrl.Opt("c" Format("{:06X}", ThemePalette().accent))
-    hwnd := d.Hwnd
-    d.Show()
-    WinWaitClose("ahk_id " hwnd)
+    ThemeShowModal(d, 0, [lead, tail, (*) => phraseCtrl.Opt("c" Format("{:06X}", ThemePalette().accent))])
 }
 
 ; ------------------------------------------------------------
@@ -188,37 +162,16 @@ NewOpenSomething(root) {
             return
         }
         newFile := root "\macros\" nm.fileBase ".ahk"
-        if FileExist(newFile) {
-            MsgBox("An automation named '" nm.fileBase "' already exists. Pick another name.", "New Automation", "Icon! Owner" d.Hwnd)
+        if ((disp := ClaimNewMacroName(root, nm.fileBase, d.Hwnd)) = "")
+            return
+        content := VkOpensMacroContent(nm.phrase, target)
+        ; Load-checked before the voice phrase points at it — a macro that
+        ; won't load would only fail later, when spoken, with a code error.
+        if !AhkWriteChecked(newFile, content, &err) {
+            MsgBox(err, "New Automation", "Icon! Owner" d.Hwnd)
             return
         }
-        ; Name the .lnk by SpaceOut(fileBase) — the same name Home's list,
-        ; Home's Delete, and first-run reinstall all reconstruct — so they
-        ; never drift (same rule SaveWorkflow follows; phrases with digits,
-        ; like "Plan 9", don't round-trip through SpaceOut otherwise).
-        disp := SpaceOut(nm.fileBase)
-        vmDir := A_Programs "\Voice Macros"
-        EnsureDir(vmDir)
-        if FileExist(vmDir "\" disp ".lnk") {
-            MsgBox("The voice phrase `"open " disp "`" is already taken by another entry. Pick another name.", "New Automation", "Icon! Owner" d.Hwnd)
-            return
-        }
-        runArg := (InStr(target, " ") && FileExist(target)) ? '"' target '"' : target
-        content := "#Requires AutoHotkey v2.0`n"
-            . "#SingleInstance Force`n"
-            . "; ============================================================`n"
-            . ";  " nm.phrase "   (created " FormatTime(A_Now, "yyyy-MM-dd") ")`n"
-            . ';  Trigger by voice:  "open ' nm.phrase '"`n'
-            . ";  Opens:  " target "`n"
-            . ";`n"
-            . ";  Created by New Automation — no code needed. To add steps,`n"
-            . ";  edit below (building blocks: templates\launch-template.ahk).`n"
-            . "; ============================================================`n"
-            . '#Include "%A_ScriptDir%\..\lib\_Common.ahk"`n'
-            . "Run(" AhkStrLit(runArg) ")`n"
-        FileAppend(content, newFile, "UTF-8")
-
-        MakeAhkShortcut(vmDir "\" disp ".lnk", newFile)
+        EnsureVoiceShortcut(disp, newFile)
         Log(root, "launch | " disp " | macros\" nm.fileBase ".ahk | opens " target)
         d.Destroy()
         DoneDialog("open " disp, "It opens:  " target, newFile)
@@ -227,35 +180,16 @@ NewOpenSomething(root) {
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ShowModal(d, [exName, exTarget])
+    ThemeShowModal(d, 0, [exName, exTarget])
 }
 
-; ------------------------------------------------------------
-;  2) Record My Steps — hand off to Workflow Studio, WITHOUT
-;     killing a session that's already open (#SingleInstance
-;     Force would silently discard unsaved recorded steps).
-; ------------------------------------------------------------
-OpenStudioSafely(root, draftFile := "") {
-    if WinExist("Workflow Studio ahk_class AutoHotkeyGUI") {
-        if (draftFile != "") {
-            MsgBox("Workflow Studio is already open. Save or close it first, then try Draft With AI again.",
-                "New Automation", "Icon! 262144")
-            return false
-        }
-        WinActivate("Workflow Studio ahk_class AutoHotkeyGUI")
-        return true
-    }
-    cmd := '"' A_AhkPath '" "' root '\macros\WorkflowStudio.ahk"'
-    if (draftFile != "")
-        cmd .= ' "' draftFile '"'
-    Run(cmd)
-    return true
-}
+; (2) Record My Steps is lib\_Common.ahk OpenStudioSafely — see the switch
+; at the top.
 
 ; ------------------------------------------------------------
 ;  3) Type Text For Me — a snippet, one dialog, fully automated.
 ; ------------------------------------------------------------
-NewSnippet(root, masterPath) {
+NewSnippet(root) {
     d := Gui("+AlwaysOnTop", "New Automation — Type Text For Me")
     d.SetFont("s10", "Segoe UI")
     d.MarginX := 20, d.MarginY := 16
@@ -272,36 +206,28 @@ NewSnippet(root, masterPath) {
     btnCancel := d.AddButton("x+8 w110 h36", "Cancel")
 
     OK(*) {
-        abbrev := RegExReplace(Trim(edAbbrev.Value), "\s", "")
-        if (abbrev = "" || InStr(abbrev, ":")) {
-            MsgBox("The abbreviation can't be empty or contain a colon (:) — a colon breaks the snippet format. Pick another.",
-                "New Automation", "Icon! Owner" d.Hwnd)
-            return
-        }
+        abb := RegExReplace(Trim(edAbbrev.Value), "\s", "")
         expansion := edText.Value
-        if (Trim(expansion, " `t`r`n") = "") {
-            MsgBox("Give it the text to expand into.", "New Automation", "Icon! Owner" d.Hwnd)
-            return
-        }
-        ; A lone "{" would be parsed as an opening code block — the file then
-        ; fails to load and takes EVERY hotkey and snippet down with it.
-        if (Trim(expansion) = "{") {
-            MsgBox("The text can't be just '{' — that's code syntax in the snippets file. Add the rest of the text.", "New Automation", "Icon! Owner" d.Hwnd)
+        ; One bad line stops Snippets.ahk loading, and the reload would then
+        ; switch EVERY snippet off — so the rules are checked first, and the
+        ; written file is load-checked (and put back) below.
+        if ((why := SnippetValidate(abb, expansion)) != "") {
+            MsgBox(why, "New Automation", "Icon! Owner" d.Hwnd)
             return
         }
         snipFile := root "\hotkeys\Snippets.ahk"
-        if FileExist(snipFile) {
-            Loop Parse FileRead(snipFile, "UTF-8"), "`n", "`r" {
-                if (RegExMatch(A_LoopField, "^:\*?[^:]*:(.+?)::", &m) && m[1] = abbrev) {
-                    MsgBox("A snippet  " abbrev "  already exists. Delete it first (say `"open voice kit`") or pick another abbreviation.", "New Automation", "Icon! Owner" d.Hwnd)
-                    return
-                }
-            }
+        if SnippetExists(snipFile, abb) {
+            MsgBox("A snippet  " abb "  already exists. Delete it first (say `"open voice kit`") or pick another abbreviation.", "New Automation", "Icon! Owner" d.Hwnd)
+            return
         }
-        expansion := SnipEncode(expansion)                 ; multi-line -> `n; escape ` and ;
-        FileAppend("`n:*:" abbrev "::" expansion, snipFile, "UTF-8")
-        RunAhk(masterPath)               ; reload VoiceKit so it works immediately
-        Log(root, "snippet | " abbrev)
+        line := "`n:*:" abb "::" SnipEncode(expansion)     ; multi-line -> `n; escape ` and ;
+        if !SnippetFileChange(snipFile, () => (FileAppend(line, snipFile, "UTF-8"), true), &err) {
+            MsgBox("That snippet would stop the snippets file loading, so it wasn't added:`n`n" err,
+                "New Automation", "Icon! Owner" d.Hwnd)
+            return
+        }
+        ReloadMasterNotify(root)         ; reload VoiceKit so it works immediately
+        Log(root, "snippet | " abb)
         d.Destroy()
         d2 := Gui("+AlwaysOnTop", "New Automation")
         d2.SetFont("s10", "Segoe UI")
@@ -309,18 +235,18 @@ NewSnippet(root, masterPath) {
         d2.SetFont("s13 bold")
         d2.AddText("xm", "Ready ✓")
         d2.SetFont("s10 norm")
-        d2.AddText("xm y+10 w420", "Type  " abbrev "  anywhere and it expands immediately — no voice setup needed.")
+        d2.AddText("xm y+10 w420", "Type  " abb "  anywhere and it expands immediately — no voice setup needed.")
         b := d2.AddButton("xm y+16 w130 h34 Default", "Done")
         b.OnEvent("Click", (*) => d2.Destroy())
         d2.OnEvent("Close", (*) => d2.Destroy())
         d2.OnEvent("Escape", (*) => d2.Destroy())
-        ShowModal(d2)
+        ThemeShowModal(d2)
     }
     btnOK.OnEvent("Click", OK)
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ShowModal(d, [exA, exB])
+    ThemeShowModal(d, 0, [exA, exB])
 }
 
 ; ------------------------------------------------------------
@@ -355,27 +281,23 @@ NewAIAction(root) {
             return
         }
         newFile := root "\macros\" nm.fileBase ".ahk"
-        if FileExist(newFile) {
-            MsgBox("An automation named '" nm.fileBase "' already exists. Pick another name.", "New Automation", "Icon! Owner" d.Hwnd)
+        if ((disp := ClaimNewMacroName(root, nm.fileBase, d.Hwnd)) = "")
             return
-        }
-        disp := SpaceOut(nm.fileBase)          ; same naming rule as everywhere else
-        vmDir := A_Programs "\Voice Macros"
-        EnsureDir(vmDir)
-        if FileExist(vmDir "\" disp ".lnk") {
-            MsgBox("The voice phrase `"open " disp "`" is already taken by another entry. Pick another name.", "New Automation", "Icon! Owner" d.Hwnd)
-            return
-        }
+        promptFile := root "\prompts\" nm.fileBase ".prompt.txt"
         EnsureDir(root "\prompts")
-        f := FileOpen(root "\prompts\" nm.fileBase ".prompt.txt", "w", "UTF-8")
+        f := FileOpen(promptFile, "w", "UTF-8")
         f.Write(prompt "`n")
         f.Close()
         tpl := FileRead(root "\templates\ai-template.ahk", "UTF-8")
         tpl := StrReplace(tpl, "{{PHRASE}}", nm.phrase)
         tpl := StrReplace(tpl, "{{BASE}}", nm.fileBase)
         tpl := StrReplace(tpl, "{{DATE}}", FormatTime(A_Now, "yyyy-MM-dd"))
-        FileAppend(tpl, newFile, "UTF-8")
-        MakeAhkShortcut(vmDir "\" disp ".lnk", newFile)
+        if !AhkWriteChecked(newFile, tpl, &err) {      ; before the phrase points at it
+            try FileDelete(promptFile)
+            MsgBox(err, "New Automation", "Icon! Owner" d.Hwnd)
+            return
+        }
+        EnsureVoiceShortcut(disp, newFile)
         Log(root, "ai-action | " disp " | macros\" nm.fileBase ".ahk")
         d.Destroy()
         DoneDialog("open " disp,
@@ -385,7 +307,7 @@ NewAIAction(root) {
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ShowModal(d, [how, exName, exPrompt])
+    ThemeShowModal(d, 0, [how, exName, exPrompt])
 }
 
 ; ------------------------------------------------------------
@@ -393,10 +315,10 @@ NewAIAction(root) {
 ; ------------------------------------------------------------
 NewAIDraft(root) {
     ; Check Studio BEFORE spending an API call — launching it with a draft
-    ; would replace (and silently discard) an already-open session.
-    if WinExist("Workflow Studio ahk_class AutoHotkeyGUI") {
-        MsgBox("Workflow Studio is already open. Save or close it first, then run Draft With AI again.",
-            "New Automation", "Icon! 262144")
+    ; would replace (and silently discard) an already-open session. Hidden
+    ; counts as open: it hides while recording or testing.
+    if StudioWindow().hwnd {
+        MsgBox(StudioOpenForDraftMsg(), "New Automation", "Icon! 262144")
         return
     }
     if !AIEnsureConfigured()
@@ -415,7 +337,16 @@ NewAIDraft(root) {
     btnOK := d.AddButton("xm y+16 w150 h36 Default", "Draft It")
     btnCancel := d.AddButton("x+8 w110 h36", "Cancel")
     status := d.AddText("xm y+12 w560 h30", "")
+    dHwnd := d.Hwnd          ; read now: OK below can outlive the Gui
 
+    ; Back to editable, with a message. try: see the check in OK.
+    Retry(msg) {
+        try {
+            status.Text := msg
+            edDesc.Enabled := true
+            btnOK.Enabled := true
+        }
+    }
     OK(*) {
         desc := Trim(edDesc.Value, " `t`r`n")
         if (desc = "")
@@ -425,18 +356,20 @@ NewAIDraft(root) {
         status.Text := "Drafting… (this takes a few seconds)"
         err := ""
         raw := AIComplete(DraftSystemPrompt(), desc, &err, 4096)
+        ; AIComplete keeps the dialog responsive while it waits, so Cancel /
+        ; Escape / X may have closed it meanwhile. That means "never mind":
+        ; don't open the draft the user just walked away from (and don't
+        ; write into controls that no longer exist — that throws).
+        if !WinExist("ahk_id " dHwnd)
+            return
         if (raw = "") {
-            status.Text := err
-            edDesc.Enabled := true
-            btnOK.Enabled := true
+            Retry(err)
             return
         }
         perr := ""
         steps := ParseDraft(raw, &perr)
         if !IsObject(steps) {
-            status.Text := perr " — click Draft It to retry."
-            edDesc.Enabled := true
-            btnOK.Enabled := true
+            Retry(perr " — click Draft It to retry.")
             return
         }
         EnsureDir(root "\logs")
@@ -449,13 +382,22 @@ NewAIDraft(root) {
         f.Close()
         Log(root, "ai-draft | " steps.Length " steps")
         d.Destroy()
-        OpenStudioSafely(root, draftFile)
+        ; The Studio may have been opened while the AI was drafting; a
+        ; relaunch would kill it, so the draft waits in its file instead.
+        if (OpenStudioSafely(root, draftFile) != "launched")
+            MsgBox(StudioOpenForDraftMsg() "`n`nYour draft is kept in logs\ai-draft.steps.txt.",
+                "New Automation", "Icon! 262144")
     }
     btnOK.OnEvent("Click", OK)
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ShowModal(d, [how, tips])
+    ThemeShowModal(d, 0, [how, tips])
+}
+
+StudioOpenForDraftMsg() {
+    return "Workflow Studio is already open (or busy recording or testing). "
+        . "Save or close it first, then run Draft With AI again."
 }
 
 DraftSystemPrompt() {
@@ -466,21 +408,31 @@ DraftSystemPrompt() {
         . "- run: a = program, file path, folder path, or https:// URL to open.`n"
         . "- focus: a = window to focus ('ahk_exe app.exe' or part of its title); b = command to launch it if it isn't running (optional).`n"
         . "- waitwin: a = window to wait for; b = timeout in seconds (optional, default 10).`n"
-        . "- wait: a = milliseconds to pause.`n"
+        . '- wait: a = milliseconds to pause, or a RANGE like "600-1400" to pause a random amount in between. Use this only when there is nothing observable to wait on — prefer waitfor. Use a range whenever the workflow will be repeated against a website: pausing the identical number of milliseconds every pass is the easiest robot pattern to detect.' "`n"
+        . '- waitfor: waits until something is actually true, then continues at once. a = window; b = the element name or on-screen text to wait for (empty for the window/clipboard conditions); c = one of winexists, winnotexists, elementexists, elementnotexists, textvisible, textnotvisible, clipboardchanged - optionally followed by ",<seconds>" (default 10), e.g. "textvisible,30". Use it after anything slow: a page loading, a save, a search. clipboardchanged needs no window and waits for a copy to land.' "`n"
         . "- text: a = text to type into the focused window.`n"
+        . "- fill: a = window; b = the EXACT on-screen label of an input box (its accessible name - for a web form, the field's label), with #2, #3... appended when several boxes share that label (Amount#2 = the second; write ## for a # that is part of the label itself, e.g. Line ##4); c = the value to put in it (may use {{Name}}; an empty c clears the box). It clicks the box, types the value and checks the box took it. Prefer fill over click + text for form fields.`n"
         . "- ask: a = a short label for a value the USER should supply when the workflow runs (e.g. 'Customer name'); b = suggested answer (optional). All ask inputs are collected in dialogs before the run starts, and the answer is typed into the focused window at this step's position. Use ask instead of text whenever the description implies the value changes each run.`n"
         . "- collect: a = a short label for a value the workflow should GRAB from the screen and save (it becomes a column in the workflow's results sheet); b = the exact on-screen name of the box to read (optional — leave empty to copy whatever text the previous steps left SELECTED, e.g. after a select-all or a double-click on a word). Use collect when the description implies reading or saving something the app shows.`n"
+        . "- set: a = a name (no braces) for a value; b = the value, which may itself contain {{other}} references. Use it to build a value once and reuse it.`n"
         . "- keys: a = keys in AutoHotkey v2 Send syntax, e.g. {Enter}, {Tab 2}, ^s.`n"
         . "- click / dblclick / rclick: a = window; b = the EXACT on-screen name of the thing to click (button caption, link text, menu item).`n"
         . "- hover: a = window; b = the on-screen name to rest the mouse over (moves there and pauses so a hover menu/tooltip appears; follow with a click on what it reveals).`n"
         . '- drag: a = window; c = "x1,y1,x2,y2" window-relative press and release points (selects a region by dragging). Only use when the description gives exact pixel coordinates; never invent them.' "`n"
         . "- move: a = window; b = one of left, right, top, bottom, max.`n"
         . "- close: a = window to close.`n"
-        . '- if: a = window; b = element name ("" unless the condition checks an element); c = one of winexists, winnotexists, elementexists, elementnotexists.' "`n"
-        . "- else: no fields. endif: no fields.`n`n"
+        . '- if: a = window; b = element name or on-screen text ("" for the window conditions); c = one of winexists, winnotexists, elementexists, elementnotexists, textvisible, textnotvisible. Use textvisible/textnotvisible to react to what the app says, e.g. "No results found".' "`n"
+        . "- else: no fields. endif: no fields.`n"
+        . "- NEVER use a capture step (running a command and saving its output): drafts can't contain commands. If the task needs one, draft the other steps; the user adds the command in Workflow Studio.`n`n"
+        . "Named values:`n"
+        . "- Every ask label, collect label and set name becomes a value you can reuse ANYWHERE later by writing {{Name}} — in text, keys, run targets, window criteria and element names.`n"
+        . "- That is how one answer reaches two places: ask once for 'Customer', then write {{Customer}} in every step that needs it. Never ask for the same thing twice.`n"
+        . "- {{clipboard}}, {{date}}, {{time}} and {{datetime}} are always available.`n"
+        . "- {{selected_file}} is the one file the user selected in File Explorer before starting (full path; put it in double quotes inside a command line) - the run refuses to start unless exactly one is selected. {{selected_files}} is every selected file, each already in double quotes, space-joined. Use them only when the description is about the selected file(s).`n"
+        . "- Only reference a name something defines; an unknown name is typed out literally. The one exception is a fill value: an undefined {{Name}} there becomes an input the user supplies when the workflow runs (no ask step needed).`n`n"
         . "Rules:`n"
         . "- Every if needs a matching endif (else is optional). Only branch when the description clearly needs it.`n"
-        . "- After a run/focus that launches an app, add waitwin (preferred) or wait 800-1500 ms before typing or clicking.`n"
+        . "- After a run/focus that launches an app, add waitwin. After anything else slow (a search, a save, a page load), add a waitfor for the thing that proves it finished — not a guessed wait.`n"
         . "- Prefer element-name clicks; never invent coordinates (leave c empty for clicks).`n"
         . "- Windows are 'ahk_exe name.exe' or a distinctive part of the window title.`n"
         . "- Keep it minimal and linear."
@@ -516,9 +468,14 @@ ParseDraftInner(raw, &perr) {
         perr := "The AI returned an empty step list"
         return ""
     }
-    validTypes := Map("run",1, "focus",1, "waitwin",1, "wait",1, "text",1, "ask",1, "collect",1, "keys",1,
+    validTypes := Map("run",1, "focus",1, "waitwin",1, "wait",1, "waitfor",1, "text",1, "fill",1, "ask",1, "collect",1, "set",1, "keys",1,
         "click",1, "dblclick",1, "rclick",1, "hover",1, "drag",1, "move",1, "close",1, "if",1, "else",1, "endif",1)
-    validConds := Map("winexists",1, "winnotexists",1, "elementexists",1, "elementnotexists",1)
+    ; Types that store nothing in paramC (the Studio's generic path agrees).
+    ; if/waitfor/drag and the pointer steps keep theirs, checked below.
+    paramCless := Map("run",1, "focus",1, "waitwin",1, "wait",1, "text",1, "ask",1, "collect",1,
+        "set",1, "keys",1, "move",1, "close",1, "else",1, "endif",1)
+    validConds := Map("winexists",1, "winnotexists",1, "elementexists",1, "elementnotexists",1,
+        "textvisible",1, "textnotvisible",1)
     steps := []
     for i, el in arr {
         if !(el is Map) {
@@ -527,6 +484,15 @@ ParseDraftInner(raw, &perr) {
         }
         ok := true
         t := StrLower(DraftField(el, "type", &ok))
+        ; capture runs a command line. The engine has it, but a draft is
+        ; text from a model, and a command belongs to someone who read it —
+        ; so drafts can't carry one (yet). Named, so the user knows why.
+        if (t = "capture") {
+            perr := "Draft step " i " runs a command ('capture') — Draft With AI can't add commands. "
+                . "Draft it without that step, then add it yourself in Workflow Studio "
+                . "(Add → Run a command and save its output)"
+            return ""
+        }
         if !validTypes.Has(t) {
             perr := "Draft step " i " has an unknown type ('" t "')"
             return ""
@@ -546,19 +512,63 @@ ParseDraftInner(raw, &perr) {
             perr := "Draft step " i " is a 'collect' with no label"
             return ""
         }
+        ; wait: whole milliseconds or a range ("600-1400"). Checked with the
+        ; engine's own parser so the draft can't produce a step the run rejects.
+        if (t = "wait" && WfWaitMs(a).err != "") {
+            perr := "Draft step " i " has a bad wait ('" a "') — milliseconds or a range like 600-1400"
+            return ""
+        }
         if (t = "if") {
             c := StrLower(c)
             if !validConds.Has(c) {
                 perr := "Draft step " i " has a bad if-condition ('" c "')"
                 return ""
             }
+        } else if (t = "waitfor") {
+            ; paramC is "<condType>[,<seconds>]" — normalise and check both
+            ; halves.
+            parts := StrSplit(c, ",")
+            wc := StrLower(Trim(parts.Length ? parts[1] : ""))
+            if !(validConds.Has(wc) || wc = "clipboardchanged") {
+                perr := "Draft step " i " has a bad wait-until condition ('" wc "')"
+                return ""
+            }
+            secs := (parts.Length >= 2) ? Trim(parts[2]) : ""
+            if (secs != "" && (!IsNumber(secs) || Number(secs) <= 0)) {
+                perr := "Draft step " i " has a bad wait-until timeout ('" secs "')"
+                return ""
+            }
+            c := wc (secs != "" ? "," secs : "")
         } else if (t = "drag") {
             if !(c ~= "^\s*-?\d+\s*,\s*-?\d+\s*,\s*-?\d+\s*,\s*-?\d+\s*$") {
                 perr := "Draft step " i " is a 'drag' without an x1,y1,x2,y2 path"
                 return ""
             }
-        } else if (t != "click" && t != "dblclick" && t != "rclick" && t != "hover")
-            c := ""                       ; paramC is only meaningful for if + click/hover/drag steps
+        } else if (t = "fill") {
+            ; paramC is the VALUE — kept exactly as drafted ("" clears the box).
+            if (Trim(a) = "" || Trim(b) = "") {
+                perr := "Draft step " i " is a 'fill' without a window and a box label"
+                return ""
+            }
+            if ((lerr := WfFillLabel(b).err) != "") {
+                perr := "Draft step " i ": " lerr
+                return ""
+            }
+            if RegExMatch(c, "[\r\n]") {
+                perr := "Draft step " i " fills a box with a line break — a fill types one line"
+                return ""
+            }
+        } else if paramCless.Has(t)
+            c := ""                       ; nothing lives in paramC for these — drop model noise
+        else if (t != "click" && t != "dblclick" && t != "rclick" && t != "hover") {
+            ; A type that stores something in paramC but has no branch above.
+            ; This used to be a catch-all that blanked paramC for "everything
+            ; else" — a new paramC type (waitfor's timeout, capture's) would
+            ; have lost its value silently. Now a type must be listed in
+            ; paramCless or get its own branch; anything else is refused.
+            perr := "Draft step " i " ('" t "') isn't supported in drafts yet"
+            return ""
+        }
         steps.Push([t, a, b, c])
     }
     if (berr := DraftBalanceError(steps)) {
@@ -606,7 +616,16 @@ DraftBalanceError(steps) {
 ;  6) Always-On Hotkey — no-code for the common cases; custom
 ;     code stays available as the escape hatch.
 ; ------------------------------------------------------------
-NewHotkeyModule(root, masterPath) {
+NewHotkeyModule(root) {
+    ; Offer the key up front rather than assigning one and hoping: the pool
+    ; includes symbols now, and "I wanted [ and there was no way to ask" was
+    ; the complaint that put this here.
+    freeKeys := BridgeFreeKeys(root "\bridge-map.txt")
+    if !freeKeys.Length {
+        MsgBox("No free Ctrl+Alt+Shift keys are left — retire one in bridge-map.txt first.",
+            "New Automation", "Icon! 262144")
+        return
+    }
     d := Gui("+AlwaysOnTop", "New Automation — Always-On Hotkey")
     d.SetFont("s10", "Segoe UI")
     d.MarginX := 20, d.MarginY := 16
@@ -616,6 +635,11 @@ NewHotkeyModule(root, masterPath) {
     how := d.AddText("xm y+4 w500", "VoiceKit assigns a free Ctrl+Alt+Shift key. Pairing a voice phrase to it is one manual step at the end (~30 seconds — Windows allows no shortcut API).")
     d.AddText("xm y+14", "Name it — also the suggested voice phrase:")
     edName := d.AddEdit("xm y+4 w500")
+    d.AddText("xm y+14", "Key to press:")
+    d.SetFont("s11 bold")
+    d.AddText("x+8 yp-1", "Ctrl + Alt + Shift  +")
+    ddlKey := d.AddDropDownList("x+8 yp-3 w66 Choose1", freeKeys)
+    d.SetFont("s10 norm")
     d.AddText("xm y+14", "When the key is pressed, what should happen?")
     rOpen := d.AddRadio("xm y+6 Checked Group", "Open something (app, file, folder, or web address)")
     rType := d.AddRadio("xm y+4", "Type text")
@@ -662,19 +686,24 @@ NewHotkeyModule(root, masterPath) {
                 : "Give it the text to type.", "New Automation", "Icon! Owner" d.Hwnd)
             return
         }
-        mapFile := root "\bridge-map.txt"
-        key := AllocateBridgeKey(mapFile)
+        key := ddlKey.Text
         if (key = "") {
-            MsgBox("No free bridge keys left. Retire something in bridge-map.txt first.", "New Automation", "Icon! Owner" d.Hwnd)
+            MsgBox("Pick a key for it.", "New Automation", "Icon! Owner" d.Hwnd)
             return
         }
 
+        ; Custom code runs OUT of process: hotkeys\<Base>.ahk becomes a key
+        ; binding that launches hotkeys\bodies\<Base>.body.ahk. Hand-written
+        ; code is the half that can crash hard (a bad ComCall, an unpinned
+        ; COM vtable), and in the master that kills every other hotkey and
+        ; every snippet too. The no-code branches below stay in-process:
+        ; one Run()/SendText() line can't crash, and a launch would only
+        ; add latency.
         if rCode.Value {
-            tpl := FileRead(root "\templates\hotkey-template.ahk", "UTF-8")
-            tpl := StrReplace(tpl, "{{PHRASE}}", nm.phrase)
-            tpl := StrReplace(tpl, "{{KEY}}", key)
-            tpl := StrReplace(tpl, "{{DATE}}", FormatTime(A_Now, "yyyy-MM-dd"))
-            FileAppend(tpl, newFile, "UTF-8")
+            if (cerr := HotkeyIsolatedCreate(root, nm.fileBase, nm.phrase, key)) {
+                MsgBox(cerr, "New Automation", "Icon! Owner" d.Hwnd)
+                return
+            }
         } else {
             if rOpen.Value {
                 runArg := (InStr(target, " ") && FileExist(target)) ? '"' target '"' : target
@@ -684,30 +713,21 @@ NewHotkeyModule(root, masterPath) {
                 actionLine := "SendText(" AhkStrLit(target) ")"
                 actionDesc := "Types the saved text"
             }
-            content := "#Requires AutoHotkey v2.0`n"
-                . "; ============================================================`n"
-                . ";  " nm.phrase "   (created " FormatTime(A_Now, "yyyy-MM-dd") ")`n"
-                . ";  Loaded by VoiceKit.ahk — do not run this file directly.`n"
-                . ";  Trigger key:  Ctrl+Alt+Shift+" key "`n"
-                . ";  " actionDesc "`n"
-                . ";`n"
-                . ";  Voice pairing (one-time, ~30 sec):`n"
-                . ';    1. Say: "show voice shortcuts"`n'
-                . ";    2. Create new shortcut  ->  When I say:  " nm.phrase "`n"
-                . ";    3. Action: Press keys   ->  Ctrl + Alt + Shift + " key "`n"
-                . ";  This pairing is recorded in bridge-map.txt.`n"
-                . "; ============================================================`n`n"
-                . "^!+" key ":: {`n"
-                . "    " actionLine "`n"
-                . "}`n"
-            FileAppend(content, newFile, "UTF-8")
+            ; Load-checked BEFORE it's wired in: the master #Includes it, and
+            ; a module that won't parse gets parked on the reload — which
+            ; used to happen AFTER this dialog had already said it worked.
+            if !HotkeyWriteChecked(root, "hotkeys\" nm.fileBase ".ahk",
+                    HotkeyInProcessContent(nm.phrase, key, actionLine, actionDesc), &err) {
+                MsgBox(err, "New Automation", "Icon! Owner" d.Hwnd)
+                return
+            }
         }
 
         BridgeRegisterModule(root, key, nm.phrase, "hotkeys\" nm.fileBase ".ahk")
-        RunAhk(masterPath)               ; reload VoiceKit so the hotkey is live now
+        ReloadMasterNotify(root)         ; reload VoiceKit so the hotkey is live now
         Log(root, "hotkey | " nm.phrase " | Ctrl+Alt+Shift+" key " | hotkeys\" nm.fileBase ".ahk")
-        if rCode.Value
-            Run('notepad.exe "' newFile '"')
+        if rCode.Value                   ; open the BODY — that's where steps go
+            Run('notepad.exe "' HotkeyBodyFile(root, nm.fileBase) '"')
         d.Destroy()
         PairingDialog(nm.phrase, key)
     }
@@ -716,7 +736,7 @@ NewHotkeyModule(root, masterPath) {
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
     SyncFields()
-    ShowModal(d, [how])
+    ThemeShowModal(d, 0, [how])
 }
 
 ; The one manual step Windows forces on us, spelled out calmly.
@@ -738,13 +758,10 @@ PairingDialog(phrase, key) {
     btn.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ShowModal(d, [lead, tail])
+    ThemeShowModal(d, 0, [lead, tail])
 }
 
-; First free key from the shared pool (lib\_Common.ahk BridgeKeyPool —
-; E, N, R, X, H, I reserved; companion hotkeys assigned in Voice Kit draw
-; from the same pool, so the registry keeps everyone honest).
-AllocateBridgeKey(mapFile) {
-    free := BridgeFreeKeys(mapFile)
-    return free.Length ? free[1] : ""
-}
+; (AllocateBridgeKey lived here and took the first free key. It went when the
+; hotkey dialog started offering the whole free list instead — dead code that
+; claims to mirror the Python allocator is a drift hazard. BridgeFreeKeys in
+; lib\_Common.ahk remains the shared source of truth.)
