@@ -33,19 +33,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Process -Name AutoHo
 if not exist "%TARGET%" mkdir "%TARGET%" 2>nul
 rem Additive copy (keeps any automations the user already made); never copies
 rem this installer or the legacy Setup.bat into the install.
-rem UPGRADE GUARD: three shipped files hold per-machine user state — the
-rem snippet file, the hotkey include manifest, and the bridge-key registry.
-rem On a fresh install the shipped copies must land; on an upgrade (the file
-rem already exists in the target) they must NOT be overwritten, or the user's
-rem snippets vanish and every registered hotkey goes dead.
-set "XFILES="Install-VoiceKit.cmd" "Setup.bat""
-if exist "%TARGET%\hotkeys\Snippets.ahk" set "XFILES=%XFILES% "Snippets.ahk""
-if exist "%TARGET%\hotkeys\_index.ahk"   set "XFILES=%XFILES% "_index.ahk""
-if exist "%TARGET%\bridge-map.txt"       set "XFILES=%XFILES% "bridge-map.txt""
+rem USER STATE: the snippet file, the hotkey include manifest and the
+rem bridge-key registry are the user's own. The package ships only their
+rem defaults (*.default.*); VoiceKit makes the live copies on first start
+rem and adds any line a newer version ships (SeedUserFiles in _Common.ahk),
+rem so an upgrade gets new shipped hotkeys without losing a snippet or a
+rem registration. The live names are still excluded here (a package built
+rem from an older tree carried them), and this copy never purges: no /MIR,
+rem no /PURGE, so nothing the user made is ever removed.
+set "XFILES="Install-VoiceKit.cmd" "Setup.bat" "Snippets.ahk" "_index.ahk" "bridge-map.txt""
 robocopy "%SRC%" "%TARGET%" /E /XF %XFILES% /NFL /NDL /NJH /NJS /NP >nul
 set "RC=%ERRORLEVEL%"
 if %RC% GEQ 8 goto :copyfail
 if not exist "%TARGET%\VoiceKit.ahk" goto :missing
+if not exist "%TARGET%\VoiceKitLauncher.ahk" goto :missing
 if not exist "%TARGET%\AutoHotkey64.exe" goto :missing
 
 rem Strip Mark-of-the-Web. If the zip was emailed / downloaded, every extracted
@@ -56,8 +57,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPa
 
 if defined VK_NOLAUNCH goto :nolaunch
 
+rem Start through the launcher, never VoiceKit.ahk directly: it load-checks
+rem first and parks any module that won't compile, so a bad module can't
+rem leave the machine with no hotkeys and no snippets at all.
 echo   Starting VoiceKit...
-start "" "%TARGET%\AutoHotkey64.exe" "%TARGET%\VoiceKit.ahk"
+start "" "%TARGET%\AutoHotkey64.exe" "%TARGET%\VoiceKitLauncher.ahk"
 echo.
 echo   Done. Turn on Voice Access, then say:  open voice kit
 echo   (Give Windows a few seconds to index the new Start Menu entries.)

@@ -114,6 +114,4 @@ ThemeRound(bar.Hwnd)
 ShowBottomCenter(bar)
 edQ.Focus()
 
-Abbrev(s, n) {
-    return StrLen(s) > n ? SubStr(s, 1, n) "..." : s
-}
+; (Abbrev lives in lib\_Common.ahk now.)

@@ -18,13 +18,13 @@ if errorlevel 1 (
 echo  Creating a virtual environment in .venv ...
 python -m venv .venv
 call ".venv\Scripts\activate.bat"
-echo  Installing FastMCP ...
+echo  Installing FastMCP and openpyxl ...
 python -m pip install --quiet --upgrade pip
 python -m pip install --quiet -r requirements.txt
 if errorlevel 1 ( echo  pip install failed. & pause & exit /b 1 )
 
 echo  Verifying ...
-python -c "import fastmcp, voicekit_writer; print('  fastmcp', fastmcp.__version__, 'OK')"
+python -c "import fastmcp, openpyxl, voicekit_writer; print('  fastmcp', fastmcp.__version__, '/ openpyxl', openpyxl.__version__, 'OK')"
 
 echo.
 echo  Done. Register the server with your client(s):

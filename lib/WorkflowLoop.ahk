@@ -34,7 +34,11 @@
 ;  the sheet after the loop: a batch fed BY the sheet fills the
 ;  collect columns of each row that ran; any other pass appends a
 ;  row (inputs used + values collected). If the sheet is locked
-;  (open in Excel), results go to <Base>.results.csv instead.
+;  (open in Excel), results go to <Base>.results.csv instead. Each
+;  pass's results are also journaled to logs\loop-journal as it
+;  completes, so a loop that is replaced, killed or crashes before
+;  that save loses nothing: the next save of the same workflow
+;  merges the leftovers in (see WfLoopSaveResults).
 ; ============================================================
 #Include "%A_LineFile%\..\Workflow.ahk"
 #Include "%A_LineFile%\..\Theme.ahk"
@@ -47,19 +51,32 @@ global wfLoopStop := false
 ; skips the chooser entirely: the CSV's rows are the batch — one pass per
 ; row, the workflow's remembered pause, Stop bar still up. Passing the
 ; workflow's own sheet as batchFile fills collected values into its rows.
+;
+; Returns the run's outcome as a string — "ok", "failed", "stopped",
+; "cancelled" or "error" — so LoopRunner.ahk can exit with a code that
+; means something. Before this it always exited 0, and a batch that died
+; halfway was indistinguishable from one that worked.
 RunWorkflowLoop(stepsFile, phrase, delayMs := 1500, batchFile := "") {
-    global wfLoopStop
+    global wfLoopStop, wfRunName, wfRunQuiet
     wfLoopStop := false
+    wfRunName := WfRunNameFromFile(stepsFile)
+    ; A headless batch has no one to dismiss a modal: failures are recorded
+    ; and tray-notified instead, so the process can actually exit and report.
+    wfRunQuiet := (batchFile != "")
 
-    if !FileExist(stepsFile) {
-        MsgBox("Workflow file not found:`n" stepsFile, "VoiceKit loop", "Iconx 262144")   ; 262144 = always-on-top
-        return
-    }
+    if !FileExist(stepsFile)
+        return WfLoopEarlyError("Workflow file not found: " stepsFile
+            , "Workflow file not found:`n" stepsFile)
     steps := WorkflowLoad(stepsFile)
-    if !steps.Length {
-        MsgBox("This workflow has no steps to loop.", "VoiceKit loop", "Icon! 262144")
-        return
-    }
+    if !steps.Length
+        return WfLoopEarlyError("This workflow has no steps to loop.", , "Icon!")
+    ; {{selected_file(s)}}: ONE snapshot for the whole loop, taken before the
+    ; chooser — every pass works on the same files, even if a pass opens
+    ; another Explorer window. The engine's per-pass check reuses it. (A
+    ; loop is its own fresh process, so nothing has been snapshotted yet —
+    ; unless the host pinned a selection on purpose, which is kept.)
+    if (serr := WfSelectionPrecheck(steps))
+        return WfLoopEarlyError(serr, , "Icon!")
 
     ; Workflows that ask for input: batch the answers up front (the
     ; workflow's inputs sheet, any CSV, or typed-in rows — one loop pass
@@ -80,17 +97,17 @@ RunWorkflowLoop(stepsFile, phrase, delayMs := 1500, batchFile := "") {
         try batchRows := WfLoopCsvRows(labels, FileRead(batchFile, "UTF-8"), &err)
         catch
             err := "Couldn't read the batch file:`n" batchFile
-        if !IsObject(batchRows) {
-            MsgBox("Can't run the batch.`n`n" err, "VoiceKit loop", "Iconx 262144")
-            return
-        }
+        if !IsObject(batchRows)
+            return WfLoopEarlyError(err, "Can't run the batch.`n`n" err)
         rows := batchRows
-        fromSheet := (StrLower(batchFile) = StrLower(sheetPath))
+        fromSheet := WfLoopIsOwnSheet(batchFile, sheetPath)
         delayMs := Round(Number(WfLoopDelayLoad(base)) * 1000)   ; the remembered pause
     } else if labels.Length {
         plan := WfLoopInputPlan(labels, phrase, base, sheetPath)
-        if !IsObject(plan)
-            return                               ; cancelled
+        if !IsObject(plan) {
+            WfRunRecordSimple(wfRunName, "cancelled", "Cancelled at the loop input chooser.")
+            return "cancelled"                   ; cancelled
+        }
         if (plan.mode = "rows") {
             rows := plan.rows
             fromSheet := plan.fromSheet          ; sheet rows get results written back beside them
@@ -99,6 +116,32 @@ RunWorkflowLoop(stepsFile, phrase, delayMs := 1500, batchFile := "") {
     }
     colLabels := WfCollectLabels(steps)
     results := []                                ; {src, ins, out} per completed pass that collected
+
+    ; Every completed pass that collected something is ALSO appended to a
+    ; journal on disk the moment it finishes, so a loop that never reaches
+    ; its own save below — replaced by another loop (#SingleInstance Force),
+    ; killed, crashed — leaves its rows behind instead of losing hours of
+    ; them. The save merges the journal's leftovers from dead runs of this
+    ; workflow too, and deletes a journal only once its rows landed. OnExit
+    ; covers the polite exits (a replacing loop, Exit from the tray).
+    journal := WfLoopJournalNew(base)
+    savedResults := false
+    SaveResults() {
+        savedResults := true
+        return WfLoopSaveResults(sheetPath, labels, colLabels, results, base, journal)
+    }
+    FlushOnExit(reason, code) {
+        if savedResults
+            return 0
+        try {
+            if (WfRunOutcome() != "failed")      ; mid-pass or between passes: it didn't finish
+                WfRunRecordUpdate(Map("outcome", "stopped"
+                    , "reason", "The loop was closed (" reason ") before it finished."))
+        }
+        try SaveResults()
+        return 0                                 ; never block the exit
+    }
+    OnExit(FlushOnExit)
 
     ; Make each pass abortable from the inside: the engine polls this
     ; between steps and inside its waits, so Stop cuts in mid-pass (a
@@ -124,6 +167,9 @@ RunWorkflowLoop(stepsFile, phrase, delayMs := 1500, batchFile := "") {
 
     i := 0
     ok := true
+    passes := 0                                  ; passes that actually completed
+    cancelled := false
+    loopStarted := A_Now                         ; the engine re-stamps per pass; this is the whole run
     loop {
         if wfLoopStop
             break
@@ -136,16 +182,22 @@ RunWorkflowLoop(stepsFile, phrase, delayMs := 1500, batchFile := "") {
         passVals := ""
         if (!IsObject(rows) && labels.Length) {
             passVals := WfGatherInputs(steps)
-            if !IsObject(passVals)
+            if !IsObject(passVals) {
+                cancelled := true
                 break                      ; cancelled an ask dialog — stop quietly
+            }
         }
         collected := Map()
         collected.CaseSense := false
         ok := RunWorkflowSteps(steps, IsObject(rows) ? rows[i] : passVals, collected)
-        if (ok && collected.Count)
+        if ok
+            passes += 1
+        if (ok && collected.Count) {
             results.Push({src: (fromSheet && rows[i].HasProp("srcRec")) ? rows[i].srcRec : 0
                 , ins: IsObject(rows) ? rows[i] : (IsObject(passVals) ? passVals : Map())
                 , out: collected})
+            WfLoopJournalAppend(journal, results[results.Length])
+        }
         if !ok                             ; a step failed (its popup already showed) or Stop cut the pass short
             break
         if (IsObject(rows) && i >= rows.Length)
@@ -156,26 +208,228 @@ RunWorkflowLoop(stepsFile, phrase, delayMs := 1500, batchFile := "") {
     wfRunAbortCheck := ""                  ; runs outside the loop are not abortable
     ; Save whatever the completed passes collected — even after a stop or a
     ; failed pass, the earlier rows' results are worth keeping.
-    resNote := "", resPath := ""
-    if results.Length {
-        r := WfSheetApplyResults(sheetPath, labels, colLabels, results)
-        resNote := (r.err = "") ? "Collected values saved to " r.name "." : r.err
-        resPath := r.err = "" ? r.path : ""
-    }
-    ; A loop that saved collected values ends with a voice-clickable offer
-    ; to open the file — completed batches and stopped-midway runs alike.
+    resNote := SaveResults()
+    OnExit(FlushOnExit, 0)
+
+    ; Finish the record the engine started for the last pass by adding what
+    ; only the loop knows: how many passes completed out of how many were
+    ; planned. The engine's own outcome already covers ok / failed / stopped
+    ; mid-pass; the two cases it can't see are a cancelled input dialog and a
+    ; Stop pressed during the pause BETWEEN passes.
+    if (cancelled)
+        WfRunRecordUpdate(Map("outcome", "cancelled"))
+    else if (wfLoopStop && WfRunOutcome() != "failed")
+        WfRunRecordUpdate(Map("outcome", "stopped"))
+    WfRunRecordUpdate(Map("passes_done", passes
+        , "passes_total", IsObject(rows) ? rows.Length : passes
+        , "collected_rows", results.Length
+        , "loop_started", loopStarted
+        , "loop_started_text", FormatTime(loopStarted, "yyyy-MM-dd HH:mm:ss")))
+    outcome := WfRunOutcome()
+
+    ; A finished loop reports on the TRAY, never with a dialog — batches and
+    ; user-driven loops alike. The run is recorded and logged by now
+    ; (logs\workflow-runs.ini / .log) and any collected values are already
+    ; saved, so a modal at the end said nothing new and had to be dismissed
+    ; before the user could get on with anything. It was also the reason a
+    ; headless batch could sit forever with its caller waiting on the process.
     if (IsObject(rows) && ok && !wfLoopStop && i >= rows.Length) {
         done := "Done — ran '" phrase "' for all " rows.Length " row" (rows.Length = 1 ? "" : "s") "."
-        if (resPath != "") {
-            if (MsgBox(done "`n`n" resNote "`n`nOpen it now?", "VoiceKit loop", "YesNo 262144") = "Yes")
-                WfLoopOpenFile(resPath)
-        } else
-            MsgBox(done (resNote != "" ? "`n`n" resNote : ""), "VoiceKit loop", "262144")
-    } else if (resPath != "") {
-        if (MsgBox(resNote "`n`nOpen it now?", "VoiceKit loop", "YesNo 262144") = "Yes")
-            WfLoopOpenFile(resPath)
+        WfTray(done (resNote != "" ? "`n" resNote : ""), "VoiceKit", "Iconi")
     } else if (resNote != "")
-        TrayTip(resNote, "VoiceKit", "Iconi")
+        WfTray(resNote, "VoiceKit", "Iconi")
+    return outcome
+}
+
+; A loop that can't start: record it FIRST (whoever launched a headless
+; batch reads the record, and a popup blocks), then tell the user — on the
+; tray for a headless batch (wfRunQuiet: nobody may be there, and a modal
+; would hold the process open so it never exits with its code), a dialog
+; otherwise. Returns "error", so callers can `return WfLoopEarlyError(...)`.
+WfLoopEarlyError(reason, popup := "", icon := "Iconx") {
+    global wfRunName, wfRunQuiet
+    WfRunRecordSimple(wfRunName, "error", reason)
+    msg := popup != "" ? popup : reason
+    if wfRunQuiet
+        WfTray(WfOneLine(msg, 200), "VoiceKit loop", icon)
+    else
+        MsgBox(msg, "VoiceKit loop", icon " 262144")      ; 262144 = always-on-top
+    return "error"
+}
+
+; ------------------------------------------------------------
+;  The results journal — collected values that survive a loop
+;  which never reaches its own save (replaced, killed, crashed).
+;
+;  One file per loop run: <logs>\loop-journal\<Base>.<stamp>-<pid>.jnl,
+;  one line per completed pass that collected something:
+;      src|<nIns>|<nOut>|in-label|in-value|...|out-label|out-value|...
+;  every field WfEncode'd (so | % and newlines survive). Lives under
+;  the logs folder (WfLogDir — the self-tests redirect it), never
+;  beside the workflow, so it isn't mistaken for user data.
+; ------------------------------------------------------------
+WfLoopJournalDir() => WfLogDir() "\loop-journal"
+
+WfLoopJournalNew(base) {
+    return WfLoopJournalDir() "\" base "." A_Now "-" DllCall("GetCurrentProcessId", "uint") ".jnl"
+}
+
+; Append one pass's {src, ins, out}. Never throws — a journal hiccup must not
+; be what stops the loop (the in-memory copy still gets saved at the end).
+WfLoopJournalAppend(path, r) {
+    try {
+        line := WfEncode(r.src) "|" r.ins.Count "|" r.out.Count
+        for k, v in r.ins
+            line .= "|" WfEncode(k) "|" WfEncode(v)
+        for k, v in r.out
+            line .= "|" WfEncode(k) "|" WfEncode(v)
+        SplitPath(path, , &dir)
+        if !DirExist(dir)
+            DirCreate(dir)
+        loop 5 {
+            try {
+                FileAppend(line "`n", path, "UTF-8")
+                return true
+            }
+            Sleep(50)
+        }
+    }
+    return false
+}
+
+; A journal file back into results ([{src, ins, out}, ...]). Malformed lines
+; (a write cut off by a hard kill) are skipped rather than trusted.
+WfLoopJournalRead(path) {
+    out := []
+    txt := ""
+    try txt := FileRead(path, "UTF-8")
+    Loop Parse txt, "`n", "`r" {
+        if (A_LoopField = "")
+            continue
+        f := StrSplit(A_LoopField, "|")
+        if (f.Length < 3 || !IsInteger(f[2]) || !IsInteger(f[3]))
+            continue
+        nIn := Integer(f[2]), nOut := Integer(f[3])
+        if (f.Length != 3 + 2 * (nIn + nOut))
+            continue
+        ins := Map(), outs := Map()
+        ins.CaseSense := false, outs.CaseSense := false
+        idx := 4
+        loop nIn {
+            ins[WfDecode(f[idx])] := WfDecode(f[idx + 1])
+            idx += 2
+        }
+        loop nOut {
+            outs[WfDecode(f[idx])] := WfDecode(f[idx + 1])
+            idx += 2
+        }
+        src := WfDecode(f[1])
+        out.Push({src: IsInteger(src) ? Integer(src) : 0, ins: ins, out: outs})
+    }
+    return out
+}
+
+; Journals of this workflow left behind by loops that are no longer running
+; (a live process's journal is its own business). Oldest first.
+WfLoopJournalOrphans(base, own) {
+    found := []
+    try {
+        Loop Files WfLoopJournalDir() "\" base ".*.jnl" {
+            if (A_LoopFileFullPath = own)
+                continue
+            if !RegExMatch(A_LoopFileName, "i)^\Q" base "\E\.\d{14}-(\d+)\.jnl$", &m)
+                continue
+            pid := Integer(m[1])
+            if (pid != DllCall("GetCurrentProcessId", "uint") && ProcessExist(pid))
+                continue
+            found.Push(A_LoopFileFullPath)
+        }
+    }
+    return found
+}
+
+; Save this run's results plus any orphaned journals' into the sheet (or its
+; .results.csv fallback). Journals are deleted only once their rows have
+; landed somewhere; if nothing could be written they stay for the next save.
+; Returns the tray note ("" when there was nothing to save).
+;
+; NEWER RESULTS WIN. The usual way to recover from a crashed sheet loop is to
+; run it from the sheet again, so a leftover journal's row and this run's row
+; are often the same row. The row-filling results (src > 1) therefore go to
+; WfSheetApplyResults newest first — this run's, then the leftovers from the
+; newest journal/line back — so the newest one claims the row, and a leftover
+; is marked `old`: when its row is already taken it is DROPPED, never
+; appended (appending would duplicate the inputs, and the next "Run from my
+; sheet" would run that row twice). Appended rows (src = 0) keep their
+; chronological order, leftovers first.
+WfLoopSaveResults(sheetPath, labels, colLabels, results, base, journal) {
+    old := [], merged := []
+    for f in WfLoopJournalOrphans(base, journal) {
+        rs := WfLoopJournalRead(f)
+        for x in rs {
+            x.old := true
+            old.Push(x)
+        }
+        merged.Push(f)
+    }
+    all := []
+    for x in results
+        if (x.src > 1)
+            all.Push(x)
+    loop old.Length {
+        x := old[old.Length - A_Index + 1]
+        if (x.src > 1)
+            all.Push(x)
+    }
+    for x in old
+        if !(x.src > 1)
+            all.Push(x)
+    for x in results
+        if !(x.src > 1)
+            all.Push(x)
+    if !all.Length {
+        for f in merged                          ; empty leftovers: nothing to keep
+            try FileDelete(f)
+        try FileDelete(journal)
+        return ""
+    }
+    ; A leftover journal may carry columns this version of the workflow no
+    ; longer has — keep them rather than drop what was collected.
+    ins := WfLoopLabelUnion(labels, all, "ins")
+    outs := WfLoopLabelUnion(colLabels, all, "out")
+    r := WfSheetApplyResults(sheetPath, ins, outs, all)
+    if (r.err != "")
+        return r.err " (Kept in logs\loop-journal — they'll be saved next time this loop runs.)"
+    for f in merged
+        try FileDelete(f)
+    try FileDelete(journal)
+    note := "Collected values saved to " r.name "."
+    kept := old.Length - r.skipped
+    if (kept > 0)
+        note .= " (Including " kept " row(s) an interrupted earlier loop left behind.)"
+    if (r.skipped > 0)
+        note .= " (" r.skipped " older value(s) from an interrupted loop were replaced by this run's.)"
+    return note
+}
+
+; labels, plus any key the results' `which` Maps carry that it doesn't
+; (case-insensitive), in first-seen order.
+WfLoopLabelUnion(labels, results, which) {
+    seen := Map()
+    seen.CaseSense := false
+    out := []
+    for l in labels
+        if !seen.Has(l) {
+            seen[l] := true
+            out.Push(l)
+        }
+    for r in results
+        for k in r.%which%
+            if !seen.Has(k) {
+                seen[k] := true
+                out.Push(k)
+            }
+    return out
 }
 
 ; Open a CSV in its default app (Excel if present), falling back to
@@ -290,7 +544,7 @@ WfLoopInputPlan(labels, phrase, base, sheetPath) {
     }
     SheetEdit(*) {
         if !FileExist(sheetPath) {
-            try WfLoopSheetCreate(sheetPath, labels)
+            try WfSheetWrite(sheetPath, [labels])   ; header row only: one column per input
             catch as e {
                 MsgBox("Couldn't create the sheet:`n" e.Message, "VoiceKit loop", "Iconx Owner" dh)
                 return
@@ -350,6 +604,10 @@ WfLoopInputPlan(labels, phrase, base, sheetPath) {
 ; [Map(label->answer),...] or "" if cancelled / invalid (the problem is
 ; explained, chooser stays up).
 WfLoopImportCsv(labels, owner) {
+    ; Owned by the chooser: it is AlwaysOnTop, and an unowned file dialog
+    ; opens UNDER it, partly covered (the Studio's dialog-ownership trap).
+    ; +OwnDialogs is per-thread, so it affects only this handler's dialogs.
+    owner.Opt("+OwnDialogs")
     f := FileSelect(1, , "Pick the CSV file", "CSV / text (*.csv; *.txt)")
     if (f = "")
         return ""
@@ -364,6 +622,16 @@ WfLoopImportCsv(labels, owner) {
     if !IsObject(rows)
         MsgBox(err, "VoiceKit loop", "Icon! Owner" owner.Hwnd)
     return rows
+}
+
+; Is a headless batch file the workflow's own inputs sheet (so collected
+; values go back beside each row instead of being appended)? Compared as
+; FULL paths: LoopRunner spells the steps file "<root>\lib\..\workflows\...",
+; so the plain string compare this replaced never matched the MCP's
+; canonical path, and an own-sheet batch silently appended a copy of every
+; row instead of filling them in (measured, 2026-09-30).
+WfLoopIsOwnSheet(batchFile, sheetPath) {
+    return StrLower(WfFullPath(batchFile)) = StrLower(WfFullPath(sheetPath))
 }
 
 ; Turn CSV text into loop rows. The header row must name every ask label
@@ -426,17 +694,6 @@ WfLoopCsvRows(labels, text, &err) {
         return ""
     }
     return rows
-}
-
-; Create a workflow's inputs sheet: just the header row, one column per
-; input. UTF-8 BOM + CRLF so Excel opens it cleanly.
-WfLoopSheetCreate(path, labels) {
-    line := ""
-    for l in labels
-        line .= (A_Index > 1 ? "," : "") WfCsvField(l)   ; quoting lives in Workflow.ahk now
-    f := FileOpen(path, "w", "UTF-8")
-    f.Write(line "`r`n")
-    f.Close()
 }
 
 ; ---- the pause between runs, remembered per workflow ----

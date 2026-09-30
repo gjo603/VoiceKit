@@ -69,16 +69,29 @@ AccChildren(acc) {
         return kids
     stride := 8 + 2 * A_PtrSize             ; sizeof(VARIANT)
     buf := Buffer(stride * cnt, 0)
-    if DllCall("oleacc\AccessibleChildren", "ptr", ComObjValue(acc), "int", 0, "int", cnt, "ptr", buf, "int*", &got := 0) != 0
+    ; Only a NEGATIVE HRESULT is a failure. S_FALSE (1) means "fewer children
+    ; than you asked for" — routine when a container's accChildCount is stale
+    ; or overstated (dynamic lists, lazily built trees) — and the `got` it did
+    ; return are real. Treating S_FALSE as failure dropped the whole subtree
+    ; ("Couldn't find anything named ...") and leaked every child it handed us.
+    hr := DllCall("oleacc\AccessibleChildren", "ptr", ComObjValue(acc), "int", 0, "int", cnt, "ptr", buf, "int*", &got := 0, "int")
+    if (hr < 0)
         return kids
-    Loop got {
+    Loop Min(got, cnt) {
         off := stride * (A_Index - 1)
         vt := NumGet(buf, off, "ushort")
         if (vt = 9) {                       ; VT_DISPATCH: an object child
+            ; ComObjFromPtr takes over the reference AccessibleChildren gave us
+            ; (no AddRef), so the wrapper's release is the one release it needs.
             if (p := NumGet(buf, off + 8, "ptr"))
                 kids.Push({acc: ComObjFromPtr(p), child: 0})
         } else if (vt = 3) {                ; VT_I4: simple element of same parent
             kids.Push({acc: acc, child: NumGet(buf, off + 8, "int")})
+        } else if (vt != 0) {
+            ; Anything else holds nothing we wrap, but may still own a resource
+            ; (a BSTR, an unexpected interface) — clear it rather than leak it.
+            ; oleaut32 is a system DLL AutoHotkey itself keeps loaded.
+            DllCall("oleaut32\VariantClear", "ptr", buf.Ptr + off)
         }
     }
     return kids
@@ -154,6 +167,132 @@ AccValueByName(hwnd, name, budgetMs := 3000) {
             return {found: foundEmpty, value: ""}
         Sleep(250)
     }
+}
+
+; True if `needle` appears anywhere in the window's accessible tree — a
+; case-insensitive SUBSTRING of any element's name or value.
+;
+; This is the "did the search actually return anything?" test. AccFindByName
+; needs the EXACT accessible name, which for a result row or a status message
+; is usually unknowable; the words on screen are not. Same walk limits as
+; AccNodeOnce (depth 14, 6000 nodes, honours the deadline) so a browser's
+; huge tree can't stall a run.
+AccTextOnce(hwnd, needle, deadline) {
+    AccPin()
+    if DllCall("oleacc\AccessibleObjectFromWindow", "ptr", hwnd, "uint", 0xFFFFFFFC   ; OBJID_CLIENT
+        , "ptr", AccIID(), "ptr*", &p := 0) != 0 || !p
+        return false
+    stack := [{acc: ComObjFromPtr(p), child: 0, depth: 0}]
+    visited := 0
+    while stack.Length {
+        if (A_TickCount > deadline || ++visited > 6000)
+            return false
+        node := stack.Pop()
+        ; InStr is case-insensitive by default in v2 — deliberate here: the
+        ; author types what they saw, not what the app capitalised.
+        if InStr(AccName(node.acc, node.child), needle)
+            return true
+        if InStr(AccValue(node.acc, node.child), needle)
+            return true
+        if (node.child = 0 && node.depth < 14) {
+            for kid in AccChildren(node.acc)
+                stack.Push({acc: kid.acc, child: kid.child, depth: node.depth + 1})
+        }
+    }
+    return false
+}
+
+; AccTextOnce, retried until ~budgetMs so late-rendering content counts.
+AccTextPresent(hwnd, text, budgetMs := 700) {
+    text := Trim(text)
+    if (text = "")
+        return false
+    deadline := A_TickCount + budgetMs
+    loop {
+        if AccTextOnce(hwnd, text, deadline)
+            return true
+        if (A_TickCount > deadline)
+            return false
+        Sleep(150)
+    }
+}
+
+; ---- input boxes (the `fill` step's MSAA fallback) -----------------------
+; MSAA roles/states used below (oleacc.h).
+ACC_ROLE_TEXT()        => 42      ; ROLE_SYSTEM_TEXT — an editable text box
+ACC_ROLE_COMBOBOX()    => 46
+ACC_ROLE_SPINBUTTON()  => 52
+ACC_STATE_UNAVAILABLE()=> 0x1     ; disabled
+ACC_STATE_FOCUSED()    => 0x4
+ACC_STATE_PROTECTED()  => 0x20000000   ; a password box
+
+AccRole(acc, child := 0) {
+    try return Integer(acc.accRole[child])
+    catch
+        return 0
+}
+
+AccState(acc, child := 0) {
+    try return Integer(acc.accState[child])
+    catch
+        return 0
+}
+
+; The window an accessible object belongs to (0 if oleacc can't say).
+AccWindowOf(acc) {
+    AccPin()
+    try {
+        if DllCall("oleacc\WindowFromAccessibleObject", "ptr", ComObjValue(acc), "ptr*", &h := 0) = 0
+            return h
+    }
+    return 0
+}
+
+; Every visible INPUT named `name` in the window, in TREE ORDER (so "the 2nd
+; box labelled Amount" means the same thing it does on screen): editable text
+; (ROLE_SYSTEM_TEXT), combo boxes and spin buttons — never the label that
+; shares the name (oleacc names a Win32 edit after the static before it, so
+; the role is the only thing that tells them apart). Same walk limits as
+; AccNodeOnce (depth 14, 6000 nodes, the deadline). Returns [{acc, child, loc}].
+AccInputNodes(hwnd, name, deadline, maxItems := 30) {
+    AccPin()
+    out := []
+    if DllCall("oleacc\AccessibleObjectFromWindow", "ptr", hwnd, "uint", 0xFFFFFFFC   ; OBJID_CLIENT
+        , "ptr", AccIID(), "ptr*", &p := 0) != 0 || !p
+        return out
+    name := Trim(name)
+    ; inBox: inside an input already counted — a Win32 combo box's own edit
+    ; carries the combo's name too, and one box must count once.
+    stack := [{acc: ComObjFromPtr(p), child: 0, depth: 0, inBox: false}]
+    visited := 0
+    while stack.Length {
+        if (A_TickCount > deadline || ++visited > 6000)
+            return out
+        node := stack.Pop()
+        isBox := false
+        if (!node.inBox && AccName(node.acc, node.child) = name) {
+            role := AccRole(node.acc, node.child)
+            if (role = ACC_ROLE_TEXT() || role = ACC_ROLE_COMBOBOX() || role = ACC_ROLE_SPINBUTTON()) {
+                loc := AccLocation(node.acc, node.child)
+                if IsObject(loc) {
+                    isBox := true
+                    out.Push({acc: node.acc, child: node.child, loc: loc})
+                    if (out.Length >= maxItems)
+                        return out
+                }
+            }
+        }
+        if (node.child = 0 && node.depth < 14) {
+            kids := AccChildren(node.acc)
+            i := kids.Length                 ; pushed in reverse, so they POP in tree order
+            while (i >= 1) {
+                stack.Push({acc: kids[i].acc, child: kids[i].child, depth: node.depth + 1
+                    , inBox: node.inBox || isBox})
+                i -= 1
+            }
+        }
+    }
+    return out
 }
 
 AccIID() {

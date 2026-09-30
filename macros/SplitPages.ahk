@@ -16,21 +16,30 @@
 ;  is missing, a one-time install is offered (your consent first).
 ;
 ;  Testing hook: SplitPages.ahk <file.pdf> [nopreview] skips the
-;  Explorer-selection lookup (and the viewer) — used by the
-;  automated test, harmless otherwise.
+;  Explorer-selection lookup (and the viewer), so it can be tried
+;  on a fixture file — e.g. MCP run_automation(args=[...]). No
+;  test suite exercises it yet; harmless otherwise.
 ; ============================================================
 #Include "%A_ScriptDir%\..\lib\_Common.ahk"
 #Include "%A_ScriptDir%\..\lib\Theme.ahk"
+#Include "%A_ScriptDir%\..\lib\ExplorerSel.ahk"
 
 root := RegExReplace(A_ScriptDir, "\\[^\\]+$")
-EnsureSplitShortcut()
+EnsureVoiceShortcut(VoiceShortcutName("SplitPages"), A_ScriptFullPath)   ; self-heal "open split pages"
 
 noPreview := (A_Args.Length >= 2 && A_Args[2] = "nopreview")
-src := (A_Args.Length >= 1) ? A_Args[1] : ExplorerSelectedFile()
-if (src = "") {
+; The file: an argument (testing), else THE file selected in the front-most
+; File Explorer window's active tab (lib\ExplorerSel.ahk — tab-correct).
+sel := (A_Args.Length >= 1) ? [A_Args[1]] : ExplorerSelectedFiles()
+if (sel.Length = 0) {
     InfoDialog("Nothing selected", "Click the document in File Explorer first, then say `"open split pages`".")
     ExitApp()
 }
+if (sel.Length > 1) {                        ; never guess which one was meant
+    InfoDialog("One document at a time", sel.Length " files are selected. Select just the one PDF to split, then say `"open split pages`" again.")
+    ExitApp()
+}
+src := sel[1]
 if !FileExist(src) {
     InfoDialog("File not found", src)
     ExitApp()
@@ -110,14 +119,9 @@ PageDialog(i, n, today) {
     btnStop.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ThemeApply(d)
-    ThemeDim(hint)
-    ThemeDim(ex)
-    hwnd := d.Hwnd
-    ShowBottomRight(d)                       ; corner placement — never covers the page
-    try WinActivate("ahk_id " hwnd)          ; focused over the just-opened viewer
-    try edDesc.Focus()                       ; caret ready (try: a voice click can
-    WinWaitClose("ahk_id " hwnd)             ; destroy the dialog before this line)
+    ; Corner placement — never covers the page; activated over the
+    ; just-opened viewer with the caret ready in the description box.
+    ThemeShowModal(d, 0, [hint, ex], edDesc, ShowBottomRight)
     return state
 }
 
@@ -159,22 +163,12 @@ ClosePreview(i) {
 ; the window may be gone while the process still holds the file for another
 ; beat (Acrobat especially), and a rename is blocked while ANY handle without
 ; delete-sharing is open — so runs started throwing once closes lagged.
-; Retry briefly; if the lock outlives that, fall back to copying (a viewer's
-; read lock blocks renaming, not reading) and let the end-of-run temp
-; cleanup collect the original instead.
+; The retry-then-copy dance now lives in _Common.ahk as RobustMove (this
+; race belongs to every "move a file an app just touched" flow, not just
+; this one); a "copied" result leaves the temp original for the end-of-run
+; cleanup, which is exactly what the old inline fallback did.
 SavePage(pageFile, target) {
-    Loop 8 {
-        try {
-            FileMove(pageFile, target)
-            return true
-        }
-        Sleep(150)
-    }
-    try {
-        FileCopy(pageFile, target)
-        return true
-    }
-    return false
+    return RobustMove(pageFile, target) != ""
 }
 
 ; Shown only when SavePage gave up — the page (or the destination folder)
@@ -194,10 +188,7 @@ RetrySaveDialog(i) {
     btnSkip.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ThemeApply(d)
-    hwnd := d.Hwnd
-    d.Show()
-    WinWaitClose("ahk_id " hwnd)
+    ThemeShowModal(d)
     return retry
 }
 
@@ -209,17 +200,20 @@ RetrySaveDialog(i) {
 SplitPdf(src, outDir) {
     global root
     Loop 2 {                                 ; second pass = retry after install
-        out := RunCapture(A_ComSpec ' /c python "' root '\lib\split_pdf.py" "' src '" "' outDir '"')
-        if IsInteger(out)
-            return Integer(out)
+        out := RunCapture(ComSpecPath() ' /c python "' root '\lib\split_pdf.py" "' src '" "' outDir '"')
+        count := LastIntLine(out)
+        if (count != "")
+            return Integer(count)
         if InStr(out, "NEEDS_PYPDF") {
             if (A_Index = 2)
                 break
             if !OfferInstall()
                 return ""
-            RunCapture(A_ComSpec ' /c python -m pip install pypdf')
+            RunCapture(ComSpecPath() ' /c python -m pip install pypdf')
             continue
         }
+        if InStr(out, "Couldn't run the command")    ; a failed launch, not a missing Python
+            break
         if (InStr(out, "not recognized") || InStr(out, "not found")) {
             InfoDialog("Python is needed", "Split Pages needs Python 3 (free, python.org). Install it, then try again.")
             return ""
@@ -230,11 +224,30 @@ SplitPdf(src, outDir) {
     return ""
 }
 
+; The splitter prints the page count as its final stdout line — but
+; RunCapture merges stderr into the same file, and a pypdf warning can land
+; before OR after the count (stderr is unbuffered; redirected stdout is
+; block-buffered). So the answer is the LAST line that is purely an integer.
+; IsInteger() on the whole merged blob meant one warning turned a successful
+; split into an error dialog.
+LastIntLine(s) {
+    ans := ""
+    Loop Parse s, "`n", "`r" {
+        if (Trim(A_LoopField) != "" && IsInteger(Trim(A_LoopField)))
+            ans := Trim(A_LoopField)
+    }
+    return ans
+}
+
 ; Run a console command hidden; return its combined output, trimmed.
+; A launch that fails outright (no command interpreter) comes back as text
+; the caller's error dialog shows, instead of an uncaught throw.
 RunCapture(cmd) {
     outFile := A_Temp "\vk_split_out.txt"
     try FileDelete(outFile)
-    RunWait(cmd ' > "' outFile '" 2>&1', , "Hide")
+    try RunWait(cmd ' > "' outFile '" 2>&1', , "Hide")
+    catch as e
+        return "Couldn't run the command: " e.Message
     return FileExist(outFile) ? Trim(FileRead(outFile, "UTF-8"), " `t`r`n") : ""
 }
 
@@ -253,10 +266,7 @@ OfferInstall() {
     btnNo.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ThemeApply(d)
-    hwnd := d.Hwnd
-    d.Show()
-    WinWaitClose("ahk_id " hwnd)
+    ThemeShowModal(d)
     return ok
 }
 
@@ -275,36 +285,5 @@ InfoDialog(title, text) {
     b.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
     d.OnEvent("Escape", (*) => d.Destroy())
-    ThemeApply(d)
-    hwnd := d.Hwnd
-    d.Show()
-    WinWaitClose("ahk_id " hwnd)
-}
-
-; Path of the file selected in the topmost File Explorer window, or "".
-ExplorerSelectedFile() {
-    shell := ""
-    try shell := ComObject("Shell.Application")
-    if !IsObject(shell)
-        return ""
-    for hwnd in WinGetList("ahk_class CabinetWClass") {   ; z-order: topmost first
-        try {
-            for w in shell.Windows {
-                if (w.HWND != hwnd)
-                    continue
-                items := w.Document.SelectedItems()
-                if (items.Count >= 1)
-                    return items.Item(0).Path
-            }
-        }
-    }
-    return ""
-}
-
-; Self-heal the Start Menu entry so "open split pages" always works.
-EnsureSplitShortcut() {
-    vmDir := A_Programs "\Voice Macros"
-    EnsureDir(vmDir)
-    if !FileExist(vmDir "\Split Pages.lnk")
-        MakeAhkShortcut(vmDir "\Split Pages.lnk", A_ScriptFullPath)
+    ThemeShowModal(d)
 }

@@ -44,9 +44,14 @@ Voice Access and auto-start). Then they say *open voice kit*.
 | `bootstrap.cmd` | the `.exe`'s post-extract step; delegates to `Install-VoiceKit.cmd` |
 
 The build packages **git-tracked files plus your uncommitted edits to them**, then
-drops dev-only files (`build\`, `CLAUDE.md`, `.gitignore`, `.gitattributes`) and
-the legacy `Setup.bat` (it does a fragile in-place install; the package uses
-`Install-VoiceKit.cmd`). Staging from git means **untracked personal automations
+drops dev-only files (`build\`, `CLAUDE.md`, `docs\`, `tests\`, `.gitignore`,
+`.gitattributes`) and the legacy `Setup.bat` (it does a fragile in-place install;
+the package uses `Install-VoiceKit.cmd`). The per-user files (`bridge-map.txt`,
+`hotkeys\_index.ahk`, `hotkeys\Snippets.ahk`) are gitignored and never ship —
+only their committed `*.default` versions do, and VoiceKit makes the live copies on
+first start (and adds newly shipped hotkeys to them on an upgrade). Before zipping,
+the build seeds a throwaway copy of those files in the stage and load-checks the
+staged `VoiceKit.ahk`; a master that wouldn't start aborts the build. Staging from git means **untracked personal automations
 never leak into a package you send** — so **commit new files** (e.g. a new `lib`
 script) before building, or the sanity check will stop the build. `dist\`,
 `logs\`, the MCP `.venv` and `__pycache__` are gitignored and never included.

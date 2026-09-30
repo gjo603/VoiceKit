@@ -1,1 +1,4 @@
 fastmcp>=2.9,<4
+# Only for run_workflow_batch(source=<.xlsx>): imported lazily, so CSV batches
+# and every other tool work without it. Verified with 3.1.5.
+openpyxl>=3.1,<4

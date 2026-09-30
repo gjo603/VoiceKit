@@ -31,8 +31,11 @@ if exist "%~dp0logs\installed.flag" del "%~dp0logs\installed.flag"
 :: Launch VoiceKit through the v2 interpreter directly. Do NOT rely on
 :: the .ahk file association here: on a machine migrated from an old PC
 :: it may open .ahk in an editor, which would silently skip setup.
+:: Target the launcher, not VoiceKit.ahk: it load-checks first and parks
+:: any module that won't compile, so one bad file can't leave the machine
+:: with no hotkeys and no snippets.
 echo  Starting VoiceKit...
-start "" "%ProgramFiles%\AutoHotkey\v2\AutoHotkey64.exe" "%~dp0VoiceKit.ahk"
+start "" "%ProgramFiles%\AutoHotkey\v2\AutoHotkey64.exe" "%~dp0VoiceKitLauncher.ahk"
 
 echo.
 echo  Done! VoiceKit is running.
