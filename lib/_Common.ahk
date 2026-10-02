@@ -356,6 +356,12 @@ ErrorLogAppend(line, root := "") {
 }
 
 LogUncaughtError(err, mode) {
+    ; A test run (run_automation test=True): lib\TestShim.ahk reports what is
+    ; still uncaught once the macro's own handlers have had their say -- an
+    ; error a macro handles itself is not an error there -- and none of it
+    ; belongs in the user's errors.log.
+    if VkTestMode()
+        return 0
     ErrorLogAppend(ErrorLogLine(err))
     return 0            ; observe only — dialogs and later handlers proceed
 }
@@ -488,6 +494,128 @@ VkDeleteProtected(base) {
         if (t = base)
             return true
     return false
+}
+
+; ============================================================
+;  A macro's RESULT, for whoever ran it -- and test mode (2026-10-01)
+;
+;  A launched macro has no console, so FileAppend(x, "*") used to
+;  crash it ("no stdout") and there was no standard way to hand a
+;  value back to the MCP's run_automation. Now:
+;
+;    VkResult(value)   one record per call, in call order, to the
+;        file named by %VOICEKIT_RESULT_FILE% -- run_automation sets it
+;        for every run it waits on (wait_seconds > 0, and test=True) and
+;        returns the values as its `result` list. Unset (a voice run, a
+;        fire-and-forget run): does NOTHING and returns false, so a
+;        macro calls it unconditionally. Returns true when recorded.
+;        Each record is one line of JSON, so a value holding newlines
+;        survives: text -> a string, Integer/Float -> a number (inf/nan
+;        as text), Array -> a list, Map / plain {..} object -> an object
+;        (keys as text), nested up to 20 levels. Anything else (a Func,
+;        a Gui, a COM object...) throws a TypeError naming its type --
+;        only while a result file is set, so a voice run can never fail
+;        on a result call. A write blocked by another reader (AV, an
+;        indexer) is retried for ~1 s, then throws: a result that
+;        silently vanished would read as "the macro returned nothing".
+;        A result file whose folder is gone (the run that asked for it
+;        has ended) is a no-op too, never a throw.
+;
+;    VkTestMode()      true when %VOICEKIT_TEST% is "1" -- set by
+;        run_automation(test=True), which also loads lib\TestShim.ahk
+;        (MsgBox/TrayTip/InputBox/ToolTip logged, not shown). A macro
+;        can skip a real side effect (sending the email, moving the
+;        file) when it is being tested.
+;
+;  Both act ONLY in the script the run launched: %VOICEKIT_RUN_SCRIPT%
+;  holds its full path and must name A_ScriptFullPath (VkRunScoped).
+;  AutoHotkey's Run() hands the environment to every child, so without
+;  that a macro the tested macro started -- or a master reloaded from a
+;  Home window a waited run opened, and every macro THAT launched later
+;  -- reported into a run folder deleted when the run ended (VkResult
+;  threw: an error dialog on a voice run), or believed it was under
+;  test and skipped its real work (found in review, 2026-10-01).
+; ============================================================
+VkTestMode() => EnvGet("VOICEKIT_TEST") = "1" && VkRunScoped()
+
+; Are the run variables for THIS script? (see above)
+VkRunScoped() {
+    want := EnvGet("VOICEKIT_RUN_SCRIPT")
+    return want != "" && VkLongPath(want) = VkLongPath(A_ScriptFullPath)
+}
+
+; A path as a full long-name path, so a short (8.3) or relative spelling
+; of the same file compares equal -- with =, which is caseless.
+VkLongPath(p) {
+    buf := Buffer(65536)
+    if DllCall("GetFullPathNameW", "Str", p, "UInt", 32768, "Ptr", buf, "Ptr", 0, "UInt")
+        p := StrGet(buf)
+    if DllCall("GetLongPathNameW", "Str", p, "Ptr", buf, "UInt", 32768, "UInt")
+        p := StrGet(buf)
+    return p
+}
+
+VkResult(value) {
+    path := EnvGet("VOICEKIT_RESULT_FILE")
+    if (path = "" || !VkRunScoped())
+        return false
+    SplitPath(path, , &dir)
+    if (dir = "" || !DirExist(dir))
+        return false        ; the run that asked for it has ended and taken its folder
+    line := VkResultJson(value) "`n"
+    loop 20 {
+        try {
+            FileAppend(line, path, "UTF-8-RAW")
+            return true
+        }
+        if !DirExist(dir)
+            return false
+        Sleep(50)
+    }
+    throw Error("VkResult couldn't write its result file (another program kept it locked): " path, -1)
+}
+
+; One value as JSON (see VkResult for what is accepted).
+VkResultJson(v, depth := 0) {
+    if (depth > 20)
+        throw ValueError("VkResult: the value is nested more than 20 levels deep (does it contain itself?).", -1)
+    if (v is Integer)
+        return String(v)
+    if (v is Float) {
+        s := String(v)
+        return RegExMatch(s, "i)^-?\d+(\.\d+)?(e[+-]?\d+)?$") ? s : VkResultStr(s)
+    }
+    if (v is String)
+        return VkResultStr(v)
+    acc := ""
+    if (v is Array) {
+        for x in v
+            acc .= (A_Index > 1 ? "," : "") (IsSet(x) ? VkResultJson(x, depth + 1) : "null")
+        return "[" acc "]"
+    }
+    if (v is Map) {
+        for k, x in v
+            acc .= (A_Index > 1 ? "," : "") VkResultStr(String(k)) ":" VkResultJson(x, depth + 1)
+        return "{" acc "}"
+    }
+    if (Type(v) = "Object") {
+        for k, x in v.OwnProps()
+            acc .= (A_Index > 1 ? "," : "") VkResultStr(k) ":" VkResultJson(x, depth + 1)
+        return "{" acc "}"
+    }
+    throw TypeError("VkResult takes text, a number, an Array, a Map or a plain {...} object -- not a "
+        . Type(v) ".", -1)
+}
+
+VkResultStr(s) {
+    s := StrReplace(s, "\", "\\")
+    s := StrReplace(s, '"', '\"')
+    s := StrReplace(s, "`r", "\r")
+    s := StrReplace(s, "`n", "\n")
+    s := StrReplace(s, "`t", "\t")
+    while RegExMatch(s, "[\x01-\x1F]", &m)
+        s := StrReplace(s, m[0], Format("\u{:04X}", Ord(m[0])))
+    return '"' s '"'
 }
 
 ; ============================================================

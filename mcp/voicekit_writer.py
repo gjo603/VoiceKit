@@ -12,6 +12,7 @@ the docstrings); the conformance test is what enforces that.
 
 from __future__ import annotations
 
+import contextvars
 import csv
 import functools
 import hashlib
@@ -20,11 +21,13 @@ import itertools
 import json
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import privacy
@@ -966,18 +969,25 @@ def _explain_ahk_error(text: str, code: str | None = None, script: Path | str | 
     return text.rstrip() + "\n" + "\n".join(hints)
 
 
-def _ahk_processes() -> list:
-    """Every process running OUR interpreter (basename of AHK_EXE — honors
-    the VOICEKIT_AHK override, e.g. a UIA build): [{pid, cmd, started}].
+def _cim_processes(where: str = "") -> list:
+    """Running processes from ONE Win32_Process query (PowerShell CIM):
+    [{pid, ppid, name, cmd, started}], optionally narrowed by a WQL `where`
+    (e.g. "Name = 'AutoHotkey64.exe'"). `started` is yyyyMMddHHmmss ("" when
+    Windows didn't say). [] when the query itself fails.
 
-    The one Win32_Process query in this module. There used to be three, with
-    drifting rules (one hard-coded AutoHotkey64.exe and ignored the override,
-    one matched an unanchored pattern); callers now filter these rows in
-    Python. `started` is yyyyMMddHHmmss ("" when Windows didn't say)."""
-    exe = os.path.basename(AHK_EXE).replace("'", "''")
+    The one process-listing mechanism in this module: _ahk_processes,
+    _python_processes and list_processes are filters over it. There used to
+    be three hand-written queries with drifting rules (one hard-coded
+    AutoHotkey64.exe and ignored the override, one matched an unanchored
+    pattern). Output is forced to UTF-8: PowerShell writes the console's OEM
+    code page otherwise, which turned an accented client name in a command
+    line into mojibake."""
+    filt = (" -Filter \"" + where + "\"") if where else ""
     cmd = (
-        "$list = Get-CimInstance Win32_Process -Filter \"Name = '" + exe + "'\" | "
-        "ForEach-Object { @{pid = $_.ProcessId; cmd = $_.CommandLine; "
+        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); "
+        "$list = Get-CimInstance Win32_Process" + filt + " | "
+        "ForEach-Object { @{pid = $_.ProcessId; ppid = $_.ParentProcessId; name = $_.Name; "
+        "cmd = $_.CommandLine; "
         "started = $(if ($_.CreationDate) { $_.CreationDate.ToString('yyyyMMddHHmmss') } "
         "else { '' })} }; "
         "ConvertTo-Json -InputObject @($list) -Compress"
@@ -985,16 +995,27 @@ def _ahk_processes() -> list:
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-            capture_output=True, text=True, timeout=30)
-        rows = json.loads(r.stdout or "[]")
+            capture_output=True, timeout=30, stdin=subprocess.DEVNULL,
+            creationflags=_CREATE_NO_WINDOW)
+        rows = json.loads((r.stdout or b"").decode("utf-8-sig", "replace") or "[]")
     except (ValueError, OSError, subprocess.SubprocessError):
         return []
     out = []
     for row in rows if isinstance(rows, list) else [rows]:
         if isinstance(row, dict):     # @($null) serializes as [null] when nothing matched
-            out.append({"pid": _as_int(row.get("pid")), "cmd": str(row.get("cmd") or ""),
+            out.append({"pid": _as_int(row.get("pid")), "ppid": _as_int(row.get("ppid")),
+                        "name": str(row.get("name") or ""), "cmd": str(row.get("cmd") or ""),
                         "started": str(row.get("started") or "")})
     return out
+
+
+def _ahk_processes() -> list:
+    """Every process running OUR interpreter (basename of AHK_EXE — honors
+    the VOICEKIT_AHK override, e.g. a UIA build): [{pid, cmd, started}];
+    callers filter these rows in Python. `started` is yyyyMMddHHmmss."""
+    exe = os.path.basename(AHK_EXE).replace("'", "''")
+    return [{"pid": r["pid"], "cmd": r["cmd"], "started": r["started"]}
+            for r in _cim_processes("Name = '" + exe + "'")]
 
 
 def _script_matches(cmd: str, script_name: str, anchored: bool = True) -> bool:
@@ -1700,6 +1721,22 @@ NORMALIZE_EXEMPT = {
     "update_ai_prompt": ("previous_prompt",),
 }
 
+# Tool results whose listed top-level fields each hold exactly ONE path:
+# privacy.protect masks such a value to its very end (no prose can follow a
+# path there), so a missing name that merely starts like an existing sibling
+# ('Smith jr' beside 'Smith') is masked whole, never cut at the sibling.
+PATH_FIELDS = {
+    "check_path": ("path", "deepest_existing", "missing_path"),
+}
+
+# Tool results whose (field, path_field) pairs hold a path's LAST segment:
+# privacy.protect re-derives the field from the MASKED path field, so the
+# segment is exactly as masked as the path that ends in it (a bare segment
+# would only get the bare-name pass, which skips 'JD' and '40017788').
+SEGMENT_FIELDS = {
+    "check_path": (("missing_part", "missing_path"),),
+}
+
 _PATH_TOKEN_RE = re.compile(r"%(USERPROFILE|TEMP|TMP)%", re.IGNORECASE)
 
 
@@ -1745,29 +1782,175 @@ def reveal(token: str) -> dict:
                     "only for when you must read the name itself."}
 
 
+CHECK_PATH_COUNT_CAP = 10000
+
+
+def _missing_hint(given) -> str:
+    """The tail every 'nothing at that path' error carries: whether the
+    path's privacy tokens expanded (they did — an unknown token raises
+    before any existence check, naming itself), and where to look next. The
+    case it separates, from the field: a masked path fed back said 'doesn't
+    exist', and the agent couldn't tell a token that didn't expand from a
+    file that had really been moved."""
+    if privacy.find_tokens(given if isinstance(given, str) else ""):
+        return (" Its privacy tokens all expanded (this PC issued them), so the path is "
+                "spelled right — but nothing is there now (moved, renamed or deleted?). "
+                "check_path(path) shows the deepest part that still exists and the first "
+                "part that doesn't.")
+    return (" check_path(path) shows the deepest part that still exists and the first part "
+            "that doesn't.")
+
+
+def check_path(path: str) -> dict:
+    """Does a (possibly masked) path exist — without revealing a name? The
+    path may carry %USERPROFILE% / %TEMP% and privacy tokens, quoted or not.
+    Every name in the answer is a real path or name that server._guard masks
+    on the way out, like any response.
+
+    tokens_resolved / unknown_tokens tell 'a token here isn't one this PC
+    issued' (nothing past it can be checked: kind 'unresolved', exists None)
+    from 'it expanded, but nothing is there' (kind 'missing'). For a missing
+    path, deepest_existing is its longest existing ancestor and missing_part
+    the first segment below it (missing_path = the two joined). On the way
+    out missing_part is re-derived from the MASKED missing_path
+    (SEGMENT_FIELDS), so it is exactly as masked as the path — a bare
+    segment would only get the bare-name pass, which skips 'JD' and
+    '40017788'."""
+    if not isinstance(path, str) or not path.strip():
+        raise VoiceKitError("Pass the path to check, e.g. "
+                            "'%USERPROFILE%\\Documents\\<dir#1c2e>\\<file#3a9f>.pdf'.")
+    raw = path.strip()
+    while len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        raw = raw[1:-1].strip()
+    if any(ch in raw for ch in "\r\n\0"):
+        raise VoiceKitError("A path can't contain a line break.")
+    if len(raw) > privacy.REVEAL_MAX_CHARS:
+        raise VoiceKitError(f"That's {len(raw)} characters — check_path takes one path "
+                            f"(up to {privacy.REVEAL_MAX_CHARS}).")
+    toks = list(dict.fromkeys(privacy.find_tokens(raw)))
+    unknown, one_way = [], []
+    for t in toks:
+        try:
+            privacy.expand_tokens(t, REPO_ROOT)
+        except privacy.PrivacyError:
+            (one_way if t.startswith(("<ssn#", "<ein#")) else unknown).append(t)
+    out: dict = {"tokens_resolved": not (unknown or one_way),
+                 "unknown_tokens": unknown + one_way}
+    if unknown or one_way:
+        bad = (unknown + one_way)[0]
+        cut = raw.index(bad)
+        # What comes before the first bad token can still be checked: is
+        # the folder it sits in there at all?
+        head = raw[:cut]
+        head = head[:max(head.rfind("\\"), head.rfind("/"))] if ("\\" in head or "/" in head) \
+            else ""
+        deepest = None
+        if head:
+            try:
+                hp = Path(expand_user_paths(head))
+                if hp.is_absolute():
+                    deepest = _deepest_existing(hp)[0]
+            except (privacy.PrivacyError, OSError, ValueError):
+                deepest = None
+        notes = []
+        if unknown:
+            notes.append(f"{', '.join(unknown)}: not a token this PC issued (not in its token "
+                         f"map, or retired after the map was trimmed / the key was changed), "
+                         f"so the path can't be expanded — this is NOT the same as the file "
+                         f"being gone. Re-read the listing or response that showed the path "
+                         f"and pass its tokens exactly.")
+        if one_way:
+            notes.append(f"{', '.join(one_way)}: a one-way ID mask (strict mode) — never "
+                         f"part of a path.")
+        out.update({"exists": None, "kind": "unresolved", "note": " ".join(notes)})
+        if deepest:
+            out["deepest_existing"] = deepest
+        return out
+    real = expand_user_paths(raw)
+    p = Path(real)
+    if not p.is_absolute():
+        raise VoiceKitError(f"'{path}' isn't a full path — give one starting with a drive, "
+                            f"\\\\server\\share, %USERPROFILE% or %TEMP%.")
+    out["path"] = str(p)
+    try:
+        st = p.stat()
+    except OSError:
+        st = None
+    if st is not None and p.is_dir():
+        n, more = 0, False
+        try:
+            with os.scandir(p) as it:
+                for _e in it:
+                    if n >= CHECK_PATH_COUNT_CAP:
+                        more = True
+                        break
+                    n += 1
+        except OSError as e:
+            out.update({"exists": True, "kind": "dir", "items": None,
+                        "note": f"The folder exists but couldn't be listed "
+                                f"({type(e).__name__})."})
+            return out
+        out.update({"exists": True, "kind": "dir", "items": n})
+        if more:
+            out["items_more"] = True
+            out["note"] = f"More than {CHECK_PATH_COUNT_CAP} items — counting stopped there."
+        return out
+    if st is not None:
+        out.update({"exists": True, "kind": "file", "size": st.st_size,
+                    "modified": datetime.fromtimestamp(st.st_mtime).strftime(
+                        "%Y-%m-%d %H:%M:%S")})
+        return out
+    deepest, first_missing = _deepest_existing(p)
+    out.update({"exists": False, "kind": "missing"})
+    if deepest:
+        out["deepest_existing"] = deepest
+    if first_missing:
+        out["missing_path"] = first_missing
+        out["missing_part"] = os.path.basename(first_missing)
+    out["note"] = (("Every token expanded — this PC issued them — so the path is spelled "
+                    "right, but nothing is there now (moved, renamed or deleted?). "
+                    if toks else "Nothing is at that path. ")
+                   + ("deepest_existing is the longest part that still exists; missing_part "
+                      "is the first part that doesn't." if deepest else
+                      "Not even its drive or share was found."))
+    return out
+
+
+def _deepest_existing(p: Path) -> tuple:
+    """(longest existing ancestor of p, the first missing path below it) as
+    strings — (None, None) when not even the root exists."""
+    cur = Path(os.path.normpath(str(p)))
+    child = None
+    while True:
+        try:
+            if cur.exists():
+                return (str(cur), str(child) if child else None)
+        except OSError:
+            pass
+        parent = cur.parent
+        if parent == cur:
+            return (None, None)
+        child, cur = cur, parent
+
+
 # ---------------------------------------------------------------------------
 # server_info: which server is this, and which others are out there
 # ---------------------------------------------------------------------------
 def _python_processes() -> list:
-    """Every running python process: [{pid, ppid, cmd, started}] — one CIM
-    query, like _ahk_processes."""
-    cmd = (
-        "$list = Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | "
-        "ForEach-Object { @{pid = $_.ProcessId; ppid = $_.ParentProcessId; "
-        "cmd = $_.CommandLine; "
-        "started = $(if ($_.CreationDate) { $_.CreationDate.ToString('yyyy-MM-dd HH:mm:ss') } "
-        "else { '' })} }; "
-        "ConvertTo-Json -InputObject @($list) -Compress"
-    )
-    try:
-        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                           capture_output=True, text=True, timeout=30)
-        rows = json.loads(r.stdout or "[]")
-    except (ValueError, OSError, subprocess.SubprocessError):
-        return []
-    return [{"pid": _as_int(row.get("pid")), "ppid": _as_int(row.get("ppid")),
-             "cmd": str(row.get("cmd") or ""), "started": str(row.get("started") or "")}
-            for row in (rows if isinstance(rows, list) else [rows]) if isinstance(row, dict)]
+    """Every running python process: [{pid, ppid, cmd, started}] — a filter
+    over _cim_processes, like _ahk_processes. `started` is
+    yyyy-MM-dd HH:mm:ss here (server_info shows it as is)."""
+    return [{"pid": r["pid"], "ppid": r["ppid"], "cmd": r["cmd"],
+             "started": _stamp_text(r["started"])}
+            for r in _cim_processes("Name like 'python%'")]
+
+
+def _stamp_text(stamp: str) -> str:
+    """yyyyMMddHHmmss -> 'yyyy-MM-dd HH:mm:ss' ('' stays '')."""
+    s = str(stamp or "")
+    if len(s) < 14 or not s[:14].isdigit():
+        return s
+    return f"{s[0:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}:{s[10:12]}:{s[12:14]}"
 
 
 def _mcp_server_processes(rows: list | None = None) -> list:
@@ -1853,15 +2036,90 @@ def _registrations_in(client: str, path: Path) -> list:
     return out
 
 
-def server_info() -> dict:
+TOOL_PREFIX_NOTE = (
+    "Tool-name prefixes (mcp__voicekit__..., mcp__remote-devices__voicekit__..., "
+    "mcp__claude-device__lcl-voicekit-...) are added by the MCP client or a bridge between "
+    "it and this PC, not by VoiceKit: they can change when the client reconnects through a "
+    "different path. The tool names after the prefix (run_automation, server_info, ...) "
+    "are stable — if a call fails because its tool vanished, re-list the tools and retry "
+    "with the new prefix.")
+
+
+def _client_app(label: str) -> str:
+    """'Claude Code' / 'Claude Desktop' for a config label or an MCP clientInfo
+    name (Claude Code says 'claude-code', Claude Desktop 'claude-ai'); "" for
+    anything else (a bridge, another client)."""
+    low = (label or "").lower()
+    if "claude code" in low or "claude-code" in low:
+        return "Claude Code"
+    if "claude desktop" in low or "claude-ai" in low:
+        return "Claude Desktop"
+    return ""
+
+
+def _same_path(a: str, b) -> bool:
+    try:
+        return os.path.normcase(os.path.normpath(str(a))) == \
+            os.path.normcase(os.path.normpath(str(b)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _same_client_duplicates(regs: list) -> list:
+    """The registrations that give ONE client two copies of every tool — the
+    real problem behind "two sets of VoiceKit tools" (entries in different
+    clients are normal: each client sees its own one set).
+
+    Claude Desktop: every entry in its config loads. Claude Code: user-scope
+    entries load in every project, a `projects[P]` entry only in P, the
+    repo's .mcp.json only in this repo — and a same-named entry at a narrower
+    scope REPLACES the wider one rather than adding to it, so names are
+    counted caselessly per place. One dict per place that loads more than one:
+    {client, where, names}."""
+    out = []
+    desk = sorted({r["name"] for r in regs if _client_app(r["client"]) == "Claude Desktop"},
+                  key=str.lower)
+    if len(desk) > 1:
+        out.append({"client": "Claude Desktop", "where": "every chat", "names": desk})
+    code = [r for r in regs if _client_app(r["client"]) == "Claude Code"]
+    user = {r["name"].lower(): r["name"] for r in code
+            if r["client"] == "Claude Code (user)" and "project" not in r}
+    if len(user) > 1:
+        out.append({"client": "Claude Code", "where": "every project",
+                    "names": sorted(user.values(), key=str.lower)})
+    places: dict = {}
+    for r in code:
+        if "project" in r:
+            places.setdefault(r["project"], []).append(r["name"])
+        elif r["client"] == "Claude Code (project)":
+            places.setdefault(str(REPO_ROOT), []).append(r["name"])
+    merged: dict = {}
+    for place, names in places.items():
+        key = next((k for k in merged if _same_path(k, place)), place)
+        merged.setdefault(key, []).extend(names)
+    for place, names in merged.items():
+        here = dict(user)
+        here.update({n.lower(): n for n in names})
+        if len(here) > 1 and set(here) != set(user):
+            out.append({"client": "Claude Code", "where": f"project {place}",
+                        "names": sorted(here.values(), key=str.lower)})
+    return out
+
+
+def server_info(connected_client: dict | None = None) -> dict:
     """Which VoiceKit MCP server this is and what else is registered/running
     — the answer to "why do I see two sets of VoiceKit tools?". Read-only;
-    paths come back normalized (%USERPROFILE%, %TEMP%)."""
+    paths come back normalized (%USERPROFILE%, %TEMP%).
+
+    connected_client is the MCP clientInfo ({name, version}) of the session
+    asking — server.py reads it from the FastMCP context; None when called
+    outside a request (this module never imports fastmcp)."""
     import sys
     stale = server_stale_files()
     servers = _mcp_server_processes()
     regs = [e for client, p in _client_config_files() if p.exists()
             for e in _registrations_in(client, p)]
+    dups = _same_client_duplicates(regs)
     out = {
         "version": VERSION,
         "install_root": str(REPO_ROOT),
@@ -1870,8 +2128,11 @@ def server_info() -> dict:
         "server_pid": os.getpid(),
         "server_started": SERVER_STARTED_AT.strftime("%Y-%m-%d %H:%M:%S"),
         "server_stale": bool(stale),
+        "connected_client": dict(connected_client) if connected_client else None,
         "running_servers": servers,
         "registrations": regs,
+        "same_client_duplicates": dups,
+        "tool_name_prefixes": TOOL_PREFIX_NOTE,
     }
     notes = []
     if stale:
@@ -1884,14 +2145,36 @@ def server_info() -> dict:
                      f"two clients) shows two sets of VoiceKit tool names. They act on the "
                      f"same files; a set that looks out of date belongs to an older process "
                      f"— reconnect it.")
-    if len(regs) > 1:
+    if dups:
+        where = "; ".join(f"{d['client']} ({d['where']}): " + " + ".join(
+            f"'{n}'" for n in d["names"]) for d in dups)
         notes.append(f"VoiceKit is registered {len(regs)} times in this machine's client "
-                     f"configs (see 'registrations'). Within ONE client, two entries mean "
-                     f"two copies of every tool; keep one per client. Entries in different "
-                     f"clients (Claude Code vs Claude Desktop) are normal.")
+                     f"configs (see 'registrations'). The real problem is within ONE "
+                     f"client, which then loads two copies of every tool — {where}. Keep "
+                     f"one entry per client (see 'same_client_duplicates'). Entries in "
+                     f"different clients (Claude Code vs Claude Desktop) are normal.")
+    elif len(regs) > 1:
+        apps = sorted({_client_app(r["client"]) or r["client"] for r in regs})
+        notes.append(f"VoiceKit is registered {len(regs)} times in this machine's client "
+                     f"configs (see 'registrations'), but never twice in the same client "
+                     f"({', '.join(apps)}) — that is normal: each client sees one set of "
+                     f"tools.")
     if not any(r["this_install"] for r in regs) and regs:
         notes.append("None of the registrations point at this install's server.py — this "
                      "server was started some other way (or from another copy).")
+    if connected_client:
+        cname = str(connected_client.get("name") or "")
+        app = _client_app(cname)
+        mine = [d for d in dups if d["client"] == app] if app else []
+        if mine:
+            notes.append(f"This session's client ('{cname}') is {app} — the client with "
+                         f"the duplicate registration.")
+        elif not app:
+            notes.append(f"This session's client ('{cname or 'unnamed'}') isn't one whose "
+                         f"config this tool reads (Claude Code, Claude Desktop) — it may "
+                         f"reach VoiceKit through a bridge or a remote device link, whose "
+                         f"registrations aren't listed here. Its tool-name prefix is its own "
+                         f"(see 'tool_name_prefixes').")
     if not notes:
         notes.append("One VoiceKit server, registered once — nothing to untangle.")
     out["note"] = " ".join(notes)
@@ -1953,19 +2236,17 @@ def _instructions_text(solo: list[str], families: list[str]) -> str:
     return "\n".join([
         "VoiceKit builds and runs AutoHotkey v2 automations (v1 syntax does not load).",
         "",
-        "What your AHK code gets pre-included: run_ahk_snippet code has lib\\_Common.ahk, "
-        "lib\\Browser.ahk (which pulls in lib\\UIA.ahk and lib\\Clip.ahk) and "
-        "lib\\ExplorerSel.ahk (ExplorerSelectedFiles) plus Out(value). "
-        "Generated hotkey-module bodies (create_hotkey_module, isolate=True) and launch "
-        "macros made with create_launch_macro(ahk_body=...) #Include lib\\_Common.ahk. An "
-        "isolate=False module runs inside VoiceKit.ahk itself, beside lib\\_Common.ahk, "
-        "lib\\Theme.ahk and every other module. A hand-written macro includes whatever its "
-        "own source says (read_macro_source).",
+        "Pre-included: run_ahk_snippet code gets lib\\_Common.ahk, lib\\Browser.ahk (with "
+        "lib\\UIA.ahk and lib\\Clip.ahk), lib\\ExplorerSel.ahk and Out(value). Hotkey-module "
+        "bodies (isolate=True) and create_launch_macro(ahk_body=...) macros #Include "
+        "lib\\_Common.ahk; an isolate=False module runs inside VoiceKit.ahk beside "
+        "lib\\_Common.ahk, lib\\Theme.ahk and every other module. A hand-written macro "
+        "includes what its source says (read_macro_source).",
         "",
-        "Names you can't assign at the top level of a script: AutoHotkey v2 keeps "
-        "functions and variables in ONE case-insensitive namespace, so `log := 1` fails "
-        "to load (Log is a built-in). Inside a function, plain variables are local and "
-        "any name is fine. A load error that hits a taken name says who owns it.",
+        "Names you can't assign at the top level: AutoHotkey v2 keeps functions and "
+        "variables in ONE case-insensitive namespace, so `log := 1` fails to load (Log is a "
+        "built-in); inside a function any local name is fine. A load error on a taken name "
+        "says who owns it.",
         "AutoHotkey built-ins: " + ", ".join(COMMON_BUILTIN_CLASHES) + " (and every other "
         "built-in function and class).",
         "VoiceKit functions: " + ", ".join(solo) + ".",
@@ -1974,37 +2255,41 @@ def _instructions_text(solo: list[str], families: list[str]) -> str:
         "Quotes: v2 escapes a double quote inside \"...\" as `\" (backtick-quote); v1's "
         "doubled \"\" does not load. Or use single quotes: 'say \"hi\"'.",
         "",
-        "Changing an existing automation: read it first (read_macro_source, "
-        "read_hotkey_module, read_workflow, read_ai_prompt), then use edit_macro / "
-        "edit_hotkey_module (one exact splice) or update_macro / update_hotkey_module (the "
-        "whole file) / update_ai_prompt. create_workflow replaces a workflow of the same "
-        "name. Never delete-and-recreate: a hotkey module's key pairing is made by hand.",
+        "Changing an automation: read it first (read_macro_source, read_hotkey_module, "
+        "read_workflow, read_ai_prompt), then edit_macro / edit_hotkey_module (one exact "
+        "splice) or update_macro / update_hotkey_module / update_ai_prompt (the whole file). "
+        "create_workflow replaces a same-named workflow. Never delete-and-recreate: a hotkey "
+        "module's key pairing is made by hand.",
         "",
-        "Paths: the profile shows as %USERPROFILE% and temp as %TEMP% (in AHK code: "
+        "Paths: the profile shows as %USERPROFILE% and temp as %TEMP% (in AHK: "
         "EnvGet(\"USERPROFILE\") / A_Temp). Privacy masking (on by default; set only in "
-        "logs\\settings.ini) also shows names under the profile as tokens that keep the "
-        "extension: %USERPROFILE%\\Documents\\<dir#1c2e>\\<file#3a9f>.pdf. Pass paths back "
-        "exactly as shown wherever a tool takes a path or value (opens, run/focus/capture "
-        "steps, run_automation args, batch rows/source; in run_ahk_snippet only inside quoted "
-        "strings) — they expand locally — never in saved code or steps. reveal(token) and "
-        "run_ahk_snippet(unmask=True) show real names (audited). Masking stops incidental "
-        "leakage, not what a snippet deliberately Out()s.",
+        "logs\\settings.ini) shows names under the profile as tokens: "
+        "%USERPROFILE%\\Documents\\<dir#1c2e>\\<file#3a9f>.pdf. Pass paths back "
+        "exactly as shown wherever a tool takes a path or value (in run_ahk_snippet only "
+        "inside quoted strings) — they expand locally — never in saved code or steps. "
+        "check_path: does a masked path exist, did its tokens expand? reveal(token), or "
+        "unmask=['<file#..>'] on run_ahk_snippet / run_process / read_job, shows just those "
+        "names (audited; a blanket True is refused). Masking stops incidental leakage only.",
         "",
-        "Files the user selected in File Explorer: a workflow uses {{selected_file}} (exactly "
-        "one, else the run refuses to start) or {{selected_files}} (all, each quoted, "
-        "space-joined); in a command line (a capture step's command, a run target) both "
-        "arrive already quoted, with or without quotes written around them. A capture "
-        "step runs a command line hidden from the VoiceKit folder and saves what it "
-        "printed as {{name}} — e.g. capture 'Invoice Data' = python \"C:\\tools\\invoice.py\" "
-        "{{selected_file}}, then {{Invoice Data}} in later steps. A launch macro takes them as "
-        "`#Include \"%A_ScriptDir%\\..\\lib\\ExplorerSel.ahk\"` then "
-        "`files := A_Args.Length ? A_Args : ExplorerSelectedFiles()`. "
-        "Either way run_automation(args=[...]) passes a fixture file in their place, so test "
-        "on a sample under %TEMP%, never a real client document. There is no generic "
-        "dry-run.",
+        "Files selected in File Explorer: a workflow uses {{selected_file}} (exactly one) or "
+        "{{selected_files}} (all); in a command line (capture, run) they arrive quoted. A "
+        "capture step runs a command line hidden and saves its output as {{name}}. A launch "
+        "macro: `#Include \"%A_ScriptDir%\\..\\lib\\ExplorerSel.ahk\"` then "
+        "`files := A_Args.Length ? A_Args : ExplorerSelectedFiles()`. Either way "
+        "run_automation(args=[...]) passes a fixture in their place: a sample under "
+        "%TEMP%, never a client document. There is no generic dry-run.",
         "",
-        "Seeing VoiceKit's tools twice, or a tool that should exist is missing? Call "
-        "server_info.",
+        "Programs: run_process(exe, args) — no shell, no AHK quoting — returns stdout, "
+        f"stderr, exit code. No call waits over {max_wait_s()} s; a timeout or cancel ends "
+        "its process tree. Longer: background=True, then read_job / stop_job.",
+        "Quiet tests: run_automation(..., test=True) logs MsgBox/TrayTip instead of showing "
+        "them (Gui windows still show); a macro returns values with VkResult(value).",
+        "list_processes shows command lines and tags VoiceKit's own (its server is a "
+        "python.exe too) — don't rely on ProcessExist(\"python.exe\").",
+        "",
+        "Tool-name prefixes (mcp__voicekit__, mcp__remote-devices__voicekit__) come from your "
+        "client or a bridge and can change on a reconnect; the names after them don't — "
+        "re-list tools and retry. Tools twice, or one missing? Call server_info.",
     ])
 
 
@@ -3834,6 +4119,10 @@ def list_running() -> dict:
                      "after the grace period.")}
 
 
+STOP_KILL_WAIT_S = 5        # stop_module: how long a force-killed body may take to go
+STOP_SCAN_RESERVE_S = 5     # stop_module: its process scans (before + the blind re-check)
+
+
 def stop_module(name: str, grace_s: int = 5) -> dict:
     """Stop a module's running body: cooperative first, force-kill fallback.
 
@@ -3851,7 +4140,14 @@ def stop_module(name: str, grace_s: int = 5) -> dict:
         raise VoiceKitError(
             f"'{base}' has no body process running — list_running shows what does. "
             f"(Only isolated modules run as their own process.)")
-    grace_s = max(0, min(_as_int(grace_s, 5), 60))
+    # Capped like every other wait (max_wait_s), less what the call spends
+    # around it: the process scans before and after (a PowerShell CIM query
+    # each) and the post-kill wait. It used to be clamped at 60 — on its own
+    # already past a remote bridge's 60 s, which then gave up without ever
+    # seeing the result.
+    grace_s, grace_capped = _cap_wait(grace_s, "grace_s", 5,
+                                      "call stop_module again (it drops the stop flag again)",
+                                      reserve=STOP_KILL_WAIT_S + STOP_SCAN_RESERVE_S)
     pids = [p["pid"] for p in procs]
     flag = _body_stop_file(base)
     how = "killed"
@@ -3935,7 +4231,7 @@ def stop_module(name: str, grace_s: int = 5) -> dict:
                 else:
                     refused.append(pid)
             if ended:                    # nothing was ended: nothing new to wait for
-                _wait_all(5000)
+                _wait_all(STOP_KILL_WAIT_S * 1000)
         survivors = sorted({pid for pid, h in handles if _handle_alive(h)}
                            | set(_alive_unopened()) | set(_alive_blind()))
     finally:
@@ -3961,6 +4257,8 @@ def stop_module(name: str, grace_s: int = 5) -> dict:
                "note": f"Couldn't stop pid(s) {', '.join(map(str, survivors))}: {why}."}
         if unreachable:
             out["could_not_open"] = unreachable
+        if grace_capped:
+            out["grace_capped"] = grace_capped
         return out
     if how == "graceful" and unreachable:
         # Gone — but a process this server couldn't open is one it couldn't
@@ -3981,6 +4279,8 @@ def stop_module(name: str, grace_s: int = 5) -> dict:
            "note": note}
     if unreachable:
         out["could_not_open"] = unreachable
+    if grace_capped:
+        out["grace_capped"] = grace_capped
     return out
 
 
@@ -3997,16 +4297,24 @@ def _run_uia_probe(args: list, timeout: int = 30) -> str:
     redirect (the same trap AhkValidate works around). An "error=..." line in
     the report is an answer; a nonzero exit or a missing report is a failure.
     """
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
         out = Path(d) / "probe.txt"
-        r = subprocess.run(
-            [AHK_EXE, "/ErrorStdOut", str(_uia_probe()), str(out), *map(str, args)],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if r.returncode != 0 or not out.exists():
-            detail = (r.stdout or r.stderr or "").strip()
+        so, se = Path(d) / "probe-stdout.txt", Path(d) / "probe-stderr.txt"
+        # A bounded child like any other (_run_bounded): a cancelled request
+        # ends the probe too instead of leaving it walking a huge tree.
+        r = _run_bounded([AHK_EXE, "/ErrorStdOut", str(_uia_probe()), str(out),
+                          *map(str, args)], timeout, cwd=d, out_path=so, err_path=se,
+                         label="UIA probe (inspect_focus / dump_uia_tree)")
+        if r["timed_out"] or r["cancelled"]:
+            raise VoiceKitError(f"UIA probe didn't finish within {timeout} s and was stopped "
+                                f"— the window may be hung, or its tree is huge (lower "
+                                f"max_depth, or add name_filter).")
+        if r["exit_code"] != 0 or not out.exists():
+            ansi = _ansi_codec()           # AutoHotkey's own text: ANSI, not OEM
+            detail = (_decode_output(so.read_bytes(), ansi)
+                      or _decode_output(se.read_bytes(), ansi)).strip()
             raise VoiceKitError(
-                f"UIA probe failed (exit {r.returncode})"
+                f"UIA probe failed (exit {r['exit_code']})"
                 + (f": {detail}" if detail else ""))
         return out.read_text(encoding="utf-8-sig")
 
@@ -4223,11 +4531,15 @@ def get_bridge_map() -> dict:
 # ---------------------------------------------------------------------------
 # Run / trigger / delete
 # ---------------------------------------------------------------------------
-def _run_args(args) -> list[str]:
-    """run_automation's `args`, checked: a list of plain strings (each becomes
-    one argv entry — no shell is involved, so spaces, & and quotes arrive
-    exactly as given). Line breaks and NULs are refused: a Windows command
-    line can't carry them faithfully."""
+def _run_args(args, line_breaks: bool = False) -> list[str]:
+    """run_automation's / run_process's `args`, checked: a list of plain
+    strings (each becomes one argv entry — no shell is involved, so spaces,
+    & and quotes arrive exactly as given). NUL is always refused (no command
+    line can hold one). Line breaks are refused unless `line_breaks`
+    (run_automation keeps the refusal it always had). run_process passes
+    True — CreateProcess with a list2cmdline-quoted argument hands \r and \n
+    back unchanged to a C runtime argv parser (measured: python -c with a
+    three-line program, and 'q"\r\nz', arrive intact)."""
     if args is None:
         return []
     if isinstance(args, str) or not isinstance(args, (list, tuple)):
@@ -4237,7 +4549,9 @@ def _run_args(args) -> list[str]:
     for a in args:
         if not isinstance(a, str):
             raise VoiceKitError(f"Every argument must be a string (got {type(a).__name__}).")
-        if any(ch in a for ch in "\r\n\0"):
+        if "\0" in a:
+            raise VoiceKitError("An argument can't contain a NUL character.")
+        if not line_breaks and any(ch in a for ch in "\r\n"):
             raise VoiceKitError("An argument can't contain a line break.")
         out.append(a)
     return out
@@ -4257,7 +4571,7 @@ def _workflow_file_args(args: list[str]) -> list[str]:
                 f"arguments are files standing in for the File Explorer selection — its "
                 f"{{{{selected_file}}}} / {{{{selected_files}}}} values. Try it on a fixture: "
                 f"create a sample file under %TEMP% (run_ahk_snippet can write one) rather "
-                f"than pointing at a real client document.")
+                f"than pointing at a real client document." + _missing_hint(a))
         out.append(str(path.resolve()))
     return out
 
@@ -4292,7 +4606,8 @@ def _workflow_uses_selected_file(base: str) -> bool:
     return False
 
 
-def run_automation(name: str, wait_seconds: int = 0, args: list | None = None) -> dict:
+def run_automation(name: str, wait_seconds: int = 0, args: list | None = None,
+                   test: bool = False) -> dict:
     """Trigger any spoken automation (workflow, launch macro, AI action, or
     VoiceKit tool) by launching its macro — the same thing Voice Access does
     when the user says 'open <name>', including the working directory (the
@@ -4308,11 +4623,42 @@ def run_automation(name: str, wait_seconds: int = 0, args: list | None = None) -
     instead of whatever File Explorer has selected. A raw script decides what
     its arguments mean (a %USERPROFILE% / %TEMP% form or a privacy token in one
     arrives as the real path — WP9). Refused for Workflow Studio (its argument means 'load
-    this file' / '/record') and for 'loop <name>' phrases."""
+    this file' / '/record') and for 'loop <name>' phrases.
+
+    Every run it WAITS on (wait_seconds > 0, or test=True) can hand values
+    back: each VkResult(value) call in the macro (lib\\_Common.ahk) becomes one
+    entry of `result`, in order, and the macro's stdout (FileAppend(x, "*"))
+    and stderr ("**") come back as `stdout` / `stderr` — each only when
+    non-empty. The channel is the launched script's alone
+    (%VOICEKIT_RUN_SCRIPT%): what it Run()s inherits the variables but
+    VkResult / VkTestMode ignore them there. A fire-and-forget run is
+    launched exactly as before.
+
+    test=True — a QUIET test run: lib\\TestShim.ahk is loaded ahead of the
+    macro, so MsgBox / TrayTip / InputBox / ToolTip / FileSelect / DirSelect
+    are recorded in `dialogs` instead of shown (MsgBox answers its default
+    button — what Enter would; InputBox and the file pickers are cancelled;
+    ToolTip returns a real, invisible window); the macro's own OnError
+    handlers run as on a voice run, and an error none of them handles comes
+    back as `uncaught_error` with no dialog (exit 3); load errors (exit 2)
+    as `load_errors`, anything else on stderr as `stderr`; VkTestMode() is
+    true in the macro. wait_seconds 0 means "up to the cap" — a test run always
+    reports — and on timeout the run and everything it started are KILLED
+    (`killed`), unlike a normal run. NOT covered — it is quiet, not
+    sandboxed: custom Gui windows still appear, anything the macro Run()s in
+    another process is untouched, and real side effects (file writes,
+    keystrokes, clicks, emails) really happen. Refused for Workflow Studio,
+    VoiceKit's own tools, 'loop <name>', a workflow that asks for input, and
+    a macro with a dialog-mode #Warn line. The pattern: a fixture under
+    %TEMP% passed in args, test=True, and VkResult for what to check."""
     phrase, base = _require_name(name)
     argv = _run_args(args)
+    arg_tokens = _input_tokens(argv)        # remembered past the call (_remember_tokens)
+    test = bool(test)
     macro = _macro_file(base)
     if macro.exists():
+        if test and base.lower() == "workflowstudio":
+            _refuse_untestable(macro, base, False)
         if argv and base.lower() == "workflowstudio":
             raise VoiceKitError("Workflow Studio doesn't take arguments here — its argument "
                                 "means 'load this steps file' or '/record'. Run it without args.")
@@ -4339,24 +4685,44 @@ def run_automation(name: str, wait_seconds: int = 0, args: list | None = None) -
                     f"This workflow uses {{{{selected_file}}}} — exactly one file — but "
                     f"{len(argv)} arguments were given. Pass one file, or use "
                     f"{{{{selected_files}}}} in the workflow to take several.")
+        if test:
+            _refuse_untestable(macro, base, is_workflow)
         since = datetime.now().strftime("%Y%m%d%H%M%S")
         # cwd = the macro's folder: what its Start Menu shortcut sets, so a
         # script using relative paths behaves the same here as by voice.
-        r = _launch_and_report([AHK_EXE, str(macro), *argv], space_out(base), str(macro),
-                               wait_seconds, cwd=str(macro.parent))
+        if test:
+            r = _test_run(macro, argv, wait_seconds, is_workflow, space_out(base),
+                          tokens=arg_tokens)
+        else:
+            r = _launch_and_report([AHK_EXE, str(macro), *argv], space_out(base), str(macro),
+                                   wait_seconds, cwd=str(macro.parent), tokens=arg_tokens)
         if argv:
             r["args"] = argv
         # A workflow's generated stub always exits 0, so its exit code says
         # nothing — but the engine records what the run did. Non-workflow
         # macros (AI actions, tools) leave no record and report as before.
         if is_workflow:
+            test_note = r.get("note", "")
             r = _attach_outcome(r, base, since)
+            if test and (r.get("uncaught_error") or r.get("load_errors") or r.get("timed_out")
+                         or r.get("cancelled")):
+                # The run never finished on its own: what test mode saw is
+                # the answer ("nothing recorded yet" would invite a wait for
+                # a run that was killed).
+                r["ok"] = False
+                r["note"] = test_note
         return r
     # 'loop <name>': the workflow's loop companion (same target as its
     # 'loop <name>.lnk' — lib\LoopRunner.ahk resolves the steps file itself).
     if phrase.lower().startswith("loop ") and phrase[5:].strip():
         wf_base = to_base(phrase[5:])
         if _steps_file(wf_base).exists():
+            if test:
+                raise VoiceKitError(
+                    "A loop can't be test-run: it repeats until someone stops it (and shows a "
+                    "floating Stop Looping window), so there is no single outcome to wait for. "
+                    f"Test one pass: run_automation('{space_out(wf_base)}', test=True); for rows "
+                    "of inputs use run_workflow_batch.")
             if argv:
                 raise VoiceKitError("A loop doesn't take arguments (LoopRunner's own arguments "
                                     "are the workflow and a batch file). Run the workflow once "
@@ -4378,41 +4744,376 @@ def run_automation(name: str, wait_seconds: int = 0, args: list | None = None) -
                         f"list_automations shows what exists.{_near_miss(base)}")
 
 
-# Hard cap on wait_seconds. Claude Desktop cancels a tool call at ~240 s;
-# a blocking wait that outlives the cancel answers a dead request, which
-# crashes the MCP session ("Request already responded to") and disconnects
-# the server. Stay well under the cancel window — for longer runs, callers
-# should fire-and-forget and check back (read_workflow_sheet / list state).
-WAIT_CAP_SECONDS = 120
-
-
 def _launch_and_report(cmd: list, launched: str, file: str, wait_seconds: int,
-                       cwd: str | None = None) -> dict:
+                       cwd: str | None = None, tokens: tuple = ()) -> dict:
     # cwd: what the voice shortcut would use (a macro's own folder; the repo
     # root for a loop) — without it a launch ran in the MCP server's cwd.
-    proc = subprocess.Popen(cmd, cwd=cwd)
+    # NOT a _ProcTree: this is the user's automation, launched the way their
+    # voice shortcut launches it, and it must outlive this server and any
+    # cancelled request.
     result = {"launched": launched, "file": file}
-    capped = min(int(wait_seconds), WAIT_CAP_SECONDS)
-    if capped < wait_seconds:
-        result["wait_capped"] = (f"wait_seconds {wait_seconds} was capped to {WAIT_CAP_SECONDS} "
-                                 f"(longer blocking waits get cancelled by the client and can "
-                                 f"wedge the connection — poll instead).")
-    wait_seconds = capped
-    if wait_seconds > 0:
-        try:
-            rc = proc.wait(timeout=wait_seconds)
-            result["finished"] = True
-            result["exit_code"] = rc
-            result["note"] = ("Finished cleanly." if rc == 0 else
-                              f"Exited with code {rc} — something in it failed.")
-        except subprocess.TimeoutExpired:
-            result["finished"] = False
-            result["note"] = (f"Still running after {wait_seconds}s — a long automation, "
-                              "a window it's waiting for, or a failing step showing its popup.")
-    else:
+    wait_seconds, capped = _cap_wait(
+        wait_seconds, "wait_seconds", 0,
+        "pass 0 (fire-and-forget) and poll — read_workflow_sheet for a batch "
+        "or loop, list_processes for anything else")
+    if capped:
+        result["wait_capped"] = capped
+    if wait_seconds <= 0:
+        # Fire-and-forget: exactly as before. No std handle is redirected,
+        # so none is inherited (redirecting just one would hand the child
+        # the server's other two — the MCP protocol pipe among them).
+        _remember_tokens(subprocess.Popen(cmd, cwd=cwd).pid, tokens)
         result["finished"] = False
         result["note"] = "Running on the desktop now; a failing step shows a popup naming it."
+        return result
+    # A run we wait on gets the result channel (VkResult -> `result`) and a
+    # stdout: all THREE std handles are given, stdout/stderr to files, so a
+    # macro's FileAppend(x, "*") works — a launched macro has no console,
+    # and that call used to crash it. Still not in a job: it outlives a
+    # timeout (its files then stay in its run folder until pruned).
+    folder = _new_run_dir()
+    env = _run_env(VOICEKIT_RESULT_FILE=str(folder / "result.txt"),
+                   VOICEKIT_RUN_SCRIPT=_run_script(file))
+    with open(folder / "stdout.txt", "wb") as fo, open(folder / "stderr.txt", "wb") as fe:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                stdout=fo, stderr=fe)
+    _remember_tokens(proc.pid, tokens)
+    try:
+        rc = proc.wait(timeout=wait_seconds)
+        result["finished"] = True
+        result["exit_code"] = rc
+        result["note"] = ("Finished cleanly." if rc == 0 else
+                          f"Exited with code {rc} — something in it failed.")
+        _attach_run_outputs(result, folder)
+        shutil.rmtree(folder, ignore_errors=True)
+    except subprocess.TimeoutExpired:
+        result["finished"] = False
+        # It keeps running (it is the user's automation, not ours to
+        # kill) — but say exactly which processes are still going, so a
+        # caller never mistakes them for its own work later.
+        result["still_running"] = _tree_of(proc.pid)
+        result["note"] = (f"Still running after {wait_seconds}s and left running — a long "
+                          "automation, a window it's waiting for, or a failing step showing "
+                          "its popup. still_running lists its processes (pid + image).")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Quiet test runs + the result channel (2026-10-01)
+#
+# From a session that used run_automation(args=...) as "the safe way to test":
+# the macro's error MsgBox still appeared on the user's desktop (they stopped
+# the run), and the macro had no way to hand a value back — FileAppend(x, "*")
+# crashed it, a launched macro has no console. Now:
+#  - every run run_automation WAITS on gets %VOICEKIT_RESULT_FILE% (lib\
+#    _Common.ahk VkResult appends one JSON line per value) and stdout/stderr
+#    redirected to files; the reply carries `result` and `stdout`.
+#  - test=True loads lib\TestShim.ahk ahead of the macro (AutoHotkey's
+#    /include switch): MsgBox / TrayTip / InputBox / ToolTip / FileSelect /
+#    DirSelect are written to %VOICEKIT_TEST_LOG% instead of shown, an
+#    uncaught error is logged and exits 3 instead of popping its dialog, and
+#    %VOICEKIT_TEST%=1 lets the macro skip side effects (VkTestMode()). A test
+#    run is a bounded child (_run_bounded): on timeout or a cancelled request
+#    its whole tree is KILLED — unlike a normal run, it never outlives the
+#    call that asked for it.
+# ---------------------------------------------------------------------------
+RUNS_ROOT: Path | None = None       # tests retarget; None = %TEMP%\VoiceKit\runs
+RUN_KEEP_S = 24 * 3600              # an abandoned run folder (timed-out run) is pruned after this
+RESULT_CAP_RECORDS = 200            # VkResult values returned per run
+DIALOG_CAP_RECORDS = 100            # suppressed dialogs returned per run
+DIALOG_TEXT_CAP = 2000              # characters of one dialog's text
+_WARN_LINE_RE = re.compile(r"^.+ \(\d+\) : ==> Warning: ")
+_LOAD_ERR_RE = re.compile(r"^.+ \(\d+\) : ==> ")      # AutoHotkey's /ErrorStdOut load error
+
+
+_RUN_VARS = ("VOICEKIT_TEST", "VOICEKIT_TEST_LOG", "VOICEKIT_RESULT_FILE", "VOICEKIT_RUN_SCRIPT")
+
+
+def _run_script(path) -> str:
+    """%VOICEKIT_RUN_SCRIPT%: the full path of the ONE script a run's
+    variables are for. AutoHotkey's Run() hands the environment to every
+    child, so without it a macro the run started — or a master reloaded from
+    a Home window a waited run opened, and everything THAT launched later —
+    reported into this run's result file (deleted once the run ends, so its
+    VkResult threw a dialog on a voice run) or believed it was under test.
+    lib\\_Common.ahk's VkResult / VkTestMode act only when A_ScriptFullPath
+    is this path (compared caseless, as full long paths)."""
+    return os.path.abspath(str(path))
+
+
+def _runs_dir() -> Path:
+    return Path(RUNS_ROOT) if RUNS_ROOT else Path(tempfile.gettempdir()) / "VoiceKit" / "runs"
+
+
+def _run_env(**set_vars: str) -> dict:
+    """The server's environment for a launched automation, with the run's
+    own variables set — and any of them this server happened to inherit
+    removed first (names caseless, like Windows), so a run never reports
+    into another run's files or believes it is under test when it isn't.
+    Nothing else is added: the user's automation sees what a voice launch
+    would, plus these."""
+    env = {k: v for k, v in os.environ.items() if k.upper() not in _RUN_VARS}
+    env.update(set_vars)
+    return env
+
+
+def _new_run_dir() -> Path:
+    """A fresh folder for one run's result / stdout / stderr / test-log
+    files. Folders left by earlier runs (a run that outlived its wait keeps
+    its files open) are pruned once they are a day old."""
+    root = _runs_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for old in root.iterdir():
+        try:
+            if old.is_dir() and now - old.stat().st_mtime > RUN_KEEP_S:
+                shutil.rmtree(old, ignore_errors=True)
+        except OSError:
+            pass
+    while True:
+        d = root / f"r{datetime.now():%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
+        try:
+            d.mkdir()
+            return d
+        except FileExistsError:
+            continue
+
+
+def _read_json_lines(path: Path, cap: int) -> tuple[list, int]:
+    """(records, total) from a file of one-JSON-value-per-line records — a
+    line that isn't JSON comes back as its text. At most `cap` records."""
+    try:
+        text = path.read_bytes().decode("utf-8-sig", "replace")
+    except OSError:
+        return [], 0
+    out, total = [], 0
+    for line in text.split("\n"):
+        line = line.rstrip("\r")
+        if not line.strip():
+            continue
+        total += 1
+        if len(out) >= cap:
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            out.append(line)
+    return out, total
+
+
+def _split_warnings(stdout: str) -> tuple[list[str], str]:
+    """(warnings, the rest): lib\\TestShim.ahk sends AutoHotkey's load-time
+    warnings (#Warn VarUnset / Unreachable, StdOut) to stdout, where they
+    come first — each a '<file> (<line>) : ==> Warning: ...' line plus any
+    indented 'Specifically:' lines under it."""
+    lines = stdout.split("\n")
+    warnings: list[str] = []
+    i = 0
+    while i < len(lines) and _WARN_LINE_RE.match(lines[i]):
+        block = [lines[i]]
+        i += 1
+        while i < len(lines) and lines[i].startswith((" ", "\t")) and lines[i].strip():
+            block.append(lines[i].strip())
+            i += 1
+        warnings.append("  ".join(block))
+    return warnings, "\n".join(lines[i:])
+
+
+def _attach_run_outputs(result: dict, folder: Path) -> list[str]:
+    """Add `result` (VkResult values, in order) and `stdout` / `stderr`
+    (capped) to a finished run's reply, each only when non-empty. Returns
+    the warnings split off stdout (a test run reports them)."""
+    vals, total = _read_json_lines(folder / "result.txt", RESULT_CAP_RECORDS)
+    if vals:
+        result["result"] = vals
+        if total > len(vals):
+            result["result_truncated"] = f"{total} values in all — the first {len(vals)} are shown."
+    # AutoHotkey, not a console program: FileAppend(x, "*") with no encoding
+    # writes the ANSI code page, so that is the fallback after UTF-8.
+    stdout, n_out, cut = _read_capped(folder / "stdout.txt", fallback=_ansi_codec())
+    warnings, stdout = _split_warnings(stdout)
+    if stdout.strip():
+        result["stdout"] = stdout
+        if cut:
+            result["stdout_truncated"] = (f"{n_out} bytes in all — the first and last "
+                                          f"{OUTPUT_CAP_BYTES // 2048} KB are shown.")
+    stderr, _n, _cut = _read_capped(folder / "stderr.txt", fallback=_ansi_codec())
+    if stderr.strip():
+        result["stderr"] = stderr
+    return warnings
+
+
+def _warn_dialog_line(source: str) -> str:
+    """The first '#Warn' line whose warnings show a DIALOG (no mode, or
+    MsgBox) — '' when there is none. Such a line overrides lib\\TestShim.ahk's
+    '#Warn ..., StdOut' and pops its dialog at load, before any code (the
+    shim's included) runs: measured 2026-10-01."""
+    for n, line in enumerate(source.splitlines(), 1):
+        m = re.match(r"^\s*#Warn\b([^;]*)", line, re.IGNORECASE)
+        if not m:
+            continue
+        parts = [p.strip().lower() for p in m.group(1).split(",")]
+        mode = parts[1] if len(parts) > 1 else ""
+        if mode in ("", "msgbox"):
+            return f"line {n}: {line.strip()}"
+    return ""
+
+
+def _refuse_untestable(macro: Path, base: str, is_workflow: bool) -> None:
+    """What test mode can't run quietly — refused before anything launches,
+    each with why and what to do instead."""
+    low = base.lower()
+    if low == "workflowstudio":
+        raise VoiceKitError(
+            "Workflow Studio can't be test-run: it is an editor window, not an automation, "
+            "and launching it closes an open Studio session (#SingleInstance Force) with any "
+            "unsaved recorded steps. Test the workflow itself: run_automation('<workflow>', "
+            "test=True).")
+    if low in _BUILTINS_LOWER:
+        raise VoiceKitError(
+            f"'{space_out(base)}' is one of VoiceKit's own tools — a window for the user, with "
+            f"nothing for test mode to quiet (its windows are Gui windows, which test mode "
+            f"doesn't hide). Run it without test=True if the user wants it open.")
+    if is_workflow:
+        labels = _input_labels(read_workflow(base)["steps"])
+        if labels:
+            raise VoiceKitError(
+                f"This workflow asks for input ({', '.join(labels[:5])}) in a dialog window, "
+                f"which test mode can't answer — it would sit on the desktop until killed. Feed "
+                f"the inputs as a row instead: run_workflow_batch('{space_out(base)}', "
+                f"rows=[{{...}}]) — a batch runs quietly and reports per row.")
+        return
+    try:
+        source = macro.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return
+    warn = _warn_dialog_line(source)
+    if warn:
+        raise VoiceKitError(
+            f"This macro has a #Warn directive ({warn}) whose warnings show a dialog when the "
+            f"script loads — before test mode's shim can catch anything, so it would appear on "
+            f"the desktop. Remove it (VoiceKit's macros don't use #Warn), or make it "
+            f"'#Warn All, StdOut' so warnings come back in the test run's output; "
+            f"update_macro / edit_macro change it.")
+
+
+_WITHHELD_TEXT = ("(withheld — the workflow engine's popup text can carry filled-in values; "
+                  "`run` says what happened, with values as written)")
+
+
+def _test_run(macro: Path, argv: list[str], wait_seconds, is_workflow: bool,
+              launched: str, tokens: tuple = ()) -> dict:
+    """run_automation(test=True): the macro under lib\\TestShim.ahk, bounded
+    and killed on timeout (see the section comment)."""
+    shim = REPO_ROOT / "lib" / "TestShim.ahk"
+    if not shim.is_file():
+        raise VoiceKitError(f"Test mode needs {shim}, which is missing — reinstall VoiceKit "
+                            f"(Install-VoiceKit.cmd) to restore it.")
+    asked = _as_int(wait_seconds, 0)
+    if asked > 0:
+        wait, capped = _cap_wait(asked, "wait_seconds", 0, "test a shorter piece, or run it "
+                                 "without test=True (fire-and-forget) and poll")
+    else:
+        wait, capped = max_wait_s(), ""      # 0 = up to the cap: a test run always reports
+    folder = _new_run_dir()
+    log_p, res_p = folder / "test-log.txt", folder / "result.txt"
+    env = _run_env(VOICEKIT_TEST="1", VOICEKIT_TEST_LOG=str(log_p),
+                   VOICEKIT_RESULT_FILE=str(res_p), VOICEKIT_RUN_SCRIPT=_run_script(macro))
+    cmd = [AHK_EXE, "/ErrorStdOut=UTF-8", "/include", str(shim), str(macro), *argv]
+    try:
+        r = _run_bounded(cmd, wait, cwd=str(macro.parent), env=env,
+                         out_path=folder / "stdout.txt", err_path=folder / "stderr.txt",
+                         label=f"run_automation test: {macro.name}", leftovers="keep",
+                         tokens=tokens)
+    except OSError as e:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise VoiceKitError(f"Couldn't start AutoHotkey for the test run: {e}") from None
+    res: dict = {"launched": launched, "file": str(macro), "test": True,
+                 "finished": r["exit_code"] is not None, "exit_code": r["exit_code"],
+                 "timed_out": r["timed_out"], "killed": r["killed"],
+                 "duration_s": r["duration_s"]}
+    if capped:
+        res["wait_capped"] = capped
+    if r["left_running"]:
+        res["left_running"] = r["left_running"]
+    if r["possibly_left_running"]:
+        res["possibly_left_running"] = r["possibly_left_running"]
+    if r["cancelled"]:
+        res["cancelled"] = True
+    warnings = _attach_run_outputs(res, folder)
+    res.setdefault("result", [])
+    # stderr is a load error only when it IS one: AutoHotkey exits 2 and
+    # writes '<file> (<line>) : ==> ...' (measured). A macro's own
+    # FileAppend(x, "**") goes to the same file after a clean load — that is
+    # `stderr`, and the run is judged on its exit code and errors as usual.
+    load_errors = ""
+    stderr_text = res.get("stderr", "").strip()
+    if stderr_text and r["exit_code"] == 2 and _LOAD_ERR_RE.match(stderr_text):
+        load_errors = res.pop("stderr").strip()
+        res["load_errors"] = _explain_ahk_error(load_errors, script=macro)
+    if warnings:
+        res["warnings"] = warnings
+    records, total = _read_json_lines(log_p, DIALOG_CAP_RECORDS + 1)
+    shutil.rmtree(folder, ignore_errors=True)
+    dialogs, uncaught = [], None
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        kind = str(rec.get("kind", ""))
+        if kind == "error":
+            uncaught = {k: rec[k] for k in ("type", "message", "extra", "file", "line", "what",
+                                             "stack") if rec.get(k) not in (None, "")}
+            if "line" in uncaught:
+                uncaught["line"] = _as_int(uncaught["line"])
+            continue
+        if len(dialogs) >= DIALOG_CAP_RECORDS:
+            continue
+        d = {"kind": kind, "title": str(rec.get("title", "")),
+             "text": str(rec.get("text", ""))[:DIALOG_TEXT_CAP]}
+        for k in ("options", "returned", "default"):
+            if str(rec.get(k, "")):
+                d[k] = str(rec[k])
+        if is_workflow:
+            # The engine's failure popup can hold a filled-in {{value}} or a
+            # capture's stderr tail — LOCAL-only text by the engine's own
+            # rule (WfRunFail's `detail`); the run record says what failed.
+            d["text"] = _WITHHELD_TEXT
+            d.pop("default", None)
+        dialogs.append(d)
+    res["dialogs"] = dialogs
+    if total > DIALOG_CAP_RECORDS + 1:
+        res["dialogs_truncated"] = f"{total} records in all — the first {len(dialogs)} are shown."
+    if uncaught:
+        res["uncaught_error"] = uncaught
+    res["ok"] = (r["exit_code"] == 0 and not uncaught and not load_errors
+                 and not r["timed_out"] and not r["cancelled"])
+    notes = []
+    if r["cancelled"]:
+        notes.append("The request was cancelled, so the run and everything it started were ended.")
+    elif r["timed_out"]:
+        notes.append(f"Killed after {wait} s with everything it had started (killed lists them) "
+                     f"— a test run never outlives its call. A window test mode can't hide (a "
+                     f"Gui) or a long wait is the usual cause.")
+        if r["possibly_left_running"]:
+            notes.append(COM_STRAY_NOTE)
+    elif load_errors:
+        notes.append("It didn't load — load_errors says why (nothing ran).")
+    elif uncaught:
+        at = f" at line {uncaught['line']}" if uncaught.get("line") else ""
+        notes.append(f"An uncaught error ended it (uncaught_error: "
+                     f"{uncaught.get('message', '')}{at}); no error dialog was shown.")
+    elif r["exit_code"]:
+        notes.append(f"Exited with code {r['exit_code']}.")
+    else:
+        notes.append("Finished cleanly.")
+    if dialogs:
+        notes.append(f"{len(dialogs)} dialog(s)/notification(s) suppressed — `dialogs` lists "
+                     f"them with what each returned to the macro.")
+    if r["left_running"]:
+        notes.append(f"It left {len(r['left_running'])} process(es) running (left_running) — "
+                     f"something it Run() on purpose, which test mode doesn't stop.")
+    res["note"] = " ".join(notes)
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -5273,7 +5974,7 @@ def _run_batch_source(name, source, wait_seconds, sheet, cell_range, header, col
         raise VoiceKitError(f"source must be a full path (got '{source}'); "
                             f"%USERPROFILE%\\... and %TEMP%\\... are fine.")
     if not path.is_file():
-        raise VoiceKitError(f"No file at {path}.")
+        raise VoiceKitError(f"No file at {path}." + _missing_hint(source))
     ext = path.suffix.lower()
     if ext not in BATCH_CSV_EXTS + BATCH_XLSX_EXTS:
         raise VoiceKitError(f"{path.name}: only .csv / .tsv / .txt and .xlsx / .xlsm are read "
@@ -5435,7 +6136,7 @@ def _running_loops() -> list[str]:
 
 def _loop_running() -> bool:
     """True while a loop / batch (lib\\LoopRunner.ahk) is running — the poll
-    signal for batches too long to block on (see WAIT_CAP_SECONDS)."""
+    signal for batches too long to block on (see max_wait_s)."""
     return bool(_running_loops())
 
 
@@ -5496,6 +6197,1464 @@ def read_workflow_sheet(name: str) -> dict:
         else:
             out["note"] = ("The last run finished but saved nothing — its collect steps came "
                            "back empty. Check that they point at the right selection or box.")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Child processes: ONE primitive for every bounded run (2026-10-01)
+#
+# From a session that drove VoiceKit through a remote bridge whose per-call
+# limit is 60 s: run_ahk_snippet accepted timeout_s up to 120, the bridge gave
+# up at 60, and the snippet — with the python it had started through cmd /c —
+# ran on unseen, holding its log file open, so every later run wrote an empty
+# log. subprocess.run(timeout=) only ever killed AutoHotkey itself; its
+# grandchildren were orphaned. The rules since:
+#  1. Every bounded child runs in a Windows job object (_ProcTree), started
+#     SUSPENDED and resumed only once it is in the job, so nothing it starts
+#     can slip out before the job exists. A timeout ends the whole tree and the
+#     reply names what was killed (pid + image). What it did NOT start itself
+#     is not in the job: an out-of-process COM server it drives (EXCEL.EXE for
+#     Excel.Application — started by DcomLaunch, measured) or an app it hands
+#     work to through the shell. After a timeout, COM servers started during
+#     the run are reported as possibly_left_running (_com_strays).
+#  2. Every bounded child is registered under the MCP request that started it
+#     (CURRENT_REQUEST, set by server._guard); server.py's patched cancel calls
+#     kill_request, so a client or bridge that gives up stops the work too.
+#  3. No wait a caller chooses blocks longer than max_wait_s() (MAX_WAIT_S =
+#     50 by default — under a remote bridge's 60 s): a longer request is
+#     clamped and the reply says so; a call with fixed work around its wait
+#     reserves it (_cap_wait(reserve=), stop_module). Long work is a
+#     background job (run_process(background=True) + read_job) or a
+#     fire-and-forget launch plus polling. (Not capped: a create/update that
+#     reloads VoiceKit — its load checks and the reload have their own
+#     bounds, LAUNCHER_WAIT_S and VALIDATE_TIMEOUT_S.)
+# The user's own automations (run_automation, press_hotkey, loops, batches)
+# are deliberately NOT put in a job: they are launched the way a voice
+# shortcut launches them and must outlive this server.
+# ---------------------------------------------------------------------------
+MAX_WAIT_S = 50                 # default cap on any blocking wait, seconds
+MAX_WAIT_LIMITS = (5, 230)      # what [MCP] MaxWaitSeconds may set it to
+_MCP_SETTINGS_CACHE: dict = {}
+
+
+def max_wait_s() -> int:
+    """The longest any tool blocks one call: [MCP] MaxWaitSeconds in
+    logs\\settings.ini (clamped to MAX_WAIT_LIMITS), else MAX_WAIT_S. Read the
+    way privacy.settings reads [Privacy] — mtime-cached, UTF-16 (AutoHotkey's
+    IniWrite) or UTF-8, section and key caseless. A value that isn't a
+    number is ignored."""
+    ini = REPO_ROOT / "logs" / "settings.ini"
+    try:
+        st = ini.stat()
+        stamp = (str(ini), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return MAX_WAIT_S
+    hit = _MCP_SETTINGS_CACHE.get("max_wait")
+    if hit and hit[0] == stamp:
+        return hit[1]
+    val = MAX_WAIT_S
+    try:
+        import configparser
+        cp = configparser.RawConfigParser(strict=False)
+        cp.read_string(_read_text_any(ini))
+        sect = next((s for s in cp.sections() if s.strip().lower() == "mcp"), None)
+        if sect:
+            n = _as_int((cp.get(sect, "maxwaitseconds", fallback="") or "").strip().strip('"'), 0)
+            if n > 0:
+                val = max(MAX_WAIT_LIMITS[0], min(n, MAX_WAIT_LIMITS[1]))
+    except Exception:           # noqa: BLE001 — a bad settings file means the default
+        val = MAX_WAIT_S
+    _MCP_SETTINGS_CACHE["max_wait"] = (stamp, val)
+    return val
+
+
+def _cap_wait(seconds, what: str, default: int, longer: str,
+              reserve: int = 0) -> tuple[int, str]:
+    """(seconds to block, note): a blocking wait clamped at max_wait_s(). The
+    note is '' unless the request was over the cap — a clamp is never
+    silent, or the caller would believe it waited as long as it asked.
+    `reserve` is what the call itself still spends AROUND this wait (a
+    process scan, a post-kill wait): the wait is capped that much lower, so
+    the whole call stays inside max_wait_s(), not just the wait."""
+    total = max_wait_s()
+    cap = max(1, total - max(0, reserve))
+    n = max(0, _as_int(seconds, default))
+    if n <= cap:
+        return n, ""
+    spent = f" ({total} s, less {reserve} s the call needs around the wait)" if reserve else ""
+    return cap, (f"{what}={n} was capped to {cap} s — the longest this server blocks one "
+                 f"call{spent} (a remote bridge gives up at 60 s and the work would run on "
+                 f"unseen; [MCP] MaxWaitSeconds in logs\\settings.ini sets it, "
+                 f"{MAX_WAIT_LIMITS[0]}-{MAX_WAIT_LIMITS[1]}). For longer work, {longer}.")
+
+
+def _cap_timeout(seconds, default: int, longer: str) -> tuple[int, str]:
+    """A foreground timeout_s: None = `default`, 0 (or less) = up to the cap
+    — the meaning wait_seconds=0 has for a test run, and the nearest thing
+    to the 'no limit' a background job's 0 means. (0 used to become a
+    1-second timeout: a caller who dropped background=True but kept
+    timeout_s=0 had the program and its whole tree killed after 1 s, with
+    nothing in the reply saying why.) Otherwise _cap_wait."""
+    if seconds is not None and _as_int(seconds, default) <= 0:
+        return max_wait_s(), ""
+    n, note = _cap_wait(seconds, "timeout_s", default, longer)
+    return max(1, n), note
+
+
+_CREATE_SUSPENDED = 0x00000004
+_CREATE_NO_WINDOW = 0x08000000
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_SUSPEND_RESUME = 0x0800
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JOB_INFO_PID_LIST = 3              # JobObjectBasicProcessIdList
+_JOB_INFO_EXTENDED_LIMITS = 9       # JobObjectExtendedLimitInformation
+_JOBAPI: dict = {}
+_JOBAPI_LOCK = threading.Lock()
+
+
+def _jobapi() -> dict:
+    """kernel32 / ntdll entry points and the structures job objects need,
+    declared once (ctypes, no pywin32)."""
+    with _JOBAPI_LOCK:
+        if _JOBAPI:
+            return _JOBAPI
+        import ctypes
+        from ctypes import wintypes
+
+        class _Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                        ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class _Io(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in
+                        ("ReadOps", "WriteOps", "OtherOps", "ReadBytes", "WriteBytes",
+                         "OtherBytes")]
+
+        class _Ext(ctypes.Structure):
+            _fields_ = [("Basic", _Basic), ("Io", _Io),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        class _PidList(ctypes.Structure):
+            _fields_ = [("assigned", wintypes.DWORD), ("listed", wintypes.DWORD),
+                        ("ids", ctypes.c_size_t * 1024)]
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateJobObjectW.restype = wintypes.HANDLE
+        k.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        k.SetInformationJobObject.restype = wintypes.BOOL
+        k.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                              wintypes.DWORD)
+        k.QueryInformationJobObject.restype = wintypes.BOOL
+        k.QueryInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                wintypes.DWORD, ctypes.c_void_p)
+        k.AssignProcessToJobObject.restype = wintypes.BOOL
+        k.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        k.TerminateJobObject.restype = wintypes.BOOL
+        k.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k.CloseHandle.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k.GetProcessTimes.restype = wintypes.BOOL
+        k.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(ctypes.c_uint64),) * 4
+        nt = ctypes.WinDLL("ntdll")
+        nt.NtResumeProcess.restype = ctypes.c_long
+        nt.NtResumeProcess.argtypes = (wintypes.HANDLE,)
+        _JOBAPI.update(ctypes=ctypes, k=k, nt=nt, Ext=_Ext, PidList=_PidList)
+        return _JOBAPI
+
+
+def _process_created(pid) -> int:
+    """A process's creation time (FILETIME ticks), 0 when it can't be read.
+    With the pid it identifies one process for good — a pid alone can be
+    reused by an unrelated program once the first one exits."""
+    pid = _as_int(pid)
+    if not pid:
+        return 0
+    api = _jobapi()
+    k, ct = api["k"], api["ctypes"]
+    h = k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return 0
+    try:
+        times = [ct.c_uint64() for _ in range(4)]
+        if not k.GetProcessTimes(h, *[ct.byref(t) for t in times]):
+            return 0
+        return int(times[0].value)
+    finally:
+        k.CloseHandle(h)
+
+
+def _same_process_alive(pid, created) -> bool:
+    """True while THAT process (pid + creation time) is still running."""
+    pid = _as_int(pid)
+    if not pid or _pid_image(pid) is None:
+        return False
+    return not created or _process_created(pid) == _as_int(created)
+
+
+def _image_name(pid: int) -> str:
+    img = _pid_image(pid)
+    return os.path.basename(img) if img else "?"
+
+
+class _ProcTree:
+    """One child process and everything it starts, held in a Windows job
+    object so the whole tree can be listed and ended at once.
+
+    The child is created SUSPENDED and resumed (NtResumeProcess — Popen has
+    already closed the main thread's handle) only after it is in the job, so
+    nothing it starts can escape the job in the gap (a COM server it drives
+    is started by Windows, not by it, and is never in the job — see the
+    section comment). kill_on_close=True (every
+    bounded run) makes Windows end the tree if this server dies holding it;
+    release(keep_running=True) clears that first for a tree whose leftovers
+    are meant to live on. If the job APIs fail, the tree still runs and
+    kill() falls back to taskkill /T on the main pid.
+
+    breakaway=True (background jobs) also asks Windows to start the child
+    outside the job this server itself may run in — a client that puts its
+    MCP server in a kill-on-close job would otherwise take every background
+    job down with it — and quietly retries without when that job forbids it.
+
+    The child never inherits the server's std handles: all three are always
+    given (DEVNULL when unused) — an inherited stdout would be the MCP
+    protocol pipe."""
+
+    def __init__(self, cmd, *, cwd=None, env=None, stdin=None, stdout=None, stderr=None,
+                 kill_on_close: bool = True, breakaway: bool = False, label: str = ""):
+        self.label = label
+        self.kill_on_close = kill_on_close
+        self.job = None
+        self.cancelled = False
+        self.request = None
+        self.tokens: tuple = ()      # privacy tokens its inputs carried (_input_tokens)
+        self.created = 0
+        self._lock = threading.RLock()
+        kw = {"cwd": cwd, "env": env,
+              "stdin": subprocess.DEVNULL if stdin is None else stdin,
+              "stdout": subprocess.DEVNULL if stdout is None else stdout,
+              "stderr": subprocess.DEVNULL if stderr is None else stderr}
+        flags = _CREATE_SUSPENDED | _CREATE_NO_WINDOW
+        self.proc = None
+        if breakaway:
+            try:
+                self.proc = subprocess.Popen(cmd, creationflags=flags | _CREATE_BREAKAWAY_FROM_JOB,
+                                             **kw)
+            except OSError as e:
+                if getattr(e, "winerror", None) != 5:     # 5: this job forbids breakaway
+                    raise
+        if self.proc is None:
+            self.proc = subprocess.Popen(cmd, creationflags=flags, **kw)
+        self.pid = self.proc.pid
+        try:
+            self._attach()
+        except BaseException:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+            self.release()
+            raise
+
+    def _attach(self) -> None:
+        api = _jobapi()
+        k, nt, ct = api["k"], api["nt"], api["ctypes"]
+        h = k.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE | _PROCESS_SUSPEND_RESUME
+                          | _PROCESS_QUERY_LIMITED_INFORMATION, False, self.pid)
+        if not h:
+            raise OSError(f"couldn't open the new process {self.pid} "
+                          f"(error {ct.get_last_error()})")
+        status = -1
+        try:
+            job = k.CreateJobObjectW(None, None)
+            if job:
+                ok = True
+                if self.kill_on_close:
+                    info = api["Ext"]()
+                    info.Basic.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                    ok = bool(k.SetInformationJobObject(job, _JOB_INFO_EXTENDED_LIMITS,
+                                                        ct.byref(info), ct.sizeof(info)))
+                if ok and k.AssignProcessToJobObject(job, h):
+                    self.job = job
+                else:
+                    k.CloseHandle(job)          # no job: kill() falls back to taskkill /T
+            times = [ct.c_uint64() for _ in range(4)]
+            if k.GetProcessTimes(h, *[ct.byref(t) for t in times]):
+                self.created = int(times[0].value)
+        finally:
+            status = nt.NtResumeProcess(h)
+            k.CloseHandle(h)
+        if status != 0:
+            raise OSError(f"couldn't resume the new process (NTSTATUS {status & 0xFFFFFFFF:#x})")
+
+    def pids(self) -> list[int]:
+        """Every live process in the tree (the main one included while it
+        runs). Without a job: the main pid while it runs."""
+        with self._lock:
+            if self.job:
+                api = _jobapi()
+                ct = api["ctypes"]
+                buf = api["PidList"]()
+                if api["k"].QueryInformationJobObject(self.job, _JOB_INFO_PID_LIST,
+                                                      ct.byref(buf), ct.sizeof(buf), None):
+                    return [int(buf.ids[i]) for i in range(min(int(buf.listed), 1024))]
+        return [self.pid] if self.proc.poll() is None else []
+
+    def processes(self) -> list[dict]:
+        """[{pid, image}] for the tree's live processes. conhost.exe is left
+        out: Windows attaches one to every console program — it is not
+        something the program started, and it exits with it."""
+        out = []
+        for pid in self.pids():
+            img = _pid_image(pid)
+            if img is None:
+                continue
+            name = os.path.basename(img) or "?"
+            if name.lower() != "conhost.exe":
+                out.append({"pid": pid, "image": name})
+        return out
+
+    def kill(self, wait: bool = True) -> list[dict]:
+        """End the whole tree. Returns what was running ([{pid, image}]).
+        wait=False returns at once (server.py's cancel runs on the event
+        loop); otherwise waits up to 5 s for the processes to go."""
+        with self._lock:
+            victims = self.processes()
+            if self.job:
+                _jobapi()["k"].TerminateJobObject(self.job, 1)
+            elif self.proc.poll() is None:
+                _kill_tree(self.pid)        # no job: taskkill /T from the main pid
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+        if wait:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and \
+                    any(_pid_image(v["pid"]) is not None for v in victims):
+                time.sleep(0.05)
+        return victims
+
+    def settle(self, seconds: float = 0.5) -> list[dict]:
+        """What is still running a moment after the main process exited —
+        a console host or a just-finishing child needs that moment."""
+        deadline = time.monotonic() + seconds
+        rest = self.processes()
+        while rest and time.monotonic() < deadline:
+            time.sleep(0.05)
+            rest = self.processes()
+        return rest
+
+    def release(self, keep_running: bool = False) -> None:
+        """Close the job handle. With kill_on_close that ends whatever is
+        still in it — unless keep_running clears the flag first."""
+        with self._lock:
+            job, self.job = self.job, None
+            if not job:
+                return
+            api = _jobapi()
+            try:
+                if keep_running and self.kill_on_close:
+                    info = api["Ext"]()              # LimitFlags 0: closing kills nothing
+                    api["k"].SetInformationJobObject(job, _JOB_INFO_EXTENDED_LIMITS,
+                                                     api["ctypes"].byref(info),
+                                                     api["ctypes"].sizeof(info))
+            finally:
+                api["k"].CloseHandle(job)
+
+
+# The MCP request a tool call is serving — server._guard sets it from the
+# FastMCP context ((id(session), request id) — the same pair server.py's
+# patched cancel sees); None when the writer is used directly. FastMCP runs
+# sync tools through anyio.to_thread.run_sync, which carries contextvars into
+# the worker thread.
+CURRENT_REQUEST: contextvars.ContextVar = contextvars.ContextVar("voicekit_request",
+                                                                 default=None)
+_LIVE: dict = {}                # id(tree) -> _ProcTree: every bounded run in flight
+_LIVE_LOCK = threading.Lock()
+# Requests cancelled while still in flight -> when (monotonic). A cancel can
+# land while the tool's thread is still getting ready (expanding tokens,
+# pruning run folders, Popen) — before its tree is in _LIVE, where
+# kill_request would find nothing; _track then ends the tree the moment it
+# registers. Dropped by request_done when the call returns (server._guard),
+# and after CANCELLED_KEEP_S in any case.
+_CANCELLED: dict = {}
+CANCELLED_KEEP_S = 600
+
+
+# --- Names that came in as tokens, remembered past the call ------------------
+# The bare-name pass masks a name the answer shows WITHOUT its path only when
+# the same answer shows the path, or the current call expanded it from a
+# token (privacy.take_expanded). A later read_job / list_processes call has
+# neither: a background job handed '<file#..>.pdf' that printed the bare file
+# name, or a command line carrying it, came back in clear -- no unmask, no
+# audit line (found in review, 2026-10-01). So every launch remembers the
+# TOKENS its inputs carried (never the names): a background job in its
+# meta.json, a bounded run on its tree, a run_automation launch here by pid;
+# read_job / stop_job / list_processes re-expand them (_recall_tokens), which
+# puts the names into this call's `known` set and masks them in the answer.
+_LAUNCH_TOKENS: dict = {}          # pid -> tokens, run_automation launches (this server's life)
+_LAUNCH_TOKENS_CAP = 500
+
+
+def _input_tokens(*values) -> tuple:
+    """Every privacy token in the given inputs (strings, lists, dict values)."""
+    found: set = set()
+
+    def walk(v):
+        if isinstance(v, str):
+            found.update(privacy.find_tokens(v))
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                walk(x)
+    for v in values:
+        walk(v)
+    return tuple(sorted(found))
+
+
+def _remember_tokens(pid, tokens) -> None:
+    if not tokens or not pid:
+        return
+    with _LIVE_LOCK:
+        _LAUNCH_TOKENS[int(pid)] = tuple(tokens)
+        while len(_LAUNCH_TOKENS) > _LAUNCH_TOKENS_CAP:
+            _LAUNCH_TOKENS.pop(next(iter(_LAUNCH_TOKENS)))
+
+
+def _recall_tokens(tokens) -> None:
+    """Note `tokens` as expanded by this call (privacy._note_expanded via
+    expand_tokens), so _guard masks the names behind them wherever this
+    answer shows them bare. A token the map no longer knows is skipped."""
+    for t in set(tokens or ()):
+        try:
+            privacy.expand_tokens(str(t), REPO_ROOT)
+        except Exception:           # noqa: BLE001 -- unknown/one-way: nothing to mask
+            pass
+
+
+def _track(tree: _ProcTree) -> None:
+    tree.request = CURRENT_REQUEST.get()
+    with _LIVE_LOCK:
+        _LIVE[id(tree)] = tree
+        late = tree.request is not None and tree.request in _CANCELLED
+    if late:                    # cancelled before it existed: it never runs on
+        tree.cancelled = True
+        try:
+            tree.kill(wait=False)
+        except Exception:           # noqa: BLE001
+            pass
+
+
+def request_cancelled(request=None) -> bool:
+    """Has this request (default: the current one) been cancelled?"""
+    request = CURRENT_REQUEST.get() if request is None else request
+    with _LIVE_LOCK:
+        return request is not None and request in _CANCELLED
+
+
+def request_done(request) -> None:
+    """The call serving `request` has returned: forget its cancellation."""
+    if request is None:
+        return
+    with _LIVE_LOCK:
+        _CANCELLED.pop(request, None)
+
+
+def _untrack(tree: _ProcTree) -> None:
+    with _LIVE_LOCK:
+        _LIVE.pop(id(tree), None)
+
+
+def kill_request(request) -> list[dict]:
+    """End every bounded child started while serving `request` — what
+    server.py's patched RequestResponder.cancel calls when a client (or a
+    remote bridge that gave up) cancels the call, so the work stops instead
+    of running on unseen and holding files open. Returns what was running
+    ([{pid, image}]). Never raises and never waits (it runs on the event
+    loop); the tool's own thread sees `cancelled` and reaps."""
+    if request is None:
+        return []
+    with _LIVE_LOCK:
+        now = time.monotonic()
+        for k, when in list(_CANCELLED.items()):
+            if now - when > CANCELLED_KEEP_S:
+                del _CANCELLED[k]
+        _CANCELLED[request] = now      # a tree that registers later is ended too (_track)
+        trees = [t for t in _LIVE.values() if t.request == request]
+    killed: list = []
+    for t in trees:
+        t.cancelled = True
+        try:
+            killed += t.kill(wait=False)
+        except Exception:           # noqa: BLE001
+            pass
+    return killed
+
+
+def _run_bounded(cmd: list, timeout_s: float, *, cwd: str, out_path: Path, err_path: Path,
+                 env: dict | None = None, stdin_path: Path | None = None, label: str = "",
+                 leftovers: str = "kill", tokens: tuple = ()) -> dict:
+    """Run `cmd` to completion or `timeout_s`, stdout/stderr to FILES (no pipe
+    a grandchild could hold open, no reader thread to wedge). On timeout or a
+    cancelled request the whole tree is killed. When the main process exits
+    on its own, anything it left running is killed too (leftovers='kill') or
+    left running and reported (leftovers='keep' — run_ahk_snippet, whose code
+    may Run() an app on purpose). Returns {exit_code (None when killed),
+    timed_out, cancelled, killed, left_running, possibly_left_running,
+    duration_s}. possibly_left_running is only looked for after a timeout
+    (_com_strays): out-of-process COM servers started while it ran, which
+    are never in the job."""
+    t0 = time.monotonic()
+    started_at = datetime.now()
+    if request_cancelled():
+        # The caller already gave up: start nothing (and say so the way a
+        # cancel during the run does — the reply is suppressed anyway).
+        out_path.write_bytes(b"")
+        err_path.write_bytes(b"")
+        return {"exit_code": None, "timed_out": False, "cancelled": True, "killed": [],
+                "left_running": [], "possibly_left_running": [], "duration_s": 0.0}
+    fin = open(stdin_path, "rb") if stdin_path else None
+    try:
+        with open(out_path, "wb") as fo, open(err_path, "wb") as fe:
+            tree = _ProcTree(cmd, cwd=cwd, env=env, stdin=fin, stdout=fo, stderr=fe,
+                             kill_on_close=True, label=label)
+    finally:
+        if fin:
+            fin.close()
+    tree.tokens = tuple(tokens)
+    _track(tree)
+    killed: list = []
+    left: list = []
+    timed_out = False
+    try:
+        try:
+            rc = tree.proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            rc = None
+        if rc is None or tree.cancelled:
+            timed_out = not tree.cancelled
+            killed = tree.kill()
+            try:
+                tree.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            rc = None
+        else:
+            rest = tree.settle()
+            if rest:
+                if leftovers == "keep":
+                    left = rest
+                    for p in rest:      # outlives the run: list_processes still masks
+                        _remember_tokens(p.get("pid"), tokens)
+                else:
+                    killed = tree.kill()
+    finally:
+        _untrack(tree)
+        tree.release(keep_running=(leftovers == "keep"))
+    strays = _com_strays(started_at, {v["pid"] for v in killed}) if timed_out else []
+    return {"exit_code": rc, "timed_out": timed_out, "cancelled": tree.cancelled,
+            "killed": killed, "left_running": left, "possibly_left_running": strays,
+            "duration_s": round(time.monotonic() - t0, 2)}
+
+
+COM_STRAY_NOTE = ("possibly_left_running: COM servers started while it ran (e.g. EXCEL.EXE "
+                  "for Excel.Application). Windows starts those itself (DcomLaunch), outside "
+                  "the program's process tree, so the timeout couldn't end them — a hidden "
+                  "one can still hold a workbook open. Check them with list_processes and "
+                  "end them with run_process('taskkill', ['/PID', '<pid>', '/F']) if they "
+                  "are this run's.")
+
+
+def _com_strays(since: datetime, exclude: set) -> list[dict]:
+    """Out-of-process COM servers ('-Embedding' / '/automation' on the
+    command line — EXCEL.EXE, WINWORD.EXE, ...) created since `since`: what a
+    timed-out run may have left behind OUTSIDE its job object. Excel.Application
+    from python's win32com, PowerShell's New-Object -ComObject or AutoHotkey's
+    ComObject() is started by the DcomLaunch service, not by the caller
+    (measured 2026-10-01: EXCEL.EXE's parent is svchost, so the job — and the
+    reply's `killed` — never had it). Reported, never killed: one started in
+    the same seconds may be the user's own. One process scan, only after a
+    timeout. Windows' own brokers start the same way all the time
+    (RuntimeBroker, unsecapp, Terminal, widgets — a dozen on an idle PC,
+    measured): a program under %WINDIR% or in a Store package folder
+    (\\WindowsApps\\) is never counted."""
+    stamp = (since - timedelta(seconds=1)).strftime("%Y%m%d%H%M%S")
+    rows = _cim_processes("CommandLine LIKE '%-Embedding%' OR CommandLine LIKE '%/automation%'")
+    windir = (os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+              or "C:\\Windows").rstrip("\\").lower() + "\\"
+    out = []
+    for r in rows:
+        if not (r["started"] and r["started"] >= stamp and r["pid"] not in exclude
+                and re.search(r"(?i)(?:^|\s)[-/](?:Embedding|automation)\b", r["cmd"])):
+            continue
+        m = re.match(r'\s*"([^"]*)"|\s*(\S+)', r["cmd"])
+        exe = ((m.group(1) or m.group(2) or "") if m else "").lower()
+        if exe.startswith(windir) or "\\windowsapps\\" in exe:
+            continue
+        out.append({"pid": r["pid"], "image": r["name"]})
+    return out
+
+
+def _tree_of(pid: int) -> list[dict]:
+    """A running process and its descendants ([{pid, image}]) from one
+    process scan — for launches that are NOT in a job (the user's
+    automations), so a reply can say what is still running. A child must
+    have started after its parent, or its ppid is a reused pid."""
+    rows = _cim_processes()
+    root = next((r for r in rows if r["pid"] == pid), None)
+    if not root:
+        return []
+    kids: dict = {}
+    for r in rows:
+        kids.setdefault(r["ppid"], []).append(r)
+    out, todo, seen = [], [root], set()
+    while todo:
+        r = todo.pop(0)
+        if r["pid"] in seen:
+            continue
+        seen.add(r["pid"])
+        if r["name"].lower() != "conhost.exe":
+            out.append({"pid": r["pid"], "image": r["name"]})
+        todo += [c for c in kids.get(r["pid"], []) if c["started"] >= r["started"]]
+    return out
+
+
+# --- A child's output, decoded and capped ----------------------------------
+OUTPUT_CAP_BYTES = 100 * 1024      # per stream: the first and last half are kept
+_OEM_CODEC: list = []
+_ANSI_CODEC: list = []
+
+
+def _ansi_codec() -> str:
+    """Python's name for the ANSI code page ('cp1252', ...): what AutoHotkey
+    writes with FileAppend(x, "*") when no encoding is given (A_FileEncoding
+    defaults to CP0 — measured: 'café —' arrives as 63 61 66 E9 20 97).
+    A launched macro's stdout/stderr fall back to it, never to the console's
+    OEM code page, which turned those bytes into 'cafΘ ù'."""
+    if not _ANSI_CODEC:
+        name = "cp1252"
+        try:
+            import codecs
+            import ctypes
+            n = int(ctypes.windll.kernel32.GetACP())
+            cand = "utf-8" if n == 65001 else f"cp{n}"
+            codecs.lookup(cand)
+            name = cand
+        except Exception:           # noqa: BLE001
+            pass
+        _ANSI_CODEC.append(name)
+    return _ANSI_CODEC[0]
+
+
+def _oem_codec() -> str:
+    """Python's name for the console's OEM code page ('cp437', 'cp850', ...),
+    '' when it can't be had. Console programs that don't choose an encoding
+    write in it."""
+    if not _OEM_CODEC:
+        name = ""
+        try:
+            import codecs
+            import ctypes
+            n = int(ctypes.windll.kernel32.GetOEMCP())
+            name = "utf-8" if n == 65001 else f"cp{n}"
+            codecs.lookup(name)
+        except Exception:           # noqa: BLE001
+            name = ""
+        _OEM_CODEC.append(name)
+    return _OEM_CODEC[0]
+
+
+def _trim_utf8_start(raw: bytes) -> bytes:
+    """Drop continuation bytes a cut left at the start (at most 3)."""
+    i = 0
+    while i < min(3, len(raw)) and 0x80 <= raw[i] <= 0xBF:
+        i += 1
+    return raw[i:]
+
+
+def _trim_utf8_end(raw: bytes) -> bytes:
+    """Drop a multi-byte character a cut split at the end."""
+    for back in range(1, min(4, len(raw)) + 1):
+        b = raw[-back]
+        if b < 0x80:
+            return raw
+        if b >= 0xC0:              # a lead byte: is its sequence complete?
+            need = 2 if b < 0xE0 else 3 if b < 0xF0 else 4
+            return raw if back >= need else raw[:-back]
+    return raw
+
+
+def _pick_codec(head: bytes, tail: bytes = b"", head_cut: bool = False,
+                tail_cut: bool = False, fallback: str = "") -> str:
+    """How a child's output is decoded: UTF-16 (a BOM, or the
+    NUL-every-other-byte shape Windows tools write), else UTF-8 when it
+    decodes, else `fallback` when given (an AutoHotkey macro: the ANSI code
+    page, _ansi_codec), else the console's OEM code page (what a console
+    program writes), else cp1252. head_cut / tail_cut: the bytes are a
+    slice — the head was cut at its end, the tail at its start — so a
+    character split there doesn't fail the UTF-8 test."""
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+    sample = head[:400]
+    odd, even = sample[1::2], sample[0::2]
+    if len(sample) >= 4 and odd.count(0) >= 0.9 * len(odd) and even.count(0) < 0.5 * len(even):
+        return "utf-16-le"
+    try:
+        (_trim_utf8_end(head) if head_cut else head).decode("utf-8")
+        (_trim_utf8_start(tail) if tail_cut else tail).decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        pass
+    return fallback or _oem_codec() or "cp1252"
+
+
+def _decode_with(raw: bytes, codec: str, cut_start: bool = False, cut_end: bool = False) -> str:
+    if codec.startswith("utf-16"):
+        if cut_start and len(raw) % 2:
+            raw = raw[1:]              # a slice ending at the file's end: realign
+        if codec == "utf-16" and not cut_start:
+            return raw.decode("utf-16", "replace")
+        return raw.decode("utf-16-le", "replace")
+    if codec == "utf-8":
+        raw = _trim_utf8_start(raw) if cut_start else raw
+        raw = _trim_utf8_end(raw) if cut_end else raw
+        return raw.decode("utf-8" if cut_start else "utf-8-sig", "replace")
+    return raw.decode(codec, "replace")
+
+
+def _decode_output(raw: bytes, fallback: str = "") -> str:
+    """A whole child output as text, line endings as \\n (see _pick_codec)."""
+    if not raw:
+        return ""
+    return _lf(_decode_with(raw, _pick_codec(raw, fallback=fallback)))
+
+
+def _read_capped(path: Path, cap: int = OUTPUT_CAP_BYTES,
+                 fallback: str = "") -> tuple[str, int, bool]:
+    """(text, total bytes, truncated) for one output file: everything up to
+    `cap`, else its first and last cap/2 bytes around a
+    '... N bytes omitted ...' line — the head says how it started, the
+    tail how it ended (usually where the error is)."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "", 0, False
+    with open(path, "rb") as f:
+        if size <= cap:
+            return _decode_output(f.read(), fallback), size, False
+        half = cap // 2
+        head = f.read(half)
+        f.seek(max(half, size - half))
+        tail = f.read(half)
+    codec = _pick_codec(head, tail, head_cut=True, tail_cut=True, fallback=fallback)
+    omitted = size - len(head) - len(tail)
+    return (_lf(_decode_with(head, codec, cut_end=True)) + f"\n... {omitted} bytes omitted ...\n"
+            + _lf(_decode_with(tail, codec, cut_start=True)), size, True)
+
+
+def _tail_lines(path: Path, n: int, cap: int = OUTPUT_CAP_BYTES) -> tuple[str, int, bool]:
+    """(last n lines, total bytes, more_before) of an output file that may
+    still be growing — at most `cap` bytes are read."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "", 0, False
+    with open(path, "rb") as f:
+        head = f.read(400)
+        f.seek(max(0, size - cap))
+        tail = f.read(cap)
+    cut = size > cap
+    codec = _pick_codec(head, tail, head_cut=size > len(head), tail_cut=cut)
+    text = _lf(_decode_with(tail, codec, cut_start=cut))
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines[-n:]), size, cut or len(lines) > n
+
+
+# --- run_process: a program, directly, no shell ----------------------------
+_PROGRAM_EXTS = (".exe", ".com")
+STDIN_CAP_BYTES = 10 * 1024 * 1024
+
+
+def _not_a_program(path: str) -> VoiceKitError:
+    """Why a non-.exe target is refused, with the explicit form that runs it."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".bat", ".cmd"):
+        return VoiceKitError(
+            f"'{os.path.basename(path)}' is a batch file, and run_process starts programs "
+            f"directly — batch arguments go through cmd.exe's own parsing, which makes passing "
+            f"them safely impossible to do for you (the 'BatBadBut' problem). Run it "
+            f"explicitly: exe='cmd.exe', args=['/d', '/c', r'{path}', 'arg1', ...] — cmd.exe "
+            f"then parses that line itself (& | < > ^ % are special to it), so keep arguments "
+            f"plain or escape them for cmd.")
+    if ext == ".ps1":
+        return VoiceKitError(
+            f"'{os.path.basename(path)}' is a PowerShell script. Run it explicitly: "
+            f"exe='powershell.exe', args=['-NoProfile', '-NonInteractive', '-ExecutionPolicy', "
+            f"'Bypass', '-File', r'{path}', 'arg1', ...].")
+    if ext in (".py", ".pyw"):
+        return VoiceKitError(
+            f"'{os.path.basename(path)}' is a Python script. Run it with the interpreter: "
+            f"exe='python' (or a full python.exe path), args=[r'{path}', 'arg1', ...].")
+    if ext in (".vbs", ".js", ".wsf"):
+        return VoiceKitError(
+            f"'{os.path.basename(path)}' is a Windows Script Host file. Run it explicitly: "
+            f"exe='cscript.exe', args=['//NoLogo', r'{path}', ...].")
+    if ext == ".ahk":
+        return VoiceKitError(
+            f"'{os.path.basename(path)}' is an AutoHotkey script: run_automation runs a "
+            f"VoiceKit macro, run_ahk_snippet runs code, or exe='{AHK_EXE}', args=['/ErrorStdOut', "
+            f"r'{path}', ...] runs any script file.")
+    return VoiceKitError(
+        f"'{os.path.basename(path)}' isn't a program (.exe / .com). Run it with the program "
+        f"that opens it, e.g. exe='<that program>', args=[r'{path}'].")
+
+
+def _resolve_program(exe: str) -> str:
+    """The full path of the program to start: a full path as given (the
+    %USERPROFILE% / %TEMP% forms and privacy tokens expanded), or a bare name
+    looked up on PATH like a shell would (shutil.which, PATHEXT included —
+    so 'npm' finds npm.cmd and is refused with the explicit form)."""
+    raw = (exe or "").strip().strip('"').strip()
+    if not raw:
+        raise VoiceKitError("exe is required: a program name on PATH ('python', 'git') or a "
+                            "full path to an .exe.")
+    if any(ch in raw for ch in "\r\n\0"):
+        raise VoiceKitError("exe can't contain a line break.")
+    raw = expand_user_paths(raw)
+    if any(ch in raw for ch in "\\/:"):
+        p = Path(raw)
+        if not p.is_absolute():
+            raise VoiceKitError(f"'{exe}' is a relative path — give a full path, or a bare "
+                                f"program name to find on PATH.")
+        if p.is_dir():
+            raise VoiceKitError(f"'{exe}' is a folder, not a program.")
+        if not p.is_file():
+            if not p.suffix and p.with_name(p.name + ".exe").is_file():
+                p = p.with_name(p.name + ".exe")
+            else:
+                raise VoiceKitError(f"'{exe}' doesn't exist (check the path; a masked path "
+                                    f"is passed back exactly as a response showed it)."
+                                    + _missing_hint(exe))
+        path = str(p)
+    else:
+        found = shutil.which(raw)
+        if not found:
+            raise VoiceKitError(f"'{raw}' wasn't found on this PC's PATH. Give the full path "
+                                f"to the .exe instead.")
+        path = found
+    if os.path.splitext(path)[1].lower() not in _PROGRAM_EXTS:
+        raise _not_a_program(path)
+    return path
+
+
+def _child_env(env) -> dict:
+    """The server's environment with `env` merged over it (names
+    caseless, like Windows; a None value removes a variable), values
+    expanded like every path a tool takes, and PYTHONIOENCODING=utf-8 +
+    PYTHONUNBUFFERED=1 unless something already sets them (see below)."""
+    merged = dict(os.environ)
+    if env is not None:
+        if not isinstance(env, dict):
+            raise VoiceKitError("env is an object of NAME -> value strings.")
+        for name, value in env.items():
+            if not isinstance(name, str) or not name.strip() or "=" in name or "\0" in name:
+                raise VoiceKitError(f"{name!r} isn't a valid environment variable name.")
+            for old in [k for k in merged if k.upper() == name.upper()]:
+                del merged[old]
+            if value is None:
+                continue
+            if not isinstance(value, str) or "\0" in value:
+                # The value is never echoed: env is where secrets go.
+                raise VoiceKitError(f"env {name}: the value must be a string without NUL "
+                                    f"characters.")
+            merged[name] = expand_user_paths(value) or ""
+    # Python defaults, unless the caller's env names the variable (even to
+    # remove it) or the server's own environment already sets it:
+    #  - PYTHONIOENCODING=utf-8: prints any character instead of dying with
+    #    UnicodeEncodeError on a cp1252 file;
+    #  - PYTHONUNBUFFERED=1: stdout to a FILE is block-buffered (~8 KB), so a
+    #    running job's read_job tail stayed empty for the whole run and a
+    #    timed-out run lost everything it had printed — a hard kill never
+    #    flushes (found in review: an agent polling a 90 s job saw nothing).
+    named = {k.upper() for k in (env or {})}
+    for var, val in (("PYTHONIOENCODING", "utf-8"), ("PYTHONUNBUFFERED", "1")):
+        if var not in named and not any(k.upper() == var for k in merged):
+            merged[var] = val
+    return merged
+
+
+def _run_cwd(cwd) -> str | None:
+    if cwd is None or not str(cwd).strip():
+        return None
+    c = expand_user_paths(str(cwd).strip().strip('"'))
+    p = Path(c)
+    if not p.is_absolute() or not p.is_dir():
+        raise VoiceKitError(f"cwd '{cwd}' isn't an existing folder (give a full path)."
+                            + (_missing_hint(cwd) if p.is_absolute() else ""))
+    return str(p)
+
+
+def run_process(exe: str, args: list | None = None, cwd: str | None = None,
+                timeout_s: int | None = None, stdin: str | None = None,
+                env: dict | None = None, background: bool = False) -> dict:
+    """Run a program directly — no shell, no AutoHotkey, no quoting layers —
+    and return its exit code, stdout and stderr (foreground), or start it as
+    a background JOB and return its id at once (background=True).
+
+    The feedback that asked for it: every 'run python' went through
+    run_ahk_snippet as a cmd /c line inside an AHK string — two quoting
+    languages deep — and cmd redirects to get the output back.
+
+    `args` is an argv list (each entry exactly one argument; spaces, quotes
+    and & need no escaping). exe/args/cwd/env values take the %USERPROFILE% /
+    %TEMP% forms and privacy tokens a response showed. A .bat/.cmd/.ps1/.py
+    target is refused with the explicit form that runs it. Runs hidden
+    (CREATE_NO_WINDOW), stdin empty unless given, and in a job object: a
+    foreground run that times out — or is cancelled — ends with its whole
+    tree, and so does anything it leaves running when it exits (a
+    foreground run owns its tree; start something meant to keep running
+    with background=True). Foreground cwd defaults to %TEMP%, a background
+    job's to its own folder."""
+    tokens = _input_tokens(exe, args, cwd, env)
+    path = _resolve_program(exe)
+    # Multi-line arguments are fine for a program (python -c "<several
+    # lines>"), but cmd.exe stops reading its command line at the first line
+    # break, so for cmd they would be silently cut: refused there only.
+    is_cmd = os.path.basename(path).lower() == "cmd.exe"
+    try:
+        argv = [expand_user_paths(a) for a in _run_args(args, line_breaks=not is_cmd)]
+    except VoiceKitError as e:
+        if "line break" not in str(e):
+            raise
+        raise VoiceKitError("cmd.exe stops reading its command line at the first line break, "
+                            "so the rest would be silently dropped. Run the program directly "
+                            "(exe='python', args=['-c', '<multi-line code>'] works), or write "
+                            "a script file and pass its path.") from None
+    cwd_ = _run_cwd(cwd)
+    child_env = _child_env(env)
+    if stdin is not None and not isinstance(stdin, str):
+        raise VoiceKitError("stdin is text (it is sent as UTF-8).")
+    stdin_bytes = stdin.encode("utf-8") if stdin else None
+    if stdin_bytes and len(stdin_bytes) > STDIN_CAP_BYTES:
+        raise VoiceKitError(f"stdin is over {STDIN_CAP_BYTES // (1024 * 1024)} MB — write it to "
+                            f"a file and pass the path instead.")
+    if background:
+        try:
+            return _start_job(path, argv, cwd_, child_env, stdin_bytes, timeout_s, tokens)
+        except OSError as e:
+            raise VoiceKitError(f"Couldn't start {os.path.basename(path)}: {e}") from None
+    timeout, capped = _cap_timeout(timeout_s, 30, "use background=True and poll read_job")
+    with tempfile.TemporaryDirectory(prefix="vk-run-", ignore_cleanup_errors=True) as d:
+        out_p, err_p = Path(d) / "stdout.txt", Path(d) / "stderr.txt"
+        in_p = None
+        if stdin_bytes:
+            in_p = Path(d) / "stdin.txt"
+            in_p.write_bytes(stdin_bytes)
+        run_dir = cwd_ or tempfile.gettempdir()
+        try:
+            r = _run_bounded([path, *argv], timeout, cwd=run_dir, env=child_env,
+                             stdin_path=in_p, out_path=out_p, err_path=err_p,
+                             label="run_process", leftovers="kill", tokens=tokens)
+        except OSError as e:
+            # e.g. "%1 is not a valid Win32 application" — say which program,
+            # not "couldn't run AutoHotkey" (the generic OSError text).
+            raise VoiceKitError(f"Couldn't start {os.path.basename(path)}: {e}") from None
+        stdout, n_out, cut_out = _read_capped(out_p)
+        stderr, n_err, cut_err = _read_capped(err_p)
+    res = {"exe": path, "cwd": run_dir, "exit_code": r["exit_code"], "stdout": stdout,
+           "stderr": stderr, "timed_out": r["timed_out"], "killed": r["killed"],
+           "duration_s": r["duration_s"]}
+    for key, n, cut in (("stdout", n_out, cut_out), ("stderr", n_err, cut_err)):
+        if cut:
+            res[f"{key}_truncated"] = (f"{n} bytes in all — the first and last "
+                                       f"{OUTPUT_CAP_BYTES // 2048} KB are shown.")
+    if capped:
+        res["timeout_capped"] = capped
+    if r["cancelled"]:
+        res["cancelled"] = True
+        res["note"] = "The request was cancelled, so the program and everything it started were ended."
+    elif r["timed_out"]:
+        res["note"] = (f"Killed after {timeout} s, with everything it had started (killed lists "
+                       f"them). For longer work use background=True, then read_job.")
+        if r["possibly_left_running"]:
+            res["possibly_left_running"] = r["possibly_left_running"]
+            res["note"] += " " + COM_STRAY_NOTE
+    elif r["killed"]:
+        res["note"] = (f"Exited with code {r['exit_code']} but left {len(r['killed'])} "
+                       f"process(es) running; they were ended with it (a foreground run owns "
+                       f"its whole tree — start something meant to keep running with "
+                       f"background=True).")
+    elif r["exit_code"]:
+        res["note"] = f"Exited with code {r['exit_code']} — stderr usually says why."
+    return res
+
+
+# --- Background jobs ---------------------------------------------------------
+# A VoiceKit "job" (not to be confused with the Windows job object it runs
+# in): a run_process(background=True) child whose output goes to files in
+# %TEMP%\VoiceKit\jobs\<id>\ (stdout.txt, stderr.txt, meta.json, and
+# exit.json once it ends). Jobs are not tied to this server — no
+# kill-on-close — so they survive a server restart; their tree stays
+# killable through the job object this server holds, and after a restart
+# through pid + creation time + taskkill /T.
+JOBS_ROOT: Path | None = None           # tests retarget; None = %TEMP%\VoiceKit\jobs
+JOB_DEFAULT_LIFETIME_S = 3600           # a background job's timeout_s when none is given
+JOB_MAX_LIFETIME_S = 7 * 24 * 3600
+JOB_KEEP_DAYS = 7                       # finished job folders older than this are pruned
+JOB_KEEP_MAX = 50                       # ...and never more than this many folders kept
+_JOB_ID_RE = re.compile(r"^j\d{8}-\d{6}-[0-9a-f]{4}$")
+_JOBS: dict = {}                        # job id -> {tree, lock, stopped, released, ...}
+_JOBS_LOCK = threading.Lock()
+
+
+def _jobs_dir() -> Path:
+    return Path(JOBS_ROOT) if JOBS_ROOT else Path(tempfile.gettempdir()) / "VoiceKit" / "jobs"
+
+
+def _write_json(path: Path, obj: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _start_job(path: str, argv: list, cwd: str | None, env: dict, stdin_bytes: bytes | None,
+               lifetime_s, tokens: tuple = ()) -> dict:
+    lifetime = JOB_DEFAULT_LIFETIME_S if lifetime_s is None else max(0, _as_int(lifetime_s, 0))
+    lifetime = min(lifetime, JOB_MAX_LIFETIME_S)
+    _prune_jobs(JOB_KEEP_MAX - 1)
+    root = _jobs_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    while True:
+        jid = f"j{datetime.now():%Y%m%d-%H%M%S}-{secrets.token_hex(2)}"
+        d = root / jid
+        try:
+            d.mkdir()
+            break
+        except FileExistsError:
+            continue
+    out_p, err_p = d / "stdout.txt", d / "stderr.txt"
+    fin = None
+    if stdin_bytes:
+        (d / "stdin.txt").write_bytes(stdin_bytes)
+        fin = open(d / "stdin.txt", "rb")
+    try:
+        with open(out_p, "wb") as fo, open(err_p, "wb") as fe:
+            tree = _ProcTree([path, *argv], cwd=cwd or str(d), env=env, stdin=fin, stdout=fo,
+                             stderr=fe, kill_on_close=False, breakaway=True, label=f"job {jid}")
+    except BaseException:
+        shutil.rmtree(d, ignore_errors=True)
+        raise
+    finally:
+        if fin:
+            fin.close()
+    tree.tokens = tuple(tokens)
+    # exe is the FULL path: the reply's path pass then sees (and masks) a
+    # program that lives in a client folder; tokens are what its inputs
+    # carried, re-expanded by every later read (_recall_tokens).
+    meta = {"id": jid, "pid": tree.pid, "created": tree.created, "exe": path,
+            "started": _now_text(), "started_epoch": time.time(), "lifetime_s": lifetime,
+            "cwd": cwd or str(d), "tokens": list(tokens)}
+    _write_json(d / "meta.json", meta)
+    entry = {"tree": tree, "lock": threading.RLock(), "stopped": False, "released": False,
+             "dir": d, "t0": time.monotonic(), "lifetime": lifetime}
+    with _JOBS_LOCK:
+        _JOBS[jid] = entry
+    threading.Thread(target=_watch_job, args=(jid, entry), daemon=True,
+                     name=f"voicekit-job-{jid}").start()
+    return {"job_id": jid, "pid": tree.pid, "exe": path, "started": meta["started"],
+            "lifetime_s": lifetime, "folder": str(d), "cwd": meta["cwd"],
+            "note": (f"Running in the background. read_job('{jid}') shows its state and the "
+                     f"tail of its output; stop_job('{jid}') ends it and everything it "
+                     f"started. " + (f"It is ended after {lifetime} s at the latest. "
+                                     if lifetime else "It has no time limit. ")
+                     + "It isn't tied to this server: it keeps running across a server "
+                       "restart (then its exit code can't be known).")}
+
+
+def _watch_job(jid: str, entry: dict) -> None:
+    """Record a background job's exit, and enforce its lifetime on the whole
+    tree — descendants that outlive the main process included (they stay
+    stoppable until they end or the lifetime does)."""
+    tree, lifetime = entry["tree"], entry["lifetime"]
+    deadline = entry["t0"] + lifetime if lifetime else None
+    exit_p = entry["dir"] / "exit.json"
+    try:
+        try:
+            rc = tree.proc.wait(timeout=None if deadline is None
+                                else max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            rc = None
+        with entry["lock"]:
+            if entry["stopped"]:
+                return
+            if rc is None:
+                killed = tree.kill()
+                entry["stopped"] = True
+                _write_json(exit_p, {"state": "killed", "exit_code": None, "ended": _now_text(),
+                                     "ended_epoch": time.time(), "killed": killed,
+                                     "reason": f"Its lifetime ({lifetime} s) ran out, so it was "
+                                               f"ended with everything it had started."})
+                tree.release()
+                entry["released"] = True
+                return
+            _write_json(exit_p, {"state": "exited", "exit_code": rc, "ended": _now_text(),
+                                 "ended_epoch": time.time()})
+        while True:
+            with entry["lock"]:
+                if entry["stopped"] or entry["released"]:
+                    return
+                rest = tree.processes()
+                if not rest:
+                    tree.release()
+                    entry["released"] = True
+                    return
+                if deadline is not None and time.monotonic() >= deadline:
+                    killed = tree.kill()
+                    rec = _read_json(exit_p) or {}
+                    rec["leftovers_killed"] = killed
+                    _write_json(exit_p, rec)
+                    tree.release()
+                    entry["released"] = True
+                    entry["stopped"] = True
+                    return
+            time.sleep(1.0)
+    except Exception:               # noqa: BLE001 — a watcher must never take the server down
+        pass
+
+
+def _job_ids() -> list[str]:
+    root = _jobs_dir()
+    if not root.is_dir():
+        return []
+    return sorted((p.name for p in root.iterdir() if p.is_dir() and _JOB_ID_RE.match(p.name)),
+                  reverse=True)
+
+
+def _job_running(jid: str) -> bool:
+    """True while the job's tree has anything running (main or leftovers)."""
+    entry = _JOBS.get(jid)
+    if entry and not entry["released"]:
+        return bool(entry["tree"].processes())
+    meta = _read_json(_jobs_dir() / jid / "meta.json") or {}
+    return _same_process_alive(meta.get("pid"), meta.get("created"))
+
+
+def _prune_jobs(keep: int = JOB_KEEP_MAX) -> None:
+    """Finished job folders older than JOB_KEEP_DAYS go, and never more than
+    `keep` folders stay (oldest finished first; _start_job keeps room for the
+    one it is about to make). A running job's folder is never touched."""
+    ids = sorted(_job_ids())                       # oldest first (ids start with a stamp)
+    finished = [j for j in ids if not _job_running(j)]
+    now = time.time()
+    victims = set()
+    for j in finished:
+        d = _jobs_dir() / j
+        newest = max((p.stat().st_mtime for p in d.iterdir() if p.is_file()),
+                     default=d.stat().st_mtime)
+        if now - newest > JOB_KEEP_DAYS * 86400:
+            victims.add(j)
+    over = len(ids) - len(victims) - keep
+    for j in finished:
+        if over <= 0:
+            break
+        if j not in victims:
+            victims.add(j)
+            over -= 1
+    for j in victims:
+        shutil.rmtree(_jobs_dir() / j, ignore_errors=True)
+        with _JOBS_LOCK:
+            _JOBS.pop(j, None)
+
+
+def _require_job(job_id) -> str:
+    jid = str(job_id or "").strip()
+    if not _JOB_ID_RE.match(jid) or not (_jobs_dir() / jid).is_dir():
+        raise VoiceKitError(f"No job '{job_id}' — read_job() with no id lists the jobs this PC "
+                            f"has (finished ones are kept {JOB_KEEP_DAYS} days).")
+    return jid
+
+
+def _job_status(jid: str) -> dict:
+    """One job's state from its files plus, when this server started it, its
+    live tree."""
+    d = _jobs_dir() / jid
+    meta = _read_json(d / "meta.json") or {}
+    _recall_tokens(meta.get("tokens"))
+    ex = _read_json(d / "exit.json")
+    entry = _JOBS.get(jid)
+    out: dict = {"job_id": jid, "exe": meta.get("exe", "?"), "pid": meta.get("pid"),
+                 "started": meta.get("started", "")}
+    notes = []
+    if entry:
+        main_running = entry["tree"].proc.poll() is None
+        alive = [] if entry["released"] else entry["tree"].processes()
+    else:
+        main_running = _same_process_alive(meta.get("pid"), meta.get("created"))
+        alive = ([{"pid": meta.get("pid"), "image": os.path.basename(str(meta.get("exe", "?")))}]
+                 if main_running else [])
+    t_start = meta.get("started_epoch")
+    if main_running:
+        out["state"] = "running"
+        out["exit_code"] = None
+        if not entry:
+            notes.append("Started by an earlier run of this server: it is still running, but "
+                         "its exit code won't be known and its lifetime limit is no longer "
+                         "enforced (stop_job still ends it).")
+    elif ex:
+        out["state"] = ex.get("state", "exited")
+        out["exit_code"] = ex.get("exit_code")
+        out["ended"] = ex.get("ended", "")
+        if ex.get("reason"):
+            notes.append(ex["reason"])
+        if ex.get("killed"):
+            out["killed"] = ex["killed"]
+        if ex.get("leftovers_killed"):
+            out["leftovers_killed"] = ex["leftovers_killed"]
+    elif entry:
+        # Exited this instant — its watcher hasn't written exit.json yet.
+        out["state"] = "exited"
+        out["exit_code"] = entry["tree"].proc.poll()
+    else:
+        out["state"] = "exited"
+        out["exit_code"] = None
+        notes.append("Its exit code is unknown — this server restarted while it ran, and only "
+                     "the server that starts a job sees how it ends.")
+    end = time.time() if main_running else (ex or {}).get("ended_epoch")
+    if isinstance(t_start, (int, float)) and isinstance(end, (int, float)):
+        out["duration_s"] = round(end - t_start, 1)
+    rest = [p for p in alive if p.get("pid") != meta.get("pid")]
+    if rest and not main_running:
+        out["still_running"] = rest
+        notes.append(f"The program exited but left {len(rest)} process(es) running "
+                     f"(still_running); stop_job ends them.")
+    if notes:
+        out["note"] = " ".join(notes)
+    return out
+
+
+def read_job(job_id: str | None = None, tail_lines: int = 50) -> dict:
+    """A background job's state and the tail of its output — or, with no id,
+    every job this PC has (newest first)."""
+    if not str(job_id or "").strip():
+        _prune_jobs()
+        jobs = []
+        for jid in _job_ids():
+            st = _job_status(jid)
+            st.pop("note", None)
+            jobs.append(st)
+        return {"jobs": jobs, "folder": str(_jobs_dir()),
+                "note": ("No background jobs." if not jobs else
+                         "read_job('<id>') shows one job's output tail; stop_job ends one.")}
+    jid = _require_job(job_id)
+    n = max(1, min(_as_int(tail_lines, 50), 500))
+    st = _job_status(jid)
+    d = _jobs_dir() / jid
+    for stream in ("stdout", "stderr"):
+        text, size, more = _tail_lines(d / f"{stream}.txt", n)
+        st[f"{stream}_tail"] = text
+        st[f"{stream}_bytes"] = size
+        if more:
+            st[f"{stream}_more"] = f"Only the last {n} line(s) are shown (tail_lines)."
+    st["folder"] = str(d)
+    return st
+
+
+def stop_job(job_id: str, grace_s: int = 0) -> dict:
+    """End a background job and everything it started; report what was
+    killed. grace_s first waits that long for it to finish on its own."""
+    jid = _require_job(job_id)
+    grace, capped = _cap_wait(grace_s, "grace_s", 0, "call stop_job again")
+    d = _jobs_dir() / jid
+    exit_p = d / "exit.json"
+    meta = _read_json(d / "meta.json") or {}
+    _recall_tokens(meta.get("tokens"))
+    entry = _JOBS.get(jid)
+    out: dict = {"job_id": jid}
+    restart_note = ""
+    if capped:
+        out["grace_capped"] = capped
+    if entry:
+        tree = entry["tree"]
+        if grace and tree.proc.poll() is None:
+            try:
+                tree.proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+        with entry["lock"]:
+            was_running = tree.proc.poll() is None
+            killed = [] if entry["released"] else tree.kill()
+            entry["stopped"] = True
+            tree.release()
+            entry["released"] = True
+            if was_running:
+                _write_json(exit_p, {"state": "stopped", "exit_code": None, "ended": _now_text(),
+                                     "ended_epoch": time.time(), "killed": killed,
+                                     "reason": "Stopped by stop_job."})
+            elif killed:
+                rec = _read_json(exit_p) or {"state": "exited", "exit_code": tree.proc.poll()}
+                rec["leftovers_killed"] = killed
+                _write_json(exit_p, rec)
+    else:
+        was_running = _same_process_alive(meta.get("pid"), meta.get("created"))
+        killed = []
+        if was_running:
+            pid = int(meta["pid"])
+            killed = [{"pid": pid, "image": _image_name(pid)}]
+            _kill_tree(pid)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and _pid_image(pid) is not None:
+                time.sleep(0.05)
+            _write_json(exit_p, {"state": "stopped", "exit_code": None, "ended": _now_text(),
+                                 "ended_epoch": time.time(), "killed": killed,
+                                 "reason": "Stopped by stop_job after a server restart "
+                                           "(taskkill /T from its pid)."})
+            restart_note = (" It was started by an earlier run of this server, so it was "
+                            "ended with taskkill /T from its pid: processes it started that "
+                            "had already outlived their own parent can't be traced.")
+    out["stopped"] = bool(was_running or killed)
+    out["killed"] = killed
+    out["state"] = _job_status(jid)["state"]
+    if not out["stopped"]:
+        out["note"] = "Nothing to stop — it had already finished (read_job shows how it ended)."
+    elif was_running:
+        out["note"] = f"Stopped; {len(killed)} process(es) ended." + restart_note
+    else:
+        out["note"] = (f"It had already exited; {len(killed)} process(es) it left running were "
+                       f"ended.")
+    return out
+
+
+# --- list_processes ----------------------------------------------------------
+def _voicekit_tags(rows: list) -> dict:
+    """pid -> what VoiceKit knows the process to be."""
+    tags: dict = {}
+    me = os.getpid()
+    py = [{"pid": r["pid"], "ppid": r["ppid"], "cmd": r["cmd"], "started": r["started"]}
+          for r in rows if r["name"].lower().startswith("python")]
+    for s in _mcp_server_processes(py):
+        t = "this MCP server" if s["this_server"] else "VoiceKit MCP server (other instance)"
+        for pid in s["pids"]:
+            tags[pid] = t
+    tags[me] = "this MCP server"
+    ahk = os.path.basename(AHK_EXE).lower()
+    root = re.escape(str(REPO_ROOT))
+    for r in rows:
+        if r["name"].lower() != ahk:
+            continue
+        c = r["cmd"]
+        if _script_matches(c, "VoiceKit.ahk"):
+            t = "VoiceKit master"
+        elif _script_matches(c, "VoiceKitLauncher.ahk"):
+            t = "VoiceKit launcher"
+        elif _script_matches(c, "lib\\Watchdog.ahk"):
+            t = "VoiceKit watchdog"
+        elif _script_matches(c, "lib\\LoopRunner.ahk"):
+            m = re.search(r'(?i)\\lib\\LoopRunner\.ahk"?\s+"?([^"\s]+)', c)
+            t = f"loop {space_out(m.group(1))}" if m else "loop"
+        elif _script_matches(c, "mcp\\uia_probe.ahk"):
+            t = "UIA probe (inspect_focus / dump_uia_tree)"
+        else:
+            m = re.search(root + r"\\hotkeys\\bodies\\([^\\/:*?\"<>|]+)\.body\.ahk", c, re.I)
+            m2 = re.search(root + r"\\macros\\([^\\/:*?\"<>|]+)\.ahk", c, re.I)
+            if m:
+                t = f"module body {space_out(m.group(1))}"
+            elif m2:
+                t = f"macro {space_out(m2.group(1))}"
+            else:
+                continue
+        tags[r["pid"]] = t
+    with _LIVE_LOCK:
+        live = list(_LIVE.values())
+    for t in live:
+        for pid in t.pids():
+            tags[pid] = t.label or "bounded run"
+    for jid in _job_ids():
+        entry = _JOBS.get(jid)
+        if entry and not entry["released"]:
+            for pid in entry["tree"].pids():
+                tags[pid] = f"job {jid}"
+        elif not entry:
+            meta = _read_json(_jobs_dir() / jid / "meta.json") or {}
+            if _same_process_alive(meta.get("pid"), meta.get("created")):
+                tags[int(meta["pid"])] = f"job {jid}"
+    for r in rows:
+        if r["ppid"] == me and r["pid"] not in tags:
+            tags[r["pid"]] = "started by this MCP server"
+    return tags
+
+
+def list_processes(name: str | None = None, include_command_line: bool = True,
+                   max_rows: int = 200) -> dict:
+    """Every running process (or those whose image name contains `name`),
+    with pid, parent pid, image, start time, command line, and a `voicekit`
+    field on VoiceKit's own — this server, other server instances, the
+    master, module bodies, macros, loops, snippets, run_process runs and
+    background jobs. One process scan (_cim_processes)."""
+    rows = _cim_processes()
+    if not rows:
+        raise VoiceKitError("Couldn't list processes (the PowerShell process query failed).")
+    tags = _voicekit_tags(rows)
+    # A command line can carry a name that came in as a token (an argument,
+    # a cwd): re-expand what every launch this server knows of carried, so
+    # the answer masks those names (over-masking an unrelated row is safe).
+    with _LIVE_LOCK:
+        known = [t.tokens for t in _LIVE.values()] + list(_LAUNCH_TOKENS.values())
+    known += [e["tree"].tokens for e in list(_JOBS.values())]
+    for jid in _job_ids():
+        known.append((_read_json(_jobs_dir() / jid / "meta.json") or {}).get("tokens") or ())
+    for toks in known:
+        _recall_tokens(toks)
+    needle = (name or "").strip().lower()
+    hits = [r for r in rows if not needle or needle in r["name"].lower()]
+    hits.sort(key=lambda r: (0 if r["pid"] in tags else 1, r["name"].lower(), r["pid"]))
+    cap = max(1, min(_as_int(max_rows, 200), 2000))
+    procs = []
+    for r in hits[:cap]:
+        e = {"pid": r["pid"], "ppid": r["ppid"], "image": r["name"],
+             "started": _stamp_text(r["started"])}
+        if include_command_line:
+            c = r["cmd"]
+            e["command_line"] = c if len(c) <= 2000 else c[:2000] + " ..."
+        if r["pid"] in tags:
+            e["voicekit"] = tags[r["pid"]]
+        procs.append(e)
+    out = {"processes": procs, "matched": len(hits), "shown": len(procs),
+           "this_server_pid": os.getpid(),
+           "note": ("VoiceKit's own processes come first, tagged in 'voicekit'. 'python.exe' "
+                    "includes this MCP server itself — to know whether YOUR program still "
+                    "runs, check its pid or read_job, never a bare image-name match like "
+                    "ProcessExist('python.exe').")}
+    if len(hits) > cap:
+        out["truncated"] = f"{len(hits) - cap} more not shown (max_rows, or narrow with name=)."
     return out
 
 
@@ -5630,9 +7789,13 @@ def run_ahk_snippet(code: str, timeout_s: int = 15) -> dict:
     anywhere else is refused. The code stays in the temp folder only."""
     if not (code or "").strip():
         raise VoiceKitError("No code to run.")
+    tokens = _input_tokens(code)          # list_processes masks them later too
     code = privacy.expand_ahk_code(code, REPO_ROOT)
-    timeout_s = max(1, min(_as_int(timeout_s, 15), 120))
-    with tempfile.TemporaryDirectory() as d:
+    timeout_s, capped = _cap_timeout(timeout_s, 15, "use run_process(background=True) for a "
+                                     "long-running program and poll read_job")
+    # ignore_cleanup_errors: a child the snippet Run() on purpose may still
+    # have the folder as its working directory.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
         out_file = Path(d) / "snippet-out.txt"
         err_file = Path(d) / "snippet-err.txt"
         script = Path(d) / "snippet.ahk"
@@ -5646,17 +7809,21 @@ def run_ahk_snippet(code: str, timeout_s: int = 15) -> dict:
                    .replace("__PRELUDE_LINES__", str(n_prelude)))
         script.write_text(prelude + f"{code}\n" + "ExitApp(0)\n",
                           encoding="utf-8-sig", newline="")
-        timed_out = False
-        exit_code = None
+        # In a job object (_run_bounded): a timeout or a cancelled request
+        # ends the snippet AND whatever it started — subprocess.run(timeout=)
+        # used to kill only AutoHotkey and orphan its cmd/python children.
+        # Anything still running after a normal exit is left alone (a snippet
+        # may Run() an app on purpose) and reported in left_running.
+        std_out, std_err = Path(d) / "ahk-stdout.txt", Path(d) / "ahk-stderr.txt"
+        r = _run_bounded([AHK_EXE, "/ErrorStdOut=UTF-8", str(script)], timeout_s, cwd=d,
+                         out_path=std_out, err_path=std_err, label="snippet",
+                         leftovers="keep", tokens=tokens)
+        timed_out = r["timed_out"]
+        exit_code = r["exit_code"]
         errors = ""
-        try:
-            r = subprocess.run([AHK_EXE, "/ErrorStdOut=UTF-8", str(script)],
-                               capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", timeout=timeout_s, cwd=d)
-            exit_code = r.returncode
-            errors = (r.stdout or "").strip() or (r.stderr or "").strip()
-        except subprocess.TimeoutExpired:
-            timed_out = True     # subprocess.run kills and reaps on timeout
+        if exit_code is not None:
+            errors = (std_out.read_bytes().decode("utf-8", "replace").strip()
+                      or std_err.read_bytes().decode("utf-8", "replace").strip())
         # A load error names the line in the GENERATED file — "line 67" of a
         # two-line snippet. Re-number past the prelude so it points at the
         # snippet's own line. Anchored to the script filename so a "(42)"
@@ -5688,14 +7855,35 @@ def run_ahk_snippet(code: str, timeout_s: int = 15) -> dict:
             errors = errors.replace(str(script), script.name)
         result = {"exit_code": exit_code, "output": output, "errors": errors,
                   "timed_out": timed_out}
-        if timed_out:
-            result["note"] = (f"Killed after {timeout_s} s. 'output' holds what "
+        if r["killed"]:
+            result["killed"] = r["killed"]
+        if r["left_running"]:
+            result["left_running"] = r["left_running"]
+        if r["possibly_left_running"]:
+            result["possibly_left_running"] = r["possibly_left_running"]
+        if capped:
+            result["timeout_capped"] = capped
+        if r["cancelled"]:
+            result["cancelled"] = True
+            result["note"] = ("The request was cancelled, so the snippet and everything it "
+                              "started were ended.")
+        elif timed_out:
+            result["note"] = (f"Killed after {timeout_s} s, together with everything it had "
+                              f"started ('killed' lists them). 'output' holds what "
                               f"Out() wrote before that — for a wedged probe the "
                               f"partial log is the diagnostic. An uncaught error "
                               f"can't be the cause (those exit immediately with "
                               f"code 3), so the code was still busy or blocked — "
                               f"an endless loop, a wait that never returned, or "
-                              f"a dialog it opened itself.")
+                              f"a dialog it opened itself. To run a program for "
+                              f"longer, use run_process(background=True).")
+            if r["possibly_left_running"]:
+                result["note"] += " " + COM_STRAY_NOTE
+        elif r["left_running"]:
+            result["note"] = (f"The snippet finished but left {len(r['left_running'])} "
+                              f"process(es) it started running (left_running) — on purpose "
+                              f"if it Run() an app; otherwise end them, or start the program "
+                              f"with run_process, which owns and reports its whole tree.")
         elif exit_code == 3 and errors:
             result["note"] = ("The snippet hit an uncaught AHK error — the "
                               "UNCAUGHT line in 'output'/'errors' names it and "

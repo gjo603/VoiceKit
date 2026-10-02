@@ -23,7 +23,10 @@ MaskRoots=D:\\Clients;\\\\server\\share (semicolon list). No tool can change
 it — only the file. Tokens are HMAC-SHA256 of the case-folded name under a
 per-install random key (logs\\privacy.key); the token -> name map lives in
 logs\\privacy-tokens.json so a token handed back as INPUT expands to the real
-name locally (expand_tokens). reveal() is the audited way to read one.
+name locally (expand_tokens). reveal() is the audited way to read one; a
+tool's unmask=[tokens] shows just those tokens in clear in its own answer
+(unmask_spec + protect), and a blanket unmask=True is refused unless
+[Privacy] AllowBlanketUnmask=1.
 
 What this is NOT: data-loss prevention. It stops INCIDENTAL leakage (paths in
 listings, errors, logs, snippet output). A snippet that deliberately Out()s a
@@ -195,7 +198,8 @@ def _expand_env(s: str) -> str:
 
 
 def settings(root=None) -> dict:
-    """{'mode': off|paths|strict, 'mask_roots': [real paths], 'note': str}.
+    """{'mode': off|paths|strict, 'mask_roots': [real paths], 'note': str,
+    'allow_blanket_unmask': bool ([Privacy] AllowBlanketUnmask=1)}.
     A missing file / section / key means the default, paths. An unknown Mode
     value falls back to paths (the safe side) and says so in 'note'."""
     ini = _logs(root) / "settings.ini"
@@ -209,7 +213,7 @@ def settings(root=None) -> dict:
         hit = _SETTINGS_CACHE.get(str(ini))
         if hit and hit[0] == key:
             return hit[1]
-    out = {"mode": DEFAULT_MODE, "mask_roots": [], "note": ""}
+    out = {"mode": DEFAULT_MODE, "mask_roots": [], "note": "", "allow_blanket_unmask": False}
     if stamp is not None:
         try:
             cp = configparser.RawConfigParser(strict=False)
@@ -235,6 +239,12 @@ def settings(root=None) -> dict:
                         r = r[:2]                   # a whole drive: 'D:'
                     roots.append(r.replace("/", "\\"))
                 out["mask_roots"] = roots
+                # AllowBlanketUnmask=1 lets a tool's unmask=True return a whole
+                # response without name tokens. Anything else (absent, 0, a
+                # typo) keeps it refused — only the scoped token-list form works.
+                blanket = (cp.get(sect, "allowblanketunmask", fallback="") or "")
+                out["allow_blanket_unmask"] = \
+                    blanket.strip().strip('"').lower() in ("1", "true", "yes", "on")
         except (OSError, configparser.Error, UnicodeError):
             out["note"] = "settings.ini couldn't be read — using the default privacy mode (paths)."
     with _LOCK:
@@ -495,7 +505,7 @@ def find_tokens(s) -> list[str]:
     return [m.group(0) for m in TOKEN_RE.finditer(s)] if isinstance(s, str) else []
 
 
-def _lookup(root, kind: str, hexpart: str) -> str:
+def _lookup(root, kind: str, hexpart: str, note: bool = True) -> str:
     """The real name behind one path token — verified: the stored name must
     HMAC to the token, so a corrupted or edited map can never expand a token
     to somebody else's file."""
@@ -508,11 +518,14 @@ def _lookup(root, kind: str, hexpart: str) -> str:
     ent = m.tokens.get(hexpart)
     key = _key(root, create=False)
     if ent is None or key is None or not _digest(key, ent["t"]).startswith(hexpart):
-        raise PrivacyError(f"Unknown privacy token {tok} — it isn't in this PC's token map "
-                           f"(logs\\{MAP_FILE}). Tokens come only from this VoiceKit's own "
-                           f"responses; re-read the listing or path that showed it and pass "
-                           f"that token exactly.")
-    _note_expanded(kind, ent["t"])
+        raise PrivacyError(f"Unknown privacy token {tok} — this PC didn't issue it (it isn't "
+                           f"in the token map, logs\\{MAP_FILE}), so it can't be expanded. "
+                           f"Tokens come only from this VoiceKit's own responses; re-read the "
+                           f"listing or path that showed it and pass that token exactly. "
+                           f"check_path(path) tells a token that won't expand from a file "
+                           f"that is really gone.")
+    if note:
+        _note_expanded(kind, ent["t"])
     return ent["t"]
 
 
@@ -704,6 +717,15 @@ _READABLE_TREES = (
     r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\AutoHotkey",
     r"AppData\Roaming\Claude", r"AppData\Local\AnthropicClaude", r".claude", r".claude.json",
 )
+# Under %TEMP%: run_process's background-job folders, by name only —
+# %TEMP%\VoiceKit\jobs\<job id>\ and the files VoiceKit itself writes there.
+# A job id masked as <dir#..> (and then, by the bare-name pass, in the
+# job_id field itself) made read_job / stop_job unusable over MCP. Anything
+# ELSE in a job folder (it is a background job's default cwd, so a program
+# may write client-named files there) stays masked.
+_TEMP_READABLE = re.compile(r"VoiceKit(?:\\jobs(?:\\j\d{8}-\d{6}-[0-9a-f]{4}"
+                            r"(?:\\(?:stdout\.txt|stderr\.txt|meta\.json|exit\.json))?)?)?",
+                            re.IGNORECASE)
 # Folder names a bare-name pass must never rewrite (they're readable above).
 _KNOWN_WORDS = {w.casefold() for w in (
     "Desktop Documents Downloads Pictures Videos Music Favorites Links Contacts Searches "
@@ -806,6 +828,11 @@ class _Ctx:
         for mr in self.mask_roots:
             if _under(f, mr) and f != mr:
                 return False
+        tn = _norm(self.temp)
+        if _under(f, tn) and f != tn:
+            rel = full.replace("/", "\\")[len(self.temp):].strip("\\")
+            if _TEMP_READABLE.fullmatch(rel):
+                return True
         if _under(f, self.pn) and f != self.pn:
             rel = full.replace("/", "\\")[len(self.profile):].strip("\\")
             return any(p.fullmatch(rel) for p in _READABLE_LEVELS)
@@ -1094,31 +1121,164 @@ def _has_id_shape(s: str) -> bool:
     return bool(_SSN_RE.search(s) or _EIN_RE.search(s) or _LABELLED_RE.search(s))
 
 
-def protect(obj, root=None, normalize=None, exempt=(), unmask: bool = False,
-            known: dict | None = None):
+# ---------------------------------------------------------------------------
+# unmask: scoped (a list of tokens) or blanket (True, only when allowed)
+# ---------------------------------------------------------------------------
+UNMASK_MAX_TOKENS = 50
+
+BLANKET_REFUSED = (
+    "unmask=True (every name in the answer in clear) is turned off on this PC. Pass the "
+    "tokens you need instead — unmask=['<file#3a9f>'] or a whole masked path like "
+    "'%USERPROFILE%\\Documents\\<dir#1c2e>\\<file#3a9f>.pdf' (every token in it counts) — "
+    "and only those are shown in clear; everything else stays masked (audited, token "
+    "only). A blanket unmask needs [Privacy] AllowBlanketUnmask=1 in logs\\settings.ini, "
+    "which only the user can set.")
+
+
+def unmask_spec(unmask, root=None):
+    """A tool's `unmask` argument, checked BEFORE the tool runs: None (no
+    unmask), True (blanket — only when [Privacy] AllowBlanketUnmask=1), or a
+    tuple of the exact token strings to show in clear. Accepts True/False, one
+    string, or a list of strings; each string is a token or a whole masked
+    path (every token in it is taken). Raises PrivacyError naming every
+    one-way (<ssn#..>/<ein#..>) or unknown token — nothing is unmasked
+    unless every requested token is one this PC issued."""
+    if unmask is None or unmask is False:
+        return None
+    if unmask is True:
+        if not settings(root)["allow_blanket_unmask"]:
+            raise PrivacyError(BLANKET_REFUSED)
+        return True
+    items = [unmask] if isinstance(unmask, str) else unmask
+    if not isinstance(items, (list, tuple)) or not all(isinstance(i, str) for i in items):
+        raise PrivacyError("unmask takes a list of privacy tokens (or masked paths), e.g. "
+                           "['<file#3a9f>'] — or False.")
+    if not items:
+        return None
+    toks: list = []
+    for it in items:
+        if len(it) > REVEAL_MAX_CHARS:
+            raise PrivacyError(f"An unmask entry is {len(it)} characters — give tokens or "
+                               f"masked paths (up to {REVEAL_MAX_CHARS} each).")
+        found = find_tokens(it)
+        if not found:
+            raise PrivacyError("Every unmask entry must hold a privacy token, e.g. "
+                               "'<file#3a9f>' or a masked path like "
+                               "'%USERPROFILE%\\Documents\\<dir#1c2e>'. A real name or path "
+                               "isn't masked to begin with.")
+        toks.extend(found)
+    toks = list(dict.fromkeys(toks))
+    if len(toks) > UNMASK_MAX_TOKENS:
+        raise PrivacyError(f"unmask names {len(toks)} tokens — at most {UNMASK_MAX_TOKENS}. "
+                           f"Ask only for the names you need.")
+    one_way = [t for t in toks if t.startswith(("<ssn#", "<ein#"))]
+    if one_way:
+        raise PrivacyError(f"{', '.join(one_way)}: one-way ID mask(s) (strict privacy mode) — "
+                           f"the number never left this PC and no tool can show it. Nothing "
+                           f"was run; drop {'it' if len(one_way) == 1 else 'them'} from unmask.")
+    unknown = []
+    for t in toks:
+        m = TOKEN_RE.fullmatch(t)
+        try:
+            _lookup(root, m.group(1), m.group(2), note=False)
+        except PrivacyError:
+            unknown.append(t)
+    if unknown:
+        raise PrivacyError(f"unmask: {', '.join(unknown)} "
+                           f"{'is' if len(unknown) == 1 else 'are'} not a token this PC "
+                           f"issued (not in logs\\{MAP_FILE}, or retired). Nothing was run. "
+                           f"Pass tokens exactly as a response showed them.")
+    return tuple(toks)
+
+
+def _unmask_tokens(obj, toks, root, exempt, report: dict | None):
+    """The scoped unmask, applied to an ALREADY MASKED response: every exact
+    occurrence of a requested token string becomes its real name; any other
+    token — including a longer or shorter one that shares hex digits, or the
+    same hex under the other kind — stays as it is. One regex pass, so a
+    revealed name is never rescanned. Real names come from _lookup, which
+    re-verifies each against its HMAC (raises -> the caller fails closed)."""
+    names = {}
+    for t in toks:
+        m = TOKEN_RE.fullmatch(t)
+        names[t] = _lookup(root, m.group(1), m.group(2), note=False)
+    shown: dict = {}
+
+    def one(m):
+        t = m.group(0)
+        if t in names:
+            shown[t] = True
+            return names[t]
+        return t
+
+    def rep(s):
+        if not isinstance(s, str) or "<" not in s:
+            return s
+        return TOKEN_RE.sub(one, s)
+    obj = _walk(obj, rep, exempt)
+    if report is not None:
+        report["unmasked"] = [t for t in toks if t in shown]
+        report["unused"] = [t for t in toks if t not in shown]
+    return obj
+
+
+def protect(obj, root=None, normalize=None, exempt=(), unmask=False,
+            known: dict | None = None, report: dict | None = None, path_fields=(),
+            segment_fields=()):
     """The whole outbound pipeline for one response (dict/list/str):
     phase-1 normalization, then (paths/strict) path-segment tokens and the
-    bare-name pass, then (strict) ID masks. `exempt` top-level keys are left
-    byte-for-byte. unmask=True skips the path tokens (normalization and, in
-    strict mode, the ID masks still apply). `known` ({folded: (name, kind)},
+    bare-name pass, then the scoped unmask, then (strict) ID masks. `exempt`
+    top-level keys are left byte-for-byte. `known` ({folded: (name, kind)},
     from take_expanded) are names this call's input carried as tokens: they
-    get the bare-name pass here even if no path in the answer shows them."""
+    get the bare-name pass here even if no path in the answer shows them.
+    `path_fields` top-level keys hold exactly one path each (check_path's
+    answers): a path that runs to the end of such a value is masked to its
+    very end, never cut short as if prose followed it. `segment_fields`
+    ((field, path_field) pairs) are top-level fields that hold the LAST
+    segment of a path field: they are re-derived from that field AFTER it
+    is masked, never masked on their own — a bare segment only gets the
+    bare-name pass, which skips short and digit-only names ('JD',
+    '40017788'), so check_path's missing_part showed exactly the name its
+    missing_path masked (found in review, 2026-10-01).
+
+    unmask: False/None = mask everything. A tuple/list of token strings (from
+    unmask_spec) = mask as usual, then show ONLY those exact tokens in clear;
+    `report` (a dict) gets 'unmasked' (shown) and 'unused' (requested but not
+    in the answer). True = skip the path tokens (normalization and, in strict
+    mode, the ID masks still apply) — only when [Privacy] AllowBlanketUnmask=1,
+    re-checked here so a caller that skipped unmask_spec still fails closed."""
     cfg = settings(root)
+    if unmask is True and not cfg.get("allow_blanket_unmask"):
+        raise PrivacyError(BLANKET_REFUSED)
+    scoped = tuple(unmask) if isinstance(unmask, (list, tuple)) else ()
+    if report is not None:
+        report["unmasked"], report["unused"] = [], list(scoped)
     norm = (lambda s: normalize(_override_norm(s))) if normalize else _override_norm
     obj = _walk(obj, lambda s: norm(s), exempt)
     md = cfg["mode"]
     if md == "off":
-        return obj
-    if not unmask:
+        return _derive_segments(obj, segment_fields)
+    if unmask is not True:
         ctx = _Ctx(root, cfg, norm)
 
-        def scan(s):
+        def scan(s, whole=False):
             if not isinstance(s, str) or not ctx.rx.search(s):
                 return s
+            # whole: the value IS one path (a path_fields entry), so a path
+            # running to the end of it ends exactly at the end of its name —
+            # no prose can follow, and the last segment is masked entire.
             return ctx.rx.sub(lambda m: m.group("anchor") + ctx.rewrite_tail(
                 ctx.anchor_base[m.group("anchor").casefold()], m.group("tail"), ctx.collect,
-                closed=m.end() < len(m.string) and m.string[m.end()] in '"<>|'), s)
-        marked = _walk(obj, scan, exempt)
+                closed=(m.end() < len(m.string) and m.string[m.end()] in '"<>|')
+                or (whole and m.start() == 0 and m.end() == len(m.string))), s)
+        if path_fields and isinstance(obj, dict):
+            # _walk's top level, with the path fields scanned as whole paths.
+            marked = {(scan(k) if isinstance(k, str) else k):
+                      (v if k in exempt else
+                       scan(v, True) if k in path_fields and isinstance(v, str) else
+                       _walk(v, scan)) for k, v in obj.items()}
+        else:
+            marked = _walk(obj, scan, exempt)
         for f, (name, kind) in (known or {}).items():
             ctx.found.setdefault(f, (name, "", kind))
             if _bare_ok(name):
@@ -1145,6 +1305,8 @@ def protect(obj, root=None, normalize=None, exempt=(), unmask: bool = False,
             obj = _walk(obj, bare, exempt, keys=False)
         else:
             obj = marked
+        if scoped:
+            obj = _unmask_tokens(obj, scoped, root, exempt, report)
     if md == "strict":
         def ids(s):
             if not isinstance(s, str) or not _has_id_shape(s):
@@ -1152,10 +1314,21 @@ def protect(obj, root=None, normalize=None, exempt=(), unmask: bool = False,
             key = _key(root)
             return _mask_ids(s, key) if key else s
         obj = _walk(obj, ids, exempt)
+    return _derive_segments(obj, segment_fields)
+
+
+def _derive_segments(obj, segment_fields):
+    """Each (field, path_field): field = the last segment of the (already
+    protected) path_field — see protect()."""
+    if not segment_fields or not isinstance(obj, dict):
+        return obj
+    for field, src in segment_fields:
+        if field in obj and isinstance(obj.get(src), str):
+            obj[field] = re.split(r"[\\/]", obj[src].rstrip("\\/"))[-1]
     return obj
 
 
-def protect_text(s: str, root=None, normalize=None, unmask: bool = False) -> str:
+def protect_text(s: str, root=None, normalize=None, unmask=False) -> str:
     return protect(s, root=root, normalize=normalize, unmask=unmask)
 
 

@@ -9,7 +9,7 @@ work unchanged; this is a third path.
 
 ## What it can do
 
-Every tool the server exposes (30). `test_conformance.py` checks this table
+Every tool the server exposes (34). `test_conformance.py` checks this table
 names each one, so a new tool can't ship undocumented.
 
 **Create and change**
@@ -37,18 +37,38 @@ names each one, so a new tool can't ship undocumented.
 | `read_reference` | Worked example code to copy (currently `web-scrape`, a complete scraper body). |
 | `inspect_focus`, `dump_uia_tree` | What has keyboard focus, and a window's UI Automation tree as an outline — the real on-screen names to use in a workflow or a module's `UiaFind`. Out-of-process probes; nothing is clicked. |
 | `list_running`, `read_module_status` | Which module bodies are executing now (pid, start time, latest status line); one module's status line joined to whether its process is actually alive. |
-| `server_info` | Which VoiceKit server you are talking to: version, install root, Python, pid and start time, whether its code changed since it started, every other VoiceKit `server.py` process running, and each client config that registers VoiceKit (command + args, never `env`). The first call when tools show up twice or one seems missing. |
+| `list_processes` | Every running process (or those whose image name contains `name`): pid, parent pid, image, start time, command line, and a `voicekit` tag on VoiceKit's own — this MCP server, other server instances, the master, module bodies, macros, loops, snippets, `run_process` runs and background jobs. `python.exe` includes this server itself, so check your own program by pid or job id. |
+| `server_info` | Which VoiceKit server you are talking to: version, install root, Python, pid and start time, whether its code changed since it started, every other VoiceKit `server.py` process running, and each client config that registers VoiceKit (command + args, never `env`); `connected_client` (the MCP client of this session) and `same_client_duplicates` (registrations ONE client loads twice — the real problem; one per client is normal). The first call when tools show up twice or one seems missing. |
 | `reveal` | The real file/folder name behind a privacy token (`<dir#1c2e>`, `<file#3a9f>.pdf`, or a whole masked path). Audited locally (token and time, never the name); one-way `<ssn#..>`/`<ein#..>` tokens are refused. See **Privacy masking** below. |
+| `check_path` | Does a path exist — given exactly as a response showed it (`%USERPROFILE%`/`%TEMP%` and tokens welcome) — without revealing a name: `exists`, `kind` (`file`/`dir`/`missing`, or `unresolved`), size and modified time or item count, and `tokens_resolved` / `unknown_tokens`. Tells a token this PC never issued apart from a path that expanded but has nothing there (then `deepest_existing` and `missing_part`, both masked — `missing_part` is cut from the masked path, so even a short or all-digit name stays masked). |
 
 **Run and stop**
 
 | Tool | Does |
 |------|------|
-| `run_automation` | **Trigger** any spoken automation now — the MCP equivalent of "open \<name\>". `loop <name>` starts a workflow's loop companion. Optional `wait_seconds` to wait and report the outcome (read from the run record, never guessed from an exit code). Optional `args` are the script's command-line arguments (an argv list, no shell); for a workflow they must be existing files and stand in for the File Explorer selection, so a selected-file workflow can be tested on a fixture. Runs in the macro's folder, like the voice shortcut. |
+| `run_automation` | **Trigger** any spoken automation now — the MCP equivalent of "open \<name\>". `loop <name>` starts a workflow's loop companion. Optional `wait_seconds` to wait and report the outcome (read from the run record, never guessed from an exit code). Optional `args` are the script's command-line arguments (an argv list, no shell); for a workflow they must be existing files and stand in for the File Explorer selection, so a selected-file workflow can be tested on a fixture. Runs in the macro's folder, like the voice shortcut. Any run it waits on returns `result` — the values the macro passed to `VkResult(value)` — and its `stdout` / `stderr` (the launched macro's alone: a program it starts inherits the variables, but `VkResult`/`VkTestMode` ignore them there). **`test=True`** is a quiet test run: MsgBox / TrayTip / InputBox / ToolTip / file pickers are returned in `dialogs` instead of shown — MsgBox answers its default button (what Enter would), InputBox, FileSelect and DirSelect are **cancelled**, ToolTip returns a real but invisible window; the macro's own `OnError` handlers run, an error none of them handles comes back as `uncaught_error` with no dialog (exit 3; its `OnExit` callbacks are skipped), `VkTestMode()` is true in the macro, and a timeout kills the run and every process it started. Quiet, not sandboxed: Gui windows still appear and real side effects still happen. |
 | `run_workflow_batch` | **Run a workflow once per row of inputs**, no dialogs. Pass `rows` (one object per run, keys = the workflow's ask labels) **or `source`** — a CSV or an Excel range (see below); the loop runs headlessly with the floating Stop bar still up, and `collect` steps save each pass's values to the workflow's sheet. `dry_run=True` previews the mapped rows and launches nothing. Refused while another loop is running. |
 | `press_hotkey` | **Trigger** a hotkey module (or a companion hotkey) by synthesizing its registered combo — bridge-map entries only, never arbitrary keys; needs the resident VoiceKit running. |
-| `run_ahk_snippet` | Run one-off AutoHotkey v2 code in a throwaway process (`_Common.ahk` + `Browser.ahk` + `UIA.ahk` + `ExplorerSel.ahk` pre-included, `Out(value)` to report) — for probes and experiments. Uncaught errors come back as text instead of a hidden dialog. A masked path inside a quoted string is expanded locally; `unmask=True` returns one result without name tokens (audited). |
+| `run_ahk_snippet` | Run one-off AutoHotkey v2 code in a throwaway process (`_Common.ahk` + `Browser.ahk` + `UIA.ahk` + `ExplorerSel.ahk` pre-included, `Out(value)` to report) — for probes and experiments. Uncaught errors come back as text instead of a hidden dialog. A timeout (or a cancelled call) ends the snippet **and every process it started** (`killed` lists them; a COM server it drove, e.g. `ComObject("Excel.Application")`, is started by Windows outside its tree — after a timeout `possibly_left_running` names it). A masked path inside a quoted string is expanded locally; `unmask=['<file#..>']` shows just those tokens in clear (audited). |
+| `run_process` | **Run a program directly** — `exe` + an `args` list, no shell, no AHK quoting — and get `exit_code`, `stdout`, `stderr` (decoded, 100 KB each, head + tail kept), `timed_out`, `killed`, `duration_s`. Runs hidden in a Windows job object: a timeout or a cancelled call ends its whole process tree — but not a COM server it drives (Excel.Application through win32com or `New-Object -ComObject`) or an app it hands work to through the shell: Windows starts those outside the tree, so after a timeout check `possibly_left_running` / `list_processes` before re-running on the same file. Arguments may span lines (`python -c` with several lines works; only `cmd.exe` refuses them). `timeout_s=0` = up to the cap. Python children get `PYTHONUNBUFFERED=1` (output shows up in `read_job` as printed). `.bat`/`.cmd`/`.ps1` are refused with the explicit form. `background=True` starts a **job** instead and returns its `job_id` at once. Takes the same scoped `unmask` as `run_ahk_snippet` (so does `read_job`). |
+| `read_job`, `stop_job` | A background job's state (running / exited / killed / stopped), exit code, duration and output tails — or, with no id, every job; end a job and everything it started. Output lives in `%TEMP%\VoiceKit\jobs\<id>\`; finished jobs are pruned after 7 days (50 kept at most). |
 | `stop_module` | Stop a module's running body: drops the cooperative stop flag, waits `grace_s`, then force-kills that module's own processes. |
+
+**No wait you choose blocks a call longer than 50 s** (`run_ahk_snippet`
+`timeout_s`, `run_process` `timeout_s`, `run_automation` /
+`run_workflow_batch` `wait_seconds`, `stop_job` `grace_s`, and `stop_module`
+`grace_s` — less the ~10 s that call spends around its wait) — a remote
+bridge gives up on a call at 60 s and the work used to run on unseen. A
+larger value is clamped and the reply says so (`timeout_capped` /
+`wait_capped` / `grace_capped`). (A create or update that reloads VoiceKit
+is not on that list: its load checks and the reload have bounds of their
+own, and can take longer when a module is slow to load.) Set `[MCP]
+MaxWaitSeconds=<5-230>` in `logs\settings.ini` for a client that waits
+longer. Longer work: `run_process(background=True)` + `read_job`, or a
+fire-and-forget run you poll. When a client cancels a call, the processes it
+started (snippet, `run_process`, UIA probe) are ended too; your own
+automations (`run_automation`, `press_hotkey`, loops) are never put in a job
+and keep running.
 
 Every generated `.ahk` is load-checked with AutoHotkey before it's kept; if it
 fails, nothing is written (edits and replacements roll back byte for byte).
@@ -134,8 +154,10 @@ replaced by a stable token that keeps the extension:
   `Temp` / `Programs`), the **VoiceKit folder and everything in it** (macro,
   workflow and module names are your *automation* names, which the agent needs
   to do its job — so don't name an automation after a client), the Voice
-  Macros Start Menu folder, and Python / program folders. Everything else under
-  the profile — including `%TEMP%` — is masked.
+  Macros Start Menu folder, Python / program folders, and the names of
+  `run_process`'s background-job folders (`%TEMP%\VoiceKit\jobs\<job id>` —
+  not what a job writes there). Everything else under the profile —
+  including `%TEMP%` — is masked.
 - **Tokens are stable** (the same name always gets the same token, across
   calls and restarts) so the model can still say "page 7 of `<file#3a9f>.pdf`
   failed". They're an HMAC of the name under a random per-PC key
@@ -154,10 +176,23 @@ replaced by a stable token that keeps the extension:
   appears on its own in the same response (a snippet that prints the file
   name after the path). A client name that never appears as part of a masked
   path is *not* caught.
-- **When the real name is needed:** `reveal(token)` returns it, and
-  `run_ahk_snippet(..., unmask=True)` returns one result without name tokens.
-  Both append a line to `logs\privacy-audit.log` (time, tool, token — never
-  the name).
+- **When the real name is needed:** `reveal(token)` returns it. To read
+  names where they appear in a run's output, `run_ahk_snippet`, `run_process`
+  and `read_job` take `unmask=['<file#3a9f>', ...]` (tokens, or whole masked
+  paths — every token in one counts): the answer is masked as usual and only
+  the tokens listed are shown in clear; the reply's `unmasked` lists them and
+  `unmask_unused` any that weren't in the output. An unknown or one-way token
+  refuses the call before anything runs. A blanket `unmask=True` (everything
+  in clear) is **refused** unless you set `AllowBlanketUnmask=1` (below). Every
+  reveal and unmask appends a line to `logs\privacy-audit.log` (time, tool,
+  tokens — never the name).
+- **Does that masked path still exist?** `check_path(path)` answers without
+  revealing anything: whether the path's tokens expanded at all (a token this
+  PC never issued is listed in `unknown_tokens`) and, if they did, whether
+  something is there — for a missing path, the deepest part that still exists
+  and the first part that doesn't, both masked. The "isn't there" errors of
+  `run_automation` (workflow args), `run_workflow_batch` (`source`) and
+  `run_process` (`exe`, `cwd`) say which of the two it is too.
 
 **Settings** — edit `logs\settings.ini` (create the section if it isn't
 there); no tool can change it:
@@ -168,6 +203,9 @@ there); no tool can change it:
 Mode=paths
 ; extra folders whose contents are masked too, ; separated — e.g. a client share
 MaskRoots=D:\Clients;\\server\clients
+; 1 = allow unmask=True (a whole answer in clear). Default 0: only the
+; scoped unmask=['<file#..>'] form works
+AllowBlanketUnmask=0
 ```
 
 Desktop / Documents / Downloads / Pictures / Videos / Music that Windows
@@ -338,6 +376,10 @@ call these tools, so treat it accordingly.
   run code now or leave a persistent payload. Know which tools have an
   **immediate effect**:
   - `run_ahk_snippet` — runs arbitrary code on the desktop right now;
+  - `run_process` — runs any program with your privileges right now (a
+    background job keeps running until it ends, its lifetime runs out, or
+    `stop_job` ends it);
+  - `stop_job` — ends a background job's whole process tree;
   - `run_automation` and `run_workflow_batch` — run an automation now,
     including `loop <name>` runs that repeat until stopped;
   - `press_hotkey` — fires a registered combo now (only combos already in
@@ -355,7 +397,9 @@ call these tools, so treat it accordingly.
   `create_launch_macro`, `create_workflow` and `create_ai_action` only fire
   when later triggered.
 - **What leaves the machine.** Tool results go to your MCP client — and so to
-  the model provider. That includes whatever a snippet `Out()`s, log lines
+  the model provider. That includes whatever a snippet `Out()`s or a program
+  run by `run_process` prints, other programs' command lines
+  (`list_processes`), log lines
   (`read_log`), file paths (`list_automations`, errors), on-screen text
   (`inspect_focus`, `dump_uia_tree`), sheet rows (`read_workflow_sheet`) and a
   batch's `dry_run` preview (`run_workflow_batch` — a real run's reply never
@@ -365,8 +409,9 @@ call these tools, so treat it accordingly.
   `%TEMP%`, which keeps your Windows user name out of responses, and file and
   folder names under the profile are masked by default (see **Privacy
   masking**) — that stops incidental leakage only, not what a snippet
-  deliberately `Out()`s. `reveal` and `run_ahk_snippet(unmask=True)` return
-  real names on request; both are audited in `logs\privacy-audit.log`.
+  deliberately `Out()`s. `reveal` and a scoped `unmask=['<file#..>']`
+  (`run_ahk_snippet`, `run_process`, `read_job`) return real names on
+  request; both are audited in `logs\privacy-audit.log`.
 - **AI actions and the network.** Creating or editing an AI action writes
   only local files. When the *user* (or `run_automation`) later triggers it,
   it sends the saved prompt plus the current selection/clipboard to
@@ -381,7 +426,8 @@ call these tools, so treat it accordingly.
 1. **Keep your MCP client's tool-approval prompts on** for `voicekit` — don't
    blanket-allow it. Review `create_*` / `update_*` / `edit_*` arguments
    (especially `ahk_body`, `code` and `run` targets), `run_ahk_snippet` code,
-   `run_automation`, `press_hotkey` and `stop_module` before approving.
+   `run_process` programs and arguments, `run_automation`, `press_hotkey`,
+   `stop_module` and `stop_job` before approving.
 2. **Don't use this server in sessions that ingest untrusted content** without
    watching the tool calls.
 3. **Don't put secrets in automations.** Your macros, hotkey modules,
@@ -400,6 +446,11 @@ call these tools, so treat it accordingly.
   two entries in ONE client mean two sets of names. A server that started
   before its code changed shows `server_stale` — reconnect it (`/mcp` in
   Claude Code, restart Claude Desktop).
+- **The tool names changed mid-session** (`mcp__voicekit__...` became
+  `mcp__remote-devices__voicekit__...`) → the prefix is added by the client
+  or a bridge, not by VoiceKit, and can change when the client reconnects
+  through a different path. The names after it are stable: re-list the
+  tools and retry with the new prefix.
 
 ## Maintenance
 

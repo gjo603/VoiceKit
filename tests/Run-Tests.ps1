@@ -2,7 +2,7 @@
 #  VoiceKit test suite runner.  Run:  powershell -File tests\Run-Tests.ps1
 #
 #  Load-checks the core scripts (tracked macros, the master, launcher,
-#  loop runner, watchdog, UIA probe, complete templates), runs every AHK
+#  loop runner, watchdog, UIA probe, test shim, complete templates), runs every AHK
 #  self-test in this folder (*-selftest.ahk, skipping *-target.ahk helpers
 #  and the shared _harness.ahk / _target.ahk includes) plus the Python MCP
 #  conformance test, and exits nonzero if anything failed.
@@ -147,7 +147,7 @@ if (-not $gitOk -or $tracked.Count -eq 0) {
     $tracked = @()
 }
 foreach ($rel in $tracked) { $loadTargets += Join-Path $root ($rel -replace '/', '\') }
-foreach ($rel in @('VoiceKitLauncher.ahk', 'lib\LoopRunner.ahk', 'lib\Watchdog.ahk',
+foreach ($rel in @('VoiceKitLauncher.ahk', 'lib\LoopRunner.ahk', 'lib\Watchdog.ahk', 'lib\TestShim.ahk',
                    'mcp\uia_probe.ahk', 'templates\ai-template.ahk', 'templates\launch-template.ahk')) {
     $loadTargets += Join-Path $root $rel
 }

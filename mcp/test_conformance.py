@@ -1297,76 +1297,14 @@ def test_mcp_cancellation_is_not_connection_fatal():
     in-flight tools/call and assert (a) no response for that id is ever
     written — not even once the abandoned worker finishes — and (b) the same
     connection still answers afterwards."""
-    import json
-    import sys
-    import threading
-
-    mcp_dir = vk.REPO_ROOT / "mcp"
-    py = mcp_dir / ".venv" / "Scripts" / "python.exe"
-    if not py.exists():
-        py = Path(sys.executable)
-    if subprocess.run([str(py), "-c", "import fastmcp"],
-                      capture_output=True).returncode != 0:
+    w = _WireServer.start()
+    if w is None:
         print("      (skipped: fastmcp not importable — the MCP add-on isn't installed)")
         return
-
-    proc = subprocess.Popen(
-        [str(py), str(mcp_dir / "server.py")],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        cwd=str(mcp_dir))
-    replies: list = []
-    stderr_lines: list = []
-    lock = threading.Lock()
-
-    def _read():
-        for raw in proc.stdout:
-            line = raw.decode("utf-8", "replace").strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            with lock:
-                replies.append(msg)
-
-    def _read_err():
-        # Drained so the server can't block on a full stderr pipe; kept so a
-        # failure can SHOW the server's own traceback instead of a bare
-        # "no reply" (this test failed exactly once, under full-suite load,
-        # with nothing to say for itself — never again).
-        for raw in proc.stderr:
-            stderr_lines.append(raw.decode("utf-8", "replace").rstrip())
-
-    threading.Thread(target=_read, daemon=True).start()
-    threading.Thread(target=_read_err, daemon=True).start()
-
-    def send(obj):
-        proc.stdin.write(json.dumps(obj).encode("utf-8") + b"\n")
-        proc.stdin.flush()
-
-    def wait_for_id(rid, deadline_s):
-        deadline = time.time() + deadline_s
-        while time.time() < deadline:
-            with lock:
-                for m in replies:
-                    if m.get("id") == rid:
-                        return m
-            time.sleep(0.1)
-        return None
-
-    def diagnostics():
-        tail = [ln for ln in stderr_lines if ln.strip()][-8:]
-        with lock:
-            seen = [m.get("id") for m in replies]
-        return f"reply ids seen: {seen}; server stderr tail: {tail}"
-
+    send, wait_for_id, diagnostics, stderr_lines = (w.send, w.wait_for_id, w.diagnostics,
+                                                     w.stderr_lines)
     try:
-        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-              "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                         "clientInfo": {"name": "vk-conformance", "version": "0"}}})
-        assert wait_for_id(1, 30), f"server never answered initialize — {diagnostics()}"
-        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        w.initialize()
 
         # Slow enough that the cancellation always lands while the call is in
         # flight (the notification goes out within milliseconds; the snippet
@@ -1399,14 +1337,921 @@ def test_mcp_cancellation_is_not_connection_fatal():
         bad = [ln for ln in stderr_lines if "already responded" in ln or "Traceback" in ln]
         assert not bad, f"the server raised while handling the cancel — {diagnostics()}"
     finally:
+        w.close()
+
+
+class _WireServer:
+    """The real server.py over real stdio pipes (mcp\\.venv's python when it
+    exists), for the wire tests. start() returns None when fastmcp isn't
+    importable — the MCP is an optional add-on."""
+
+    @classmethod
+    def start(cls):
+        import sys
+        mcp_dir = vk.REPO_ROOT / "mcp"
+        py = mcp_dir / ".venv" / "Scripts" / "python.exe"
+        if not py.exists():
+            py = Path(sys.executable)
+        if subprocess.run([str(py), "-c", "import fastmcp"],
+                          capture_output=True).returncode != 0:
+            return None
+        return cls(py, mcp_dir)
+
+    def __init__(self, py: Path, mcp_dir: Path):
+        import threading
+        self.proc = subprocess.Popen(
+            [str(py), str(mcp_dir / "server.py")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=str(mcp_dir))
+        self.replies: list = []
+        self.stderr_lines: list = []
+        self.lock = threading.Lock()
+        threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._read_err, daemon=True).start()
+
+    def _read(self):
+        for raw in self.proc.stdout:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            with self.lock:
+                self.replies.append(msg)
+
+    def _read_err(self):
+        # Drained so the server can't block on a full stderr pipe; kept so a
+        # failure can SHOW the server's own traceback instead of a bare
+        # "no reply" (the cancel test failed exactly once, under full-suite
+        # load, with nothing to say for itself — never again).
+        for raw in self.proc.stderr:
+            self.stderr_lines.append(raw.decode("utf-8", "replace").rstrip())
+
+    def send(self, obj):
+        self.proc.stdin.write(json.dumps(obj).encode("utf-8") + b"\n")
+        self.proc.stdin.flush()
+
+    def wait_for_id(self, rid, deadline_s):
+        deadline = time.time() + deadline_s
+        while time.time() < deadline:
+            with self.lock:
+                for m in self.replies:
+                    if m.get("id") == rid:
+                        return m
+            time.sleep(0.1)
+        return None
+
+    def diagnostics(self):
+        tail = [ln for ln in self.stderr_lines if ln.strip()][-8:]
+        with self.lock:
+            seen = [m.get("id") for m in self.replies]
+        return f"reply ids seen: {seen}; server stderr tail: {tail}"
+
+    def initialize(self):
+        self.send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                              "clientInfo": {"name": "vk-conformance", "version": "0"}}})
+        assert self.wait_for_id(1, 30), \
+            f"server never answered initialize — {self.diagnostics()}"
+        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def close(self):
         try:
-            proc.stdin.close()
+            self.proc.stdin.close()
         except OSError:
             pass
         try:
-            proc.wait(timeout=10)
+            self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            self.proc.kill()
+
+
+def test_cancel_ends_the_request_tree_on_the_wire():
+    """Feedback #2, end to end: a remote bridge gave up on a call at 60 s and
+    the program it had started ran on unseen, holding its log file open.
+    Now the patched cancel ends every process the cancelled request started.
+    Over real pipes: a run_process call starts python, which starts its own
+    child and writes both pids to a file; the client cancels; both must be
+    gone within seconds, no reply may arrive for the id, and the connection
+    must still answer."""
+    import sys
+    w = _WireServer.start()
+    if w is None:
+        print("      (skipped: fastmcp not importable — the MCP add-on isn't installed)")
+        return
+    pidfile = Path(tempfile.gettempdir()) / f"vk-wire-cancel-{os.getpid()}.txt"
+    pidfile.unlink(missing_ok=True)
+    pids: list = []
+    try:
+        w.initialize()
+        code = ("import subprocess, sys, time, os; "
+                "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                "open(sys.argv[1], 'w').write(f'{os.getpid()} {c.pid}'); "
+                "time.sleep(60)")
+        w.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "run_process",
+                           "arguments": {"exe": sys.executable,
+                                         "args": ["-c", code, str(pidfile)],
+                                         "timeout_s": 40}}})
+        deadline = time.time() + 20
+        while time.time() < deadline and not (pidfile.exists() and pidfile.read_text().strip()):
+            time.sleep(0.1)
+        assert pidfile.exists(), f"the program never started — {w.diagnostics()}"
+        pids = [int(p) for p in pidfile.read_text().split()]
+        assert len(pids) == 2 and all(vk._pid_image(p) for p in pids), pids
+        w.send({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": {"requestId": 2, "reason": "bridge gave up"}})
+        deadline = time.time() + 10
+        while time.time() < deadline and any(vk._pid_image(p) is not None for p in pids):
+            time.sleep(0.1)
+        alive = [p for p in pids if vk._pid_image(p) is not None]
+        assert not alive, (f"cancelling the request must end the program AND its child; "
+                           f"still running: {alive} — {w.diagnostics()}")
+        assert w.wait_for_id(2, 3) is None, "a cancelled request must never be answered"
+        w.send({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+        assert w.wait_for_id(3, 30), f"no reply after the cancel — {w.diagnostics()}"
+        bad = [ln for ln in w.stderr_lines if "Traceback" in ln]
+        assert not bad, f"the server raised while handling the cancel — {w.diagnostics()}"
+    finally:
+        for p in pids:
+            if vk._pid_image(p) is not None:
+                vk._kill_tree(p)
+        w.close()
+        pidfile.unlink(missing_ok=True)
+
+
+def test_server_info_names_the_connected_client_on_the_wire():
+    """Feedback #4, over real pipes: server_info's connected_client is the
+    clientInfo the session sent at initialize (read from the FastMCP context
+    in the tool's worker thread), and the reply explains tool-name prefixes."""
+    w = _WireServer.start()
+    if w is None:
+        print("      (skipped: fastmcp not importable — the MCP add-on isn't installed)")
+        return
+    try:
+        w.initialize()
+        w.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "server_info", "arguments": {}}})
+        reply = w.wait_for_id(2, 60)
+        assert reply and "result" in reply, f"no server_info reply — {w.diagnostics()}"
+        res = reply["result"]
+        data = res.get("structuredContent")
+        if not isinstance(data, dict):
+            data = json.loads(res["content"][0]["text"])
+        data = data.get("result", data) if "connected_client" not in data else data
+        assert data["connected_client"] == {"name": "vk-conformance", "version": "0"}, data
+        assert "stable" in data["tool_name_prefixes"], data
+        assert isinstance(data["same_client_duplicates"], list), data
+    finally:
+        w.close()
+
+
+def _alive(pid: int) -> bool:
+    return vk._pid_image(int(pid)) is not None
+
+
+def _reap(*pids) -> None:
+    """Test cleanup: end any of these processes (and their trees) still running."""
+    for p in pids:
+        if p and _alive(p):
+            vk._kill_tree(int(p))
+
+
+def _gone_within(pids, seconds: float = 5.0) -> list:
+    """The pids still alive after waiting up to `seconds` for them to exit."""
+    deadline = time.time() + seconds
+    while time.time() < deadline and any(_alive(p) for p in pids):
+        time.sleep(0.05)
+    return [p for p in pids if _alive(p)]
+
+
+def test_max_wait_cap_and_setting():
+    """Feedback #2: run_ahk_snippet took timeout_s up to 120 while the remote
+    bridge gave up at 60, so the work ran on unseen. One cap now
+    (max_wait_s: MAX_WAIT_S = 50, or [MCP] MaxWaitSeconds clamped 5..230,
+    read UTF-16 like AHK's IniWrite writes it), every blocking wait clamps
+    against it, and a clamp is never silent."""
+    import sys
+    assert vk.MAX_WAIT_S == 50 and vk.MAX_WAIT_LIMITS == (5, 230)
+    with _sandbox() as d:
+        ini = d / "logs" / "settings.ini"
+        assert vk.max_wait_s() == 50, "no settings file: the default"
+        for text, want in (("[MCP]\r\nMaxWaitSeconds=120\r\n", 120),
+                           ("[mcp]\r\nmaxwaitseconds = 1\r\n", 5),
+                           ("[MCP]\r\nMaxWaitSeconds=999\r\n", 230),
+                           ("[MCP]\r\nMaxWaitSeconds=soon\r\n", 50),
+                           ("[Privacy]\r\nMode=paths\r\n", 50)):
+            ini.write_text(text, encoding="utf-16")         # what IniWrite makes
+            vk._MCP_SETTINGS_CACHE.clear()
+            assert vk.max_wait_s() == want, (text, vk.max_wait_s())
+        ini.write_text("[MCP]\nMaxWaitSeconds=60\n", encoding="utf-8")
+        vk._MCP_SETTINGS_CACHE.clear()
+        assert vk.max_wait_s() == 60
+    vk._MCP_SETTINGS_CACHE.clear()
+    with _patched(max_wait_s=lambda: 50):
+        n, note = vk._cap_wait(120, "timeout_s", 15, "use background=True")
+        assert n == 50 and "capped to 50" in note and "background=True" in note, note
+        assert vk._cap_wait(30, "timeout_s", 15, "x") == (30, "")
+        assert vk._cap_wait(None, "timeout_s", 15, "x") == (15, "")
+        # run_ahk_snippet: clamped AND says so.
+        got = vk.run_ahk_snippet('Out("ok")', timeout_s=120)
+        assert got["output"] == "ok" and "capped to 50" in got.get("timeout_capped", ""), got
+        # run_process: same.
+        got = vk.run_process(sys.executable, ["-c", "print(1)"], timeout_s=500)
+        assert got["exit_code"] == 0 and "capped to 50" in got.get("timeout_capped", ""), got
+    # run_automation / run_workflow_batch: _launch_and_report clamps wait_seconds.
+    with _patched(max_wait_s=lambda: 5):
+        r = vk._launch_and_report([sys.executable, "-c", "pass"], "probe", "probe", 500)
+        assert r["finished"] is True and "capped to 5" in r.get("wait_capped", ""), r
+        # A wait that runs out leaves the run going (it is the user's
+        # automation) and names every process still running.
+        code = ("import subprocess, sys, time\n"
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                "time.sleep(30)\n")
+        r = None
+        try:
+            r = vk._launch_and_report([sys.executable, "-c", code], "probe", "probe", 2)
+            assert r["finished"] is False, r
+            running = r.get("still_running", [])
+            assert len(running) >= 2 and all(_alive(p["pid"]) for p in running), r
+            assert all(p["image"].lower().startswith("python") for p in running), running
+            assert "left running" in r["note"], r
+        finally:
+            for p in (r or {}).get("still_running", []):
+                _reap(p["pid"])
+
+
+def test_run_process_foreground():
+    """Feedback #1: run a program directly — no shell, no AHK string, no cmd
+    redirects. argv entries arrive exactly as given (spaces, quotes, &),
+    stdout/stderr come back decoded (non-ASCII included: PYTHONIOENCODING is
+    utf-8 unless set), with the exit code; cwd, env and stdin apply; a child
+    waiting for input gets EOF instead of hanging."""
+    import sys
+    py = sys.executable
+    got = vk.run_process(py, ["-c", "import sys; print('héllo ✓ 中', sys.argv[1:]); "
+                                    "print('oops', file=sys.stderr); sys.exit(3)",
+                              "a b", 'say "hi"', "x&y", ""])
+    assert got["exit_code"] == 3 and got["timed_out"] is False and got["killed"] == [], got
+    assert got["stdout"] == "héllo ✓ 中 ['a b', 'say \"hi\"', 'x&y', '']\n", got["stdout"]
+    assert got["stderr"] == "oops\n", got
+    assert "code 3" in got["note"], got
+    with tempfile.TemporaryDirectory() as d:
+        got = vk.run_process(py, ["-c", "import os; print(os.getcwd())"], cwd=d)
+        assert Path(got["stdout"].strip()).resolve() == Path(d).resolve(), got
+    # Default cwd: %TEMP%, never the server's (or the repo's) folder.
+    got = vk.run_process(py, ["-c", "import os; print(os.getcwd())"])
+    assert Path(got["stdout"].strip()).resolve() == Path(tempfile.gettempdir()).resolve(), got
+    # env merges over the server's, expands %TEMP%, and can remove a name.
+    os.environ["VK_RP_DROP_ME"] = "1"
+    try:
+        got = vk.run_process(py, ["-c", "import os; print(os.environ.get('VK_RP_X')); "
+                                        "print(os.environ.get('VK_RP_DROP_ME')); "
+                                        "print(os.environ.get('PYTHONIOENCODING')); "
+                                        "print(bool(os.environ.get('PATH')))"],
+                             env={"VK_RP_X": "%TEMP%\\x", "VK_RP_DROP_ME": None})
+    finally:
+        os.environ.pop("VK_RP_DROP_ME", None)
+    lines = got["stdout"].splitlines()
+    assert lines[0].lower() == (tempfile.gettempdir().rstrip("\\") + "\\x").lower(), lines
+    # PYTHONIOENCODING: utf-8 unless the server's own environment already says
+    # something (this one may run with utf-8:surrogateescape).
+    assert lines[1] == "None" and lines[2].startswith("utf-8") and lines[3] == "True", lines
+    got = vk.run_process(py, ["-c", "import sys; d = sys.stdin.read(); print(len(d), d.upper())"],
+                         stdin="line1\nlínea2")
+    assert got["stdout"] == "12 LINE1\nLÍNEA2\n", got
+    t0 = time.time()
+    got = vk.run_process(py, ["-c", "import sys; print(repr(sys.stdin.read()))"], timeout_s=20)
+    assert got["stdout"].strip() == "''" and time.time() - t0 < 15, got
+    # A bare name is found on PATH (here cmd.exe, with no extension given).
+    got = vk.run_process("cmd", ["/d", "/c", "echo hi there"])
+    assert got["exit_code"] == 0 and got["stdout"].strip() == "hi there", got
+    assert got["exe"].lower().endswith("cmd.exe"), got
+
+
+def test_run_process_refusals_and_expansion():
+    """Batch files are refused with the explicit form (BatBadBut: cmd.exe
+    re-parses batch arguments, so they can't be passed safely), and so are
+    .ps1/.py; paths must be full; args can't hold NUL (nor, for cmd.exe,
+    a line break -- cmd stops reading there). %TEMP% forms
+    and privacy tokens in exe/args/cwd arrive as the real path — and the
+    output, through _guard, is masked again."""
+    import sys
+    with tempfile.TemporaryDirectory() as d:
+        dd = Path(d)
+        for name, needles in (("build.bat", ("batch file", "exe='cmd.exe'", "/c")),
+                              ("go.cmd", ("batch file",)),
+                              ("x.ps1", ("PowerShell", "-File")),
+                              ("x.py", ("Python script", "exe='python'")),
+                              ("notes.txt", ("isn't a program",))):
+            (dd / name).write_text("x", encoding="utf-8")
+            e = _raises(lambda: vk.run_process(str(dd / name)), *needles,
+                        exc=vk.VoiceKitError)
+            assert "BatBadBut" in e or not name.endswith((".bat", ".cmd")), e
+        _raises(lambda: vk.run_process("sub\\prog.exe"), "relative path", exc=vk.VoiceKitError)
+        _raises(lambda: vk.run_process(str(dd / "missing.exe")), "doesn't exist",
+                exc=vk.VoiceKitError)
+        _raises(lambda: vk.run_process(str(dd)), "folder", exc=vk.VoiceKitError)
+        (dd / "fake.exe").write_text("not a program", encoding="utf-8")
+        _raises(lambda: vk.run_process(str(dd / "fake.exe")), "Couldn't start fake.exe",
+                exc=vk.VoiceKitError)
+        with _jobs_sandbox() as jr:
+            _raises(lambda: vk.run_process(str(dd / "fake.exe"), background=True),
+                    "Couldn't start fake.exe", exc=vk.VoiceKitError)
+            assert not list(jr.iterdir()), "a job that never started leaves no folder"
+        _raises(lambda: vk.run_process("vk-no-such-program-zz"), "PATH", exc=vk.VoiceKitError)
+        _raises(lambda: vk.run_process(""), "exe is required", exc=vk.VoiceKitError)
+        # Multi-line arguments reach a program intact (review finding: they
+        # were refused, which blocked the commonest case, python -c with a
+        # few lines). cmd.exe would silently drop everything after the first
+        # line break, so it alone refuses them; NUL can't be carried at all.
+        got = vk.run_process(sys.executable, ["-c", "import sys\nfor a in sys.argv[1:]:\n"
+                                                    "    print(repr(a))", "x\ny", 'q"\r\nz'])
+        assert got["exit_code"] == 0, got
+        assert got["stdout"] == "'x\\ny'\n'q\"\\r\\nz'\n", got["stdout"]
+        _raises(lambda: vk.run_process("cmd.exe", ["/d", "/c", "echo a\necho b"]),
+                "cmd.exe stops reading", "python", exc=vk.VoiceKitError)
+        _raises(lambda: vk.run_process(sys.executable, ["a\0b"]), "NUL",
+                exc=vk.VoiceKitError)
+        _raises(lambda: vk.run_process(sys.executable, "-c pass"), "list of strings",
+                exc=vk.VoiceKitError)
+        _raises(lambda: vk.run_process(sys.executable, cwd=str(dd / "nope")),
+                "isn't an existing folder", exc=vk.VoiceKitError)
+        e = _raises(lambda: vk.run_process(sys.executable, env={"VK_SECRET": "a\0b"}),
+                    "VK_SECRET", exc=vk.VoiceKitError)
+        assert "a\0b" not in e, "an env value is never echoed"
+        # %TEMP% forms expand in args and cwd.
+        fx = dd / "fixture & co.txt"
+        fx.write_text("x", encoding="utf-8")
+        tmp = tempfile.gettempdir().rstrip("\\")
+        shown = str(fx)
+        if shown.lower().startswith(tmp.lower() + "\\"):
+            shown = "%TEMP%" + shown[len(tmp):]
+        got = vk.run_process(sys.executable, ["-c", "import os, sys; print(os.path.isfile("
+                                                    "sys.argv[1]), os.getcwd())", shown],
+                             cwd="%TEMP%")
+        ok, cwd_seen = got["stdout"].strip().split(" ", 1)
+        assert ok == "True" and Path(cwd_seen).resolve() == Path(tmp).resolve(), got
+    # Privacy tokens: a masked path handed back reaches the program real,
+    # and what the program prints comes back masked. (server is imported
+    # OUTSIDE the sandbox: its import reads the libraries for the session
+    # instructions, which test_instructions_names_exist compares.)
+    server = _server_or_none()
+    with _privacy_sandbox() as s:
+        shown = _pv(str(s.inv))
+        assert "<file#" in shown, shown
+        got = vk.run_process(sys.executable, ["-c", "import os, sys; print(os.path.isfile("
+                                                    "sys.argv[1]), sys.argv[1])", shown])
+        assert got["stdout"].startswith("True ") and str(s.inv) in got["stdout"], got
+        if server:
+            g = server._guard(vk.run_process, sys.executable,
+                              ["-c", "import sys; print(sys.argv[1])", shown])
+            assert "Smith" not in json.dumps(g) and "<file#" in g["stdout"], g
+            from fastmcp.exceptions import ToolError
+            _raises(lambda: server.run_process(sys.executable, unmask=True),
+                    "AllowBlanketUnmask", exc=ToolError)
+            # The scoped unmask: the file's own token in clear, its folders
+            # still masked (the same code path as run_ahk_snippet's).
+            ftok = re.search(rf"<file#{_T}>", shown).group(0)
+            g = server.run_process(sys.executable, ["-c", "import sys; print(sys.argv[1])", shown],
+                                   unmask=[ftok])
+            assert "2025 Invoice Smith.pdf" in g["stdout"] and "Smith John" not in g["stdout"], g
+            assert "<dir#" in g["stdout"] and g["unmasked"] == [ftok], g
+
+
+def test_run_process_timeout_kills_the_grandchild():
+    """The orphan that held the field agent's log file open: a timeout ends
+    the program AND everything it started (cmd -> ping; python -> python),
+    and says which; output written before the kill still comes back. A
+    foreground run owns its tree, so anything left running after a normal
+    exit is ended too."""
+    import sys
+    t0 = time.time()
+    got = vk.run_process("cmd.exe", ["/d", "/c", "echo before & ping -n 60 127.0.0.1 >nul"],
+                         timeout_s=2)
+    assert got["timed_out"] is True and got["exit_code"] is None, got
+    assert time.time() - t0 < 15, "the timeout must not wait for the grandchild"
+    images = sorted(p["image"].lower() for p in got["killed"])
+    assert images == ["cmd.exe", "ping.exe"], got["killed"]
+    assert not _gone_within([p["pid"] for p in got["killed"]]), got["killed"]
+    assert got["stdout"].strip() == "before" and "Killed after 2 s" in got["note"], got
+    # python -> python: the grandchild's pid is printed before the timeout.
+    # (Multi-line code on stdin - 'python -' - works as well as -c.)
+    code = ("import subprocess, sys, time\n"
+            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "print(c.pid, flush=True)\n"
+            "time.sleep(60)\n")
+    got = vk.run_process(sys.executable, ["-"], stdin=code, timeout_s=3)
+    grand = int(got["stdout"].split()[0])
+    try:
+        assert got["timed_out"] and grand in [p["pid"] for p in got["killed"]], got
+        assert not _gone_within([grand]), "the grandchild must be gone"
+    finally:
+        _reap(grand)
+    # Left running after a normal exit: ended with it, and said so.
+    code = ("import subprocess, sys; "
+            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "print(c.pid, flush=True)")
+    got = vk.run_process(sys.executable, ["-c", code], timeout_s=20)
+    left = int(got["stdout"].split()[0])
+    try:
+        assert got["exit_code"] == 0 and got["timed_out"] is False, got
+        # (A venv's python.exe is a launcher with the real interpreter as its
+        # child, so the left-behind child may be two processes.)
+        assert left in [p["pid"] for p in got["killed"]], got
+        assert "process(es) running; they were ended with it" in got["note"], got
+        assert not _gone_within([left])
+    finally:
+        _reap(left)
+
+
+def test_run_process_output_is_capped_head_and_tail():
+    """Each stream is capped at 100 KB — the first and last 50 KB around a
+    '... N bytes omitted ...' line, flagged — and decoding survives the cut:
+    UTF-8 characters split at either edge are dropped, not mojibaked. UTF-16
+    output (a BOM, or the NUL-every-other-byte shape) and console-code-page
+    output decode too."""
+    import sys
+    code = "import sys; sys.stdout.write('HEAD' + 'x' * 300000 + 'TAIL')"
+    got = vk.run_process(sys.executable, ["-c", code])
+    out = got["stdout"]
+    assert out.startswith("HEAD") and out.endswith("TAIL"), (out[:20], out[-20:])
+    assert "bytes omitted" in out and len(out) < 110 * 1024, len(out)
+    assert "300008 bytes" in got.get("stdout_truncated", ""), got.get("stdout_truncated")
+    assert "stderr_truncated" not in got
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "o.txt"
+        for shift in (0, 1, 2):          # 3-byte characters: both cuts land mid-character
+            f.write_bytes(b"a" * shift + ("中" * 100000).encode("utf-8"))
+            text, size, cut = vk._read_capped(f)
+            assert cut and size == 300000 + shift and "\ufffd" not in text, text[:40]
+            assert set(text.split("\n")[-1]) == {"中"}, "the tail decodes as UTF-8"
+        f.write_bytes("hé\r\nthere".encode("utf-16"))           # BOM
+        assert vk._read_capped(f)[0] == "hé\nthere"
+        f.write_bytes("plain words".encode("utf-16-le"))        # no BOM
+        assert vk._read_capped(f)[0] == "plain words"
+    oem = vk._oem_codec()
+    if oem and oem != "utf-8":
+        assert vk._decode_output("café".encode(oem)) == "café"
+    # Not UTF-8 -> the console code page (a whole output: no edge trimming).
+    assert vk._decode_output(b"caf\xe9") == "caf" + b"\xe9".decode(oem or "cp1252", "replace")
+    # read_job's tail reader: last N lines of a big file, partial first line dropped.
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "t.txt"
+        f.write_text("".join(f"line {i}\n" for i in range(50000)), encoding="utf-8")
+        text, size, more = vk._tail_lines(f, 3)
+        assert text == "line 49997\nline 49998\nline 49999" and more, text
+
+
+@contextlib.contextmanager
+def _jobs_sandbox():
+    """Background jobs in a throwaway folder (JOBS_ROOT), every process they
+    started ended afterwards — whatever the test did."""
+    tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    orig = vk.JOBS_ROOT
+    vk.JOBS_ROOT = Path(tmp.name)
+    before = set(vk._JOBS)
+    try:
+        yield Path(tmp.name)
+    finally:
+        for jid in set(vk._JOBS) - before:
+            e = vk._JOBS.pop(jid, None)
+            if e:
+                e["stopped"] = True
+                try:
+                    e["tree"].kill()
+                    e["tree"].release()
+                except Exception:       # noqa: BLE001
+                    pass
+        vk.JOBS_ROOT = orig
+        tmp.cleanup()
+
+
+def _poll(fn, seconds: float = 10.0):
+    deadline = time.time() + seconds
+    while True:
+        v = fn()
+        if v or time.time() > deadline:
+            return v
+        time.sleep(0.1)
+
+
+def test_background_job_start_read_stop():
+    """run_process(background=True): a job id at once, output to files,
+    read_job (one, and the list), stop_job ending the WHOLE tree (cmd ->
+    ping), a quick job's exit code, the lifetime limit killing a job, the
+    after-a-restart fallback (pid + creation time + taskkill /T), id
+    validation, and pruning (old finished folders go; at most 50 kept;
+    a running job's folder never)."""
+    import sys
+    with _jobs_sandbox() as root:
+        r = vk.run_process("cmd.exe", ["/d", "/c", "echo started & ping -n 60 127.0.0.1 >nul"],
+                           background=True)
+        jid = r["job_id"]
+        assert re.fullmatch(r"j\d{8}-\d{6}-[0-9a-f]{4}", jid) and r["lifetime_s"] == 3600, r
+        assert Path(r["folder"]).parent == root and Path(r["cwd"]) == Path(r["folder"]), r
+        st = _poll(lambda: (lambda s: s if "started" in s["stdout_tail"] else None)(
+            vk.read_job(jid)))
+        assert st and st["state"] == "running" and st["exit_code"] is None, st
+        listing = vk.read_job()
+        assert [j["job_id"] for j in listing["jobs"]] == [jid], listing
+        pings = _poll(lambda: [p for p in vk.list_processes("ping")["processes"]
+                               if p.get("voicekit") == f"job {jid}"])
+        assert pings, "list_processes tags the job's grandchild with the job id"
+        s = vk.stop_job(jid)
+        images = sorted(p["image"].lower() for p in s["killed"])
+        assert s["stopped"] and images == ["cmd.exe", "ping.exe"], s
+        assert not _gone_within([p["pid"] for p in s["killed"]]), s
+        st = vk.read_job(jid)
+        assert st["state"] == "stopped" and st["stdout_tail"].strip() == "started", st
+        assert vk.stop_job(jid)["stopped"] is False, "a second stop has nothing to stop"
+        # A quick job: exit code and output, written by the watcher.
+        q = vk.run_process(sys.executable, ["-c", "print('quick'); raise SystemExit(4)"],
+                           background=True, timeout_s=0)
+        st = _poll(lambda: (lambda s: s if s["state"] != "running" else None)(
+            vk.read_job(q["job_id"])))
+        assert st["state"] == "exited" and st["exit_code"] == 4, st
+        assert st["stdout_tail"] == "quick" and q["lifetime_s"] == 0, (st, q)
+        # The lifetime ends the job.
+        k = vk.run_process(sys.executable, ["-c", "import time; time.sleep(60)"],
+                           background=True, timeout_s=2)
+        st = _poll(lambda: (lambda s: s if s["state"] != "running" else None)(
+            vk.read_job(k["job_id"])), 15)
+        assert st["state"] == "killed" and "lifetime" in st["note"], st
+        assert not _gone_within([k["pid"]])
+        # After a server restart (no handle in memory): still found running by
+        # pid + creation time, stoppable through taskkill /T.
+        g = vk.run_process(sys.executable, ["-c", "import time; time.sleep(60)"],
+                           background=True)
+        entry = vk._JOBS.pop(g["job_id"])
+        entry["stopped"] = True            # this process's watcher stands down, as a restart would
+        try:
+            st = vk.read_job(g["job_id"])
+            assert st["state"] == "running" and "earlier run" in st["note"], st
+            s = vk.stop_job(g["job_id"])
+            assert s["stopped"] and [p["pid"] for p in s["killed"]] == [g["pid"]], s
+            assert "taskkill" in s["note"] and not _gone_within([g["pid"]]), s
+        finally:
+            entry["tree"].release()
+            _reap(g["pid"])
+        # ids are validated (no path tricks), unknown ones refused.
+        for bad in ("..\\x", "j20260101-000000-zzzz", "", "j20260101-000000-abcd"):
+            if bad:
+                _raises(lambda: vk.read_job(bad), "No job", exc=vk.VoiceKitError)
+        _raises(lambda: vk.stop_job("..\\..\\Windows"), "No job", exc=vk.VoiceKitError)
+        # Pruning: finished folders older than 7 days go; never over 50.
+        old = time.time() - 9 * 86400
+        for i in range(55):
+            d = root / f"j20250101-0000{i:02d}-abcd"
+            d.mkdir()
+            (d / "meta.json").write_text(json.dumps({"pid": 0}), encoding="utf-8")
+            (d / "exit.json").write_text(json.dumps({"state": "exited", "exit_code": 0}),
+                                         encoding="utf-8")
+            if i < 3:
+                for f in d.iterdir():
+                    os.utime(f, (old, old))
+        live = vk.run_process(sys.executable, ["-c", "import time; time.sleep(30)"],
+                              background=True)
+        ids = vk._job_ids()
+        assert len(ids) == vk.JOB_KEEP_MAX, len(ids)
+        assert not any(i in ids for i in (f"j20250101-0000{n:02d}-abcd" for n in range(3))), \
+            "folders older than 7 days are pruned"
+        assert "j20250101-000054-abcd" in ids and jid in ids, "the newest are kept"
+        assert live["job_id"] in ids, "the job just started is never pruned"
+        vk.stop_job(live["job_id"])
+
+
+def test_python_children_print_unbuffered():
+    """Review finding: a python child writing to a FILE block-buffers its
+    stdout (~8 KB), so read_job showed an empty tail for a whole running job
+    and a timed-out run_process lost everything printed before the kill (a
+    hard kill never flushes). PYTHONUNBUFFERED=1 is now set unless the
+    caller's env names it -- even to remove it."""
+    import sys
+    code = "import time\nfor i in range(40):\n    print('tick', i)\n    time.sleep(0.25)\n"
+    with _jobs_sandbox():
+        j = vk.run_process(sys.executable, ["-c", code], background=True)
+        st = _poll(lambda: (lambda s: s if "tick 2" in s["stdout_tail"] else None)(
+            vk.read_job(j["job_id"])), 6)
+        assert st and st["state"] == "running", st
+    got = vk.run_process(sys.executable, ["-c", code], timeout_s=2)
+    assert got["timed_out"] and "tick 0\ntick 1" in got["stdout"], got
+    got = vk.run_process(sys.executable, ["-c", "import os; print(os.environ.get("
+                                               "'PYTHONUNBUFFERED', 'unset'))"],
+                         env={"PYTHONUNBUFFERED": None})
+    assert got["stdout"] == "unset\n", got
+
+
+def test_foreground_timeout_zero_means_up_to_the_cap():
+    """Review finding: timeout_s=0 meant 'no limit' for a background job but
+    a 1-second kill in the foreground (max(1, 0)), with nothing saying why.
+    0 now means up to the cap in the foreground -- what wait_seconds=0
+    means for a test run -- for run_process and run_ahk_snippet alike."""
+    import sys
+    with _patched(max_wait_s=lambda: 6):
+        got = vk.run_process(sys.executable, ["-c", "import time; time.sleep(2); print('done')"],
+                             timeout_s=0)
+        assert got["exit_code"] == 0 and got["stdout"] == "done\n", got
+        assert "timeout_capped" not in got, got
+        got = vk.run_ahk_snippet('Sleep(1500)\nOut("done")', timeout_s=0)
+        assert got["exit_code"] == 0 and got["output"] == "done", got
+        n, note = vk._cap_timeout(None, 30, "x")
+        assert n == 6 and "capped to 6" in note, note
+        assert vk._cap_timeout(0, 30, "x") == (6, "")
+        assert vk._cap_timeout(-5, 30, "x") == (6, "")
+        assert vk._cap_timeout(3, 30, "x") == (3, "")
+
+
+def test_stop_module_grace_is_capped_with_the_call():
+    """Review finding: stop_module clamped grace_s at 60 -- alone already past
+    a remote bridge's 60 s -- and spends process scans and a post-kill wait
+    around it. It now goes through _cap_wait with that time reserved, so the
+    WHOLE call stays inside max_wait_s(), and says so (grace_capped)."""
+    import sys
+    with _patched(max_wait_s=lambda: 50):
+        n, note = vk._cap_wait(60, "grace_s", 5, "call it again",
+                               reserve=vk.STOP_KILL_WAIT_S + vk.STOP_SCAN_RESERVE_S)
+        assert n == 50 - vk.STOP_KILL_WAIT_S - vk.STOP_SCAN_RESERVE_S, n
+        assert "capped to" in note and "less" in note and "call it again" in note, note
+        assert vk._cap_wait(60, "x", 5, "y", reserve=100)[0] == 1, "never below 1 s"
+    body = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                            creationflags=vk._CREATE_NO_WINDOW)
+    try:
+        with _sandbox(), _patched(max_wait_s=lambda: 12,
+                                  _body_processes=lambda: [{"pid": body.pid, "base": "CapProbeZz",
+                                                            "cmd": "", "started": ""}]):
+            t0 = time.time()
+            r = vk.stop_module("Cap Probe Zz", grace_s=60)
+            took = time.time() - t0
+        assert r["stopped"] is True and r["how"] == "killed", r
+        assert "capped to 2" in r.get("grace_capped", ""), r
+        assert took < 12, f"the call took {took:.1f} s, past the cap"
+    finally:
+        _reap(body.pid)
+
+
+def test_com_servers_left_by_a_timeout_are_reported():
+    """Review finding: a timeout ends the program's whole job, but an
+    out-of-process COM server it drove (Excel.Application) is started by
+    DcomLaunch, outside the job -- killed listed python, and a hidden
+    EXCEL.EXE kept the workbook locked. Such servers started during the run
+    are now reported as possibly_left_running (never killed: one could be
+    the user's own). _com_strays is driven with a fake process list here --
+    a test never starts the user's Office apps."""
+    import sys
+    from datetime import datetime
+    since = datetime(2026, 10, 1, 12, 0, 0)
+    rows = [
+        {"pid": 11, "ppid": 4, "name": "EXCEL.EXE", "cmd": '"EXCEL.EXE" /automation -Embedding',
+         "started": "20261001120005"},
+        {"pid": 12, "ppid": 4, "name": "WINWORD.EXE", "cmd": '"WINWORD.EXE" -Embedding',
+         "started": "20261001115000"},                       # before the run: not ours
+        {"pid": 13, "ppid": 4, "name": "EXCEL.EXE", "cmd": '"EXCEL.EXE" -Embedding',
+         "started": "20261001120010"},                       # one the run already killed
+        {"pid": 14, "ppid": 4, "name": "notepad.exe", "cmd": "notepad x-Embeddingish.txt",
+         "started": "20261001120010"},                       # not a COM server flag
+        {"pid": 15, "ppid": 4, "name": "RuntimeBroker.exe",
+         "cmd": os.environ.get("WINDIR", "C:\\Windows") + "\\System32\\RuntimeBroker.exe -Embedding",
+         "started": "20261001120010"},                       # Windows' own broker
+        {"pid": 16, "ppid": 4, "name": "OpenConsole.exe",
+         "cmd": '"C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal_1_x64\\'
+                'OpenConsole.exe" -Embedding', "started": "20261001120010"},   # a Store package
+        {"pid": 17, "ppid": 4, "name": "WINWORD.EXE",
+         "cmd": '"C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE" '
+                '/Automation -Embedding', "started": "20261001120011"},
+    ]
+    with _patched(_cim_processes=lambda where="": rows):
+        assert vk._com_strays(since, {13}) == [{"pid": 11, "image": "EXCEL.EXE"},
+                                               {"pid": 17, "image": "WINWORD.EXE"}]
+    stray = [{"pid": 4242, "image": "EXCEL.EXE"}]
+    with _patched(_com_strays=lambda since, exclude: stray):
+        got = vk.run_process(sys.executable, ["-c", "import time; time.sleep(20)"], timeout_s=1)
+        assert got["timed_out"] and got["possibly_left_running"] == stray, got
+        assert "possibly_left_running" in got["note"] and "DcomLaunch" in got["note"], got
+        got = vk.run_ahk_snippet("Sleep(20000)", timeout_s=1)
+        assert got["timed_out"] and got["possibly_left_running"] == stray, got
+        got = vk.run_process(sys.executable, ["-c", "print(1)"])
+        assert "possibly_left_running" not in got, "only looked for after a timeout"
+
+
+def test_background_jobs_and_list_processes_keep_token_names_masked():
+    """Review finding: a name that came in as a token was masked when the
+    SAME call echoed it (privacy.take_expanded), but a background job's
+    read_job, and list_processes' command lines, are later calls -- a job
+    handed '<file#..>.pdf' that printed the bare file name, or a command
+    line carrying it, came back in clear. Every launch now remembers the
+    TOKENS its inputs carried (never the names) and those calls re-expand
+    them, so the names are masked there too."""
+    import sys
+    server = _server_or_none()
+
+    def guarded(fn, *a, **kw):
+        if server is not None:
+            return server._guard(fn, *a, **kw)
+        pv.start_call()
+        return _pv(fn(*a, **kw), known=pv.take_expanded())
+
+    with _privacy_sandbox() as s, _jobs_sandbox():
+        script = s.temp / "pb.py"
+        script.write_text("import os, sys, time\n"
+                          "print('Processing', os.path.basename(sys.argv[1]), flush=True)\n"
+                          "time.sleep(int(sys.argv[2]))\n", encoding="utf-8")
+        shown = _pv(str(s.inv))
+        ftok = re.search(rf"<file#{_T}>\.pdf", shown).group(0)
+        g = guarded(vk.run_process, sys.executable, [str(script), shown, "0"])
+        assert g["exit_code"] == 0 and "<file#" in g["stdout"], g
+        assert "Smith" not in json.dumps(g), "the foreground case (same call) was already masked"
+        # (The sandbox's jobs folder is a random name under %TEMP%, so the
+        # reply masks job ids here: they are taken from _JOBS instead.)
+        before = set(vk._JOBS)
+        b = guarded(vk.run_process, sys.executable, [str(script), shown, "30"], background=True)
+        jid = (set(vk._JOBS) - before).pop()
+        assert "tokens" not in b, "tokens are kept in meta.json, not handed out"
+        meta = json.loads((vk._jobs_dir() / jid / "meta.json").read_text(encoding="utf-8"))
+        assert meta["tokens"] and all(t.startswith(("<dir#", "<file#")) for t in meta["tokens"])
+        assert "Smith" not in json.dumps(meta["tokens"]), "never the names"
+        st = _poll(lambda: (lambda x: x if "Processing" in x.get("stdout_tail", "") else None)(
+            guarded(vk.read_job, jid)))
+        assert st and "<file#" in st["stdout_tail"], st
+        assert "Smith" not in json.dumps(st) and "Invoice" not in json.dumps(st), st
+        # A bare token argument, cwd a masked client folder: the command line
+        # list_processes shows carries the name -- masked.
+        before = set(vk._JOBS)
+        guarded(vk.run_process, sys.executable, [str(script), ftok, "30"],
+                cwd=_pv(str(s.client)), background=True)
+        jid2 = (set(vk._JOBS) - before).pop()
+        rows = _poll(lambda: [p for p in guarded(vk.list_processes, "python")["processes"]
+                              if p.get("voicekit", "").startswith("job ")])
+        assert rows, "the job's python shows up"
+        blob = json.dumps(rows)
+        assert "Smith" not in blob and "Invoice" not in blob, rows
+        assert "<file#" in blob, rows
+        st = guarded(vk.read_job, jid2)
+        assert "Smith" not in json.dumps(st) and "Invoice" not in json.dumps(st), st
+        s1 = guarded(vk.stop_job, jid)
+        assert s1["stopped"] and "Smith" not in json.dumps(s1), s1
+        guarded(vk.stop_job, jid2)
+
+
+def test_list_processes_tags_voicekit():
+    """Feedback #7: a ProcessExist("python.exe") check matched VoiceKit's own
+    server. list_processes lists everything with command lines and tags
+    VoiceKit's own processes (this server first), so a caller checks a pid
+    instead of an image name."""
+    import sys
+    got = vk.list_processes("python")
+    me = [p for p in got["processes"] if p["pid"] == os.getpid()]
+    assert me and me[0]["voicekit"] == "this MCP server", got["processes"][:3]
+    assert got["processes"][0].get("voicekit"), "VoiceKit's own processes come first"
+    assert "ProcessExist('python.exe')" in got["note"] and got["this_server_pid"] == os.getpid()
+    assert all("command_line" not in p
+               for p in vk.list_processes("python", include_command_line=False)["processes"])
+    one = vk.list_processes(max_rows=1)
+    assert one["shown"] == 1 and "truncated" in one, one
+    # A live run_process / snippet tree is tagged while it runs.
+    import threading
+    box: dict = {}
+    t = threading.Thread(target=lambda: box.setdefault(
+        "r", vk.run_process(sys.executable, ["-c", "import time; time.sleep(4)"], timeout_s=20)))
+    t.start()
+    try:
+        tagged = _poll(lambda: [p for p in vk.list_processes("python")["processes"]
+                                if p.get("voicekit") == "run_process"], 8)
+        assert tagged, "a running run_process child is tagged"
+    finally:
+        t.join(30)
+    # The tag rules, on synthetic rows (no real master/body/macro needed).
+    root = str(vk.REPO_ROOT)
+    ahk = os.path.basename(vk.AHK_EXE)
+    rows = [{"pid": 900001, "ppid": 1, "name": ahk, "started": "20260101000000",
+             "cmd": f'"{vk.AHK_EXE}" "{root}\\VoiceKit.ahk"'},
+            {"pid": 900002, "ppid": 1, "name": ahk, "started": "20260101000000",
+             "cmd": f'"{vk.AHK_EXE}" "{root}\\hotkeys\\bodies\\WebScrape.body.ahk"'},
+            {"pid": 900003, "ppid": 1, "name": ahk, "started": "20260101000000",
+             "cmd": f'"{vk.AHK_EXE}" "{root}\\macros\\SplitPages.ahk" "C:\\x.pdf"'},
+            {"pid": 900004, "ppid": 1, "name": ahk, "started": "20260101000000",
+             "cmd": f'"{vk.AHK_EXE}" "{root}\\lib\\LoopRunner.ahk" "SendAmount"'},
+            {"pid": 900005, "ppid": 1, "name": "python.exe", "started": "20260101000000",
+             "cmd": f'python.exe "{root}\\mcp\\server.py"'},
+            {"pid": 900006, "ppid": 1, "name": ahk, "started": "20260101000000",
+             "cmd": f'"{vk.AHK_EXE}" "C:\\elsewhere\\VoiceKit.ahk"'},
+            {"pid": 900007, "ppid": os.getpid(), "name": "powershell.exe",
+             "started": "20260101000000", "cmd": "powershell -Command x"}]
+    tags = vk._voicekit_tags(rows)
+    assert tags[900001] == "VoiceKit master", tags
+    assert tags[900002] == "module body Web Scrape", tags
+    assert tags[900003] == "macro Split Pages", tags
+    assert tags[900004] == "loop Send Amount", tags
+    assert tags[900005] == "VoiceKit MCP server (other instance)", tags
+    assert 900006 not in tags, "another tree's master is not this VoiceKit's"
+    assert tags[900007] == "started by this MCP server", tags
+
+
+def test_run_ahk_snippet_timeout_kills_the_tree():
+    """The reported case: a snippet whose Run() child outlived the timeout
+    and held its log open. A timeout now ends the snippet AND what it
+    started; a snippet that finishes normally keeps what it Run() on purpose
+    and reports it (left_running)."""
+    got = vk.run_ahk_snippet('Run("ping -n 60 127.0.0.1",, "Hide", &pid)\nOut(pid)\n'
+                             'Sleep(60000)', timeout_s=3)
+    ping = int(got["output"].strip())
+    try:
+        assert got["timed_out"] is True, got
+        images = [p["image"].lower() for p in got["killed"]]
+        assert os.path.basename(vk.AHK_EXE).lower() in images, images
+        assert ping in [p["pid"] for p in got["killed"]], got
+        assert not _gone_within([ping]), "the snippet's child must be gone"
+    finally:
+        _reap(ping)
+    got = vk.run_ahk_snippet('Run("ping -n 60 127.0.0.1",, "Hide", &pid)\nOut(pid)')
+    ping = int(got["output"].strip())
+    try:
+        assert got["exit_code"] == 0 and got["timed_out"] is False, got
+        assert [p["pid"] for p in got.get("left_running", [])] == [ping], got
+        assert _alive(ping), "a child the snippet Run() on purpose is left running"
+        assert "left_running" in got["note"], got
+    finally:
+        _reap(ping)
+
+
+def test_kill_request_ends_a_requests_tree():
+    """The cancel hook, without fastmcp: work started under one request id
+    (CURRENT_REQUEST, which server._guard sets) is ended by
+    kill_request(that id) — and only that request's work."""
+    import sys
+    import threading
+    key, other = (12345, "7"), (12345, "8")
+    assert vk.kill_request(None) == []
+    box: dict = {}
+
+    def call():
+        vk.CURRENT_REQUEST.set(key)
+        box["r"] = vk.run_process(sys.executable, ["-c", "import time; time.sleep(40)"],
+                                  timeout_s=45)
+    t = threading.Thread(target=call)
+    t0 = time.time()
+    t.start()
+    try:
+        tree = _poll(lambda: next((tr for tr in list(vk._LIVE.values())
+                                   if tr.request == key and tr.pids()), None), 10)
+        assert tree, "the run registers under its request"
+        assert vk.kill_request(other) == [], "another request's id kills nothing"
+        killed = vk.kill_request(key)
+        assert tree.pid in [p["pid"] for p in killed], killed
+        t.join(20)
+        r = box["r"]
+        assert r["cancelled"] is True and r["exit_code"] is None and r["timed_out"] is False, r
+        assert time.time() - t0 < 20 and "cancelled" in r["note"], r
+        assert not _gone_within([tree.pid])
+    finally:
+        t.join(30)
+    assert vk.CURRENT_REQUEST.get() is None, "the request id never leaks into another context"
+
+
+def test_a_cancel_before_the_tree_exists_still_ends_it():
+    """Review finding (2026-10-01): kill_request only saw trees already in
+    _LIVE, so a cancel that landed while the tool's thread was still getting
+    ready (token expansion, run-folder pruning, Popen) killed nothing and the
+    run went its full timeout. A cancelled request is now remembered: a run
+    not yet started starts nothing, and one that registers after the cancel
+    is ended as it registers. request_done (server._guard's finally) forgets
+    it."""
+    import sys
+    key = (54321, "late-1")
+    sleeper = [sys.executable, "-c", "import time; time.sleep(30)"]
+    with tempfile.TemporaryDirectory() as d:
+        out, err = Path(d) / "o.txt", Path(d) / "e.txt"
+        tok = vk.CURRENT_REQUEST.set(key)
+        try:
+            assert vk.kill_request(key) == [], "nothing was running yet"
+            assert vk.request_cancelled(key)
+            # 1. cancelled before _run_bounded: nothing starts
+            t0 = time.time()
+            r = vk._run_bounded(sleeper, 20, cwd=d, out_path=out, err_path=err)
+            assert r["cancelled"] is True and r["exit_code"] is None, r
+            assert time.time() - t0 < 2, "started anyway"
+            # 2. the cancel lands between that check and _track (the race the
+            # review measured): the tree is ended the moment it registers
+            real = vk.request_cancelled
+            vk.request_cancelled = lambda request=None: False
+            try:
+                t0 = time.time()
+                r = vk._run_bounded(sleeper, 20, cwd=d, out_path=out, err_path=err)
+            finally:
+                vk.request_cancelled = real
+            assert r["cancelled"] is True and r["timed_out"] is False, r
+            assert time.time() - t0 < 10, f"ran on for {time.time() - t0:.1f} s"
+            # 3. the call returned: its cancellation is forgotten
+            vk.request_done(key)
+            assert not vk.request_cancelled(key)
+            r = vk._run_bounded([sys.executable, "-c", "print('ran')"], 20, cwd=d,
+                                out_path=out, err_path=err)
+            assert r["exit_code"] == 0 and not r["cancelled"], r
+        finally:
+            vk.request_done(key)
+            vk.CURRENT_REQUEST.reset(tok)
 
 
 def test_quiet_cancel_survives_a_late_respond():
@@ -2402,7 +3247,8 @@ def test_every_tool_is_in_the_readme():
     assert not missing, f"mcp\\README.md doesn't document: {', '.join(missing)}"
     sec = readme[readme.index("## Security"):]
     for t in ("run_ahk_snippet", "stop_module", "update_macro", "edit_macro",
-              "edit_hotkey_module", "update_hotkey_module", "run_automation", "press_hotkey"):
+              "edit_hotkey_module", "update_hotkey_module", "run_automation", "press_hotkey",
+              "run_process", "stop_job"):
         assert f"`{t}`" in sec, f"the security section must name immediate-effect tool {t}"
 
 
@@ -2850,7 +3696,7 @@ def test_batch_refuses_while_a_loop_runs_and_uses_its_own_file():
                   "cmd": f'"{vk.AHK_EXE}" "C:\\Elsewhere\\lib\\LoopRunner.ahk" X'}]
         launched: list = []
 
-        def fake_launch(cmd, launched_as, file, wait, cwd=None):
+        def fake_launch(cmd, launched_as, file, wait, cwd=None, tokens=()):
             launched.append(cmd)
             return {"launched": launched_as, "file": file, "finished": False, "note": ""}
         with _patched(_ahk_processes=lambda: other, _launch_and_report=fake_launch):
@@ -2984,6 +3830,286 @@ def test_run_automation_passes_args_and_cwd():
                 except vk.VoiceKitError as e:
                     assert why in str(e), (why, str(e))
         assert not launched, "a refused run must launch nothing"
+
+
+
+class _DialogWatch:
+    """Polls (every 50 ms, on a thread) for a VISIBLE top-level dialog
+    (#32770 — MsgBox, InputBox and AutoHotkey's error dialog all are one)
+    whose title contains `marker`, for as long as the with-block runs.
+    `seen` lists the titles that appeared: a quiet test run must leave it
+    empty."""
+
+    def __init__(self, marker: str):
+        self.marker = marker
+        self.seen: list[str] = []
+        self._stop = False
+        self._t = None
+
+    def _poll(self):
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL("user32")
+        proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def each(h, _l):
+            if u.IsWindowVisible(h):
+                cls = ctypes.create_unicode_buffer(64)
+                u.GetClassNameW(h, cls, 64)
+                if cls.value == "#32770":
+                    title = ctypes.create_unicode_buffer(256)
+                    u.GetWindowTextW(h, title, 256)
+                    if self.marker in title.value and title.value not in self.seen:
+                        self.seen.append(title.value)
+            return True
+        cb = proc(each)
+        while not self._stop:
+            u.EnumWindows(cb, 0)
+            time.sleep(0.05)
+
+    def __enter__(self):
+        import threading
+        self._t = threading.Thread(target=self._poll, daemon=True)
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop = True
+        self._t.join(5)
+        return False
+
+
+_TEST_LIBS = ("_Common.ahk", "TestShim.ahk")
+_TEST_WF_LIBS = _TEST_LIBS + ("Workflow.ahk", "Acc.ahk", "UIA.ahk", "Clip.ahk", "ExplorerSel.ahk")
+
+
+def test_run_automation_test_mode_is_quiet():
+    """run_automation(test=True) (feedback #3): a macro's MsgBox, InputBox and
+    TrayTip are recorded in `dialogs` instead of shown — no #32770 window
+    appears — each answering as Enter would (YesNo -> 'Yes', seen through
+    VkResult by the macro itself); VkResult values (newlines, quotes,
+    numbers, Arrays, Maps) come back in order in `result`; FileAppend(x, "*")
+    comes back in `stdout` (it used to crash a launched macro); AutoHotkey's
+    load-time warnings come back as `warnings` instead of a dialog; and an
+    uncaught error is reported as `uncaught_error`, exit 3, with no dialog
+    and nothing after it run. The macro's arguments still arrive."""
+    with _sandbox(libs=_TEST_LIBS) as d, _patched(RUNS_ROOT=None):
+        runs = d / "runs"
+        vk.RUNS_ROOT = runs
+        fixture = d / "fixture & co.txt"
+        fixture.write_text("x", encoding="utf-8")
+        vk.create_launch_macro("Quiet Probe Zz", ahk_body=(
+            'r := MsgBox("Proceed?`nLine two", "Shim Probe Zz", "YesNo Icon?")\n'
+            'VkResult(r)\n'
+            'VkResult("multi`nline `"q`" \\ tab`t end")\n'
+            'VkResult(VkTestMode())\n'
+            'VkResult([1, "two", Map("k", "v")])\n'
+            'TrayTip("hello tray", "Shim Probe Zz")\n'
+            'ib := InputBox("Name?", "Shim Probe Zz")\n'
+            'VkResult(ib.Result "|" ib.Value)\n'
+            'FileAppend("to stdout`nsecond", "*", "UTF-8")\n'
+            'VkResult(A_Args.Length ? A_Args[1] : "no args")\n'
+            'm := Map()\n'
+            'gone := m["missing key"]\n'
+            'VkResult("never")\n'))
+        # Unreachable code draws a load-time warning, which AutoHotkey shows
+        # as a DIALOG by default — so it goes in after create_launch_macro's
+        # own load check (which would show it), straight into the file.
+        mp = d / "macros" / "QuietProbeZz.ahk"
+        mp.write_text(mp.read_text(encoding="utf-8-sig")
+                      + "Unused() {\n    return 1\n    zz := 2\n}\n", encoding="utf-8")
+        with _DialogWatch("Zz") as watch:
+            r = vk.run_automation("Quiet Probe Zz", test=True, args=[str(fixture)])
+        assert not watch.seen, f"a test run showed a dialog: {watch.seen}"
+        assert r["test"] is True and r["exit_code"] == 3 and r["ok"] is False, r
+        assert r["timed_out"] is False and not r["killed"], r
+        assert r["result"] == ["Yes", 'multi\nline "q" \\ tab\t end', 1,
+                               [1, "two", {"k": "v"}], "Cancel|", str(fixture)], r["result"]
+        kinds = [(x["kind"], x.get("returned", "")) for x in r["dialogs"]]
+        assert kinds == [("MsgBox", "Yes"), ("TrayTip", ""), ("InputBox", "Cancel")], kinds
+        mb = r["dialogs"][0]
+        assert mb["title"] == "Shim Probe Zz" and mb["text"] == "Proceed?\nLine two" \
+            and mb["options"] == "YesNo Icon?", mb
+        assert r["stdout"].rstrip("\n") == "to stdout\nsecond", repr(r["stdout"])
+        assert len(r["warnings"]) == 1 and "never execute" in r["warnings"][0], r["warnings"]
+        ue = r["uncaught_error"]
+        assert ue["type"] == "UnsetItemError" and ue["extra"] == "missing key" \
+            and isinstance(ue["line"], int) and ue["file"].endswith("QuietProbeZz.ahk"), ue
+        assert "no error dialog" in r["note"], r["note"]
+        assert "load_errors" not in r, r
+        assert not (d / "logs" / "errors.log").exists(), \
+            "a test run's error never reaches the user's errors.log"
+        assert not any(runs.iterdir()), "a finished test run removes its run folder"
+
+        # A load error comes back as text (/ErrorStdOut) — never a dialog.
+        (d / "macros" / "QuietProbeZz.ahk").write_text(
+            '#Requires AutoHotkey v2.0\nx := "unterminated\n', encoding="utf-8")
+        with _DialogWatch("QuietProbeZz") as watch:
+            r = vk.run_automation("Quiet Probe Zz", test=True)
+        assert not watch.seen, watch.seen
+        assert r["ok"] is False and "load_errors" in r and "didn't load" in r["note"], r
+
+
+def test_run_automation_test_mode_stderr_ansi_and_handled_errors():
+    """Review findings on test mode: (1) a macro's own FileAppend(x, "**")
+    went into load_errors, with ok=False and 'It didn't load' after a clean
+    run -- stderr is a load error only when AutoHotkey exits 2 with its
+    '<file> (<line>) : ==>' text; otherwise it is `stderr`. (2) FileAppend(x,
+    "*") with no encoding writes the ANSI code page and was decoded as the
+    console's OEM one ('cafe' + e-acute arrived as 'caf' + Greek Theta). (3) A
+    macro's own OnError handler never ran (the shim exited first), so a
+    macro that handles its errors failed its test; now it runs, and the run
+    goes on. (4) ToolTip returns a real window handle a macro can use."""
+    with _sandbox(libs=_TEST_LIBS) as d, _patched(RUNS_ROOT=None):
+        vk.RUNS_ROOT = d / "runs"
+        vk.create_launch_macro("Stderr Probe Zz", ahk_body=(
+            'FileAppend("café — ok`n", "*")\n'
+            'FileAppend("diag line`n", "**")\n'
+            'OnError(Handled)\n'
+            'Handled(e, m) {\n'
+            '    VkResult("handled " e.Extra)\n'
+            '    return -1\n'
+            '}\n'
+            'x := Map()["k1"]\n'
+            'tt := ToolTip("busy")\n'
+            'WinSetTransparent(200, "ahk_id " tt)\n'
+            'ToolTip()\n'
+            'VkResult("done")\n'))
+        with _DialogWatch("Zz") as watch:
+            r = vk.run_automation("Stderr Probe Zz", test=True)
+        assert not watch.seen, watch.seen
+        assert r["exit_code"] == 0 and r["ok"] is True, r
+        assert r["result"] == ["handled k1", "done"], r
+        assert r["stdout"].rstrip("\n") == "café — ok", repr(r["stdout"])
+        assert r["stderr"].rstrip("\n") == "diag line", r
+        assert "load_errors" not in r and "uncaught_error" not in r, r
+        assert r["note"].startswith("Finished cleanly"), r["note"]
+        assert [x["kind"] for x in r["dialogs"]] == ["ToolTip"], r["dialogs"]
+        # A real load error is still a load error.
+        (d / "macros" / "StderrProbeZz.ahk").write_text(
+            '#Requires AutoHotkey v2.0\nx := "unterminated\n', encoding="utf-8")
+        r = vk.run_automation("Stderr Probe Zz", test=True)
+        assert r["exit_code"] == 2 and "load_errors" in r and "stderr" not in r, r
+        assert "didn't load" in r["note"], r
+
+
+def test_run_automation_result_channel_without_test_mode():
+    """Any run run_automation WAITS on gets the result channel and a stdout:
+    VkResult values (one with a newline) and FileAppend(x, "*") come back
+    without test=True; VkTestMode() is false there. Fire-and-forget launches
+    exactly as before — nothing redirected, no run folder."""
+    with _sandbox(libs=_TEST_LIBS) as d, _patched(RUNS_ROOT=None):
+        vk.RUNS_ROOT = d / "runs"
+        vk.create_launch_macro("Result Probe Zz", ahk_body=(
+            'VkResult("a`nb")\nVkResult(VkTestMode())\nFileAppend("out", "*", "UTF-8")\n'))
+        r = vk.run_automation("Result Probe Zz", wait_seconds=20)
+        assert r.get("finished") and r["exit_code"] == 0, r
+        assert r["result"] == ["a\nb", 0] and r["stdout"] == "out", r
+        assert "test" not in r and "dialogs" not in r, r
+        launched: list = []
+
+        class _P:
+            pid = 0
+
+        def fake_popen(cmd, **kw):
+            launched.append(kw)
+            return _P()
+        with _patched(subprocess=type("S", (), {"Popen": staticmethod(fake_popen),
+                                                "DEVNULL": subprocess.DEVNULL,
+                                                "TimeoutExpired": subprocess.TimeoutExpired})):
+            r = vk.run_automation("Result Probe Zz")
+        assert launched == [{"cwd": str(d / "macros")}], launched
+        assert "result" not in r and r["finished"] is False, r
+
+
+def test_run_automation_test_mode_kills_the_tree_on_timeout():
+    """A test run that outlives its wait is KILLED with everything it started
+    (unlike a normal run, which is left running) — and the values it handed
+    back before that still arrive."""
+    with _sandbox(libs=_TEST_LIBS) as d, _patched(RUNS_ROOT=None):
+        vk.RUNS_ROOT = d / "runs"
+        grand = d / "grandchild.ahk"
+        grand.write_text("#Requires AutoHotkey v2.0\n#SingleInstance Off\nPersistent\n"
+                         "Sleep(60000)\n", encoding="utf-8")
+        vk.create_launch_macro("Slow Probe Zz", ahk_body=(
+            f'Run(\'"\' A_AhkPath \'" "{grand}"\', , , &gpid)\n'
+            'VkResult(gpid)\nSleep(60000)\n'))
+        t0 = time.time()
+        r = vk.run_automation("Slow Probe Zz", test=True, wait_seconds=4)
+        took = time.time() - t0
+        gpid = r["result"][0] if r.get("result") else 0
+        try:
+            assert r["timed_out"] is True and r["ok"] is False and r["exit_code"] is None, r
+            assert took < 20, f"took {took:.1f} s"
+            assert isinstance(gpid, int) and gpid, r
+            killed = {k["pid"] for k in r["killed"]}
+            assert gpid in killed and len(killed) >= 2, r["killed"]
+            assert not _gone_within([gpid]), "the grandchild must be gone"
+            assert "Killed after 4 s" in r["note"], r["note"]
+        finally:
+            _reap(gpid)
+
+
+def test_run_automation_test_mode_quiets_a_workflow():
+    """A WORKFLOW under test=True: the engine's failure popup (a MsgBox) is
+    suppressed like any other — its text withheld, since the engine keeps
+    that text local (it can carry filled-in values) — and the run record
+    still says what failed (_attach_outcome)."""
+    with _sandbox(libs=_TEST_WF_LIBS) as d, _patched(RUNS_ROOT=None):
+        vk.RUNS_ROOT = d / "runs"
+        vk.create_workflow("Wf Quiet Zz", [("set", "Greeting", "hi", ""),
+                                           ("capture", "Out", "cmd /c exit 3", "10")])
+        with _DialogWatch("VoiceKit workflow") as watch:
+            r = vk.run_automation("Wf Quiet Zz", test=True)
+        assert not watch.seen, watch.seen
+        assert r["ok"] is False and r["run"]["outcome"] == "failed", r
+        assert r["run"]["failed_step"] == 2 and "code 3" in r["run"]["reason"], r["run"]
+        assert [x["kind"] for x in r["dialogs"]] == ["MsgBox"], r["dialogs"]
+        assert r["dialogs"][0]["title"] == "VoiceKit workflow"
+        assert r["dialogs"][0]["text"].startswith("(withheld"), r["dialogs"]
+        assert r["dialogs"][0]["returned"] == "OK" and r["exit_code"] == 0, r
+
+
+def test_run_automation_test_mode_refusals():
+    """What test mode can't run quietly is refused before anything launches,
+    each saying why: a loop, Workflow Studio, VoiceKit's own tools, a
+    workflow that asks for input (its dialog is a Gui), and a macro with a
+    dialog-mode #Warn line (its warnings pop at load, before the shim)."""
+    with _sandbox(libs=_TEST_WF_LIBS) as d:
+        vk.create_workflow("Ask Zz", [("ask", "Customer", "", ""), ("text", "{{Customer}}", "", "")])
+        vk.create_workflow("Plain Zz", [("wait", "10", "", "")])
+        (d / "macros" / "WorkflowStudio.ahk").write_text("; dummy\n", encoding="utf-8")
+        (d / "macros" / "AskAI.ahk").write_text("; dummy\n", encoding="utf-8")
+        vk.create_launch_macro("Warn Zz", ahk_body="x := 1\n")
+        src = (d / "macros" / "WarnZz.ahk").read_text(encoding="utf-8-sig")
+        (d / "macros" / "WarnZz.ahk").write_text(src.replace("x := 1", "#Warn  ; strict\nx := 1"),
+                                                 encoding="utf-8")
+        launched: list = []
+
+        def fake(*a, **k):
+            launched.append(a)
+            return {"exit_code": 0}
+        with _patched(_run_bounded=fake, _launch_and_report=fake,
+                      _ahk_script_running=lambda *a, **k: False, _ahk_processes=lambda: []):
+            for call, why in [
+                    (lambda: vk.run_automation("loop Plain Zz", test=True), "can't be test-run"),
+                    (lambda: vk.run_automation("Workflow Studio", test=True), "editor window"),
+                    (lambda: vk.run_automation("Ask AI", test=True), "VoiceKit's own tools"),
+                    (lambda: vk.run_automation("Ask Zz", test=True), "asks for input (Customer)"),
+                    (lambda: vk.run_automation("Warn Zz", test=True),
+                     "has a #Warn directive (line "),
+            ]:
+                try:
+                    call()
+                    assert False, f"must refuse: {why}"
+                except vk.VoiceKitError as e:
+                    assert why in str(e), (why, str(e))
+        assert not launched, "a refused test run must launch nothing"
+    # Which #Warn lines pop a dialog (the measured rule): no mode / MsgBox do.
+    assert vk._warn_dialog_line("#Warn") and vk._warn_dialog_line("  #warn VarUnset, MsgBox")
+    assert vk._warn_dialog_line("#Warn All") and not vk._warn_dialog_line("; #Warn")
+    assert not vk._warn_dialog_line("#Warn All, StdOut\n#Warn VarUnset, Off")
+    assert not vk._warn_dialog_line("#Warn All, OutputDebug ; quiet")
 
 
 def test_press_hotkey_resolves_a_companion_by_its_listed_name():
@@ -3314,7 +4440,12 @@ def test_instructions_names_exist():
     for f in fams:
         assert any(d.startswith(f[:-1]) for d in defs), f"no definition starts with {f}"
     for must in ("`\"", "single quotes", "edit_hotkey_module", "update_macro",
-                 "server_info", "%USERPROFILE%", "_Common.ahk", "Browser.ahk"):
+                 "server_info", "%USERPROFILE%", "_Common.ahk", "Browser.ahk",
+                 # 2026-10-01: the quiet-harness capabilities, discoverable
+                 # without reading every docstring, and the honest cap.
+                 "run_process", "background=True", "read_job", "test=True", "VkResult",
+                 "list_processes", "check_path", "unmask=[", f"over {vk.max_wait_s()} s",
+                 "prefixes", "re-list"):
         assert must in text, must
     assert len(text) < 4000, "instructions load every session — keep them short"
     try:
@@ -3397,6 +4528,17 @@ def test_server_info_and_version():
     assert "hunter2" not in json.dumps(info) and "SECRET_TOKEN" not in json.dumps(info)
     assert "registered 3 times" in info["note"] and "two sets" in info["note"], info["note"]
     assert "%TEMP%" in regs[0]["config"], "server_info normalizes its own paths"
+    # Feedback #4: say WHICH registrations collide. The user-scope 'voicekit'
+    # and C:/p's 'VoiceKit-dev' both load in C:/p — one client, two sets; the
+    # Desktop entry is a different client — normal.
+    assert info["same_client_duplicates"] == [
+        {"client": "Claude Code", "where": "project C:/p", "names": ["voicekit", "VoiceKit-dev"]}
+    ], info["same_client_duplicates"]
+    assert "ONE client" in info["note"] and "'VoiceKit-dev'" in info["note"] \
+        and "different clients" in info["note"], info["note"]
+    assert info["connected_client"] is None, "no request: no client"
+    pre = info["tool_name_prefixes"]
+    assert "mcp__remote-devices__voicekit__" in pre and "stable" in pre and "re-list" in pre, pre
     try:
         import server
     except ImportError:
@@ -3404,6 +4546,66 @@ def test_server_info_and_version():
         return
     assert getattr(server.mcp, "version", vk.VERSION) == vk.VERSION
     assert callable(getattr(server, "server_info", None))
+    assert server._connected_client() is None, "outside a request there is no client"
+
+
+def test_server_info_registrations_by_client():
+    """Feedback #4 ("server_info showed VoiceKit registered three times with
+    two server processes"): a count alone can't tell the real problem — two
+    entries the SAME client loads, so it shows every tool twice — from the
+    normal case of one entry per client. Claude Code's scopes: user entries
+    load everywhere, a projects[P] entry only in P, the repo's .mcp.json only
+    here, and a same-named narrower entry replaces the wider one. The
+    connected client (MCP clientInfo) is named, and a client whose config
+    isn't read here (a bridge) is said to be one."""
+    def regs(*entries):
+        out = []
+        for client, name, project in entries:
+            e = {"client": client, "config": "x", "name": name, "command": "py",
+                 "args": [], "this_install": True}
+            if project:
+                e["project"] = project
+            out.append(e)
+        return out
+    dup = vk._same_client_duplicates
+    U, D, M = "Claude Code (user)", "Claude Desktop", "Claude Code (project)"
+    # One per client: normal.
+    assert dup(regs((U, "voicekit", None), (D, "voicekit", None))) == []
+    # Same name narrower: replaces, never doubles.
+    assert dup(regs((U, "voicekit", None), (U, "VoiceKit", "C:/p"))) == []
+    # Two user-scope entries: every project; the project that only repeats
+    # them isn't reported again.
+    got = dup(regs((U, "voicekit", None), (U, "vk2", None), (U, "voicekit", "C:/p")))
+    assert got == [{"client": "Claude Code", "where": "every project",
+                    "names": ["vk2", "voicekit"]}], got
+    # The repo's .mcp.json and a projects[] entry for the same folder (any
+    # spelling) are one place.
+    root = str(vk.REPO_ROOT)
+    got = dup(regs((U, "voicekit", None), (M, "voicekit-dev", None),
+                   (U, "vk-local", root.replace("\\", "/"))))
+    assert len(got) == 1 and got[0]["names"] == ["vk-local", "voicekit", "voicekit-dev"], got
+    # Desktop: every entry loads.
+    got = dup(regs((D, "voicekit", None), (D, "voicekit-old", None)))
+    assert got == [{"client": "Claude Desktop", "where": "every chat",
+                    "names": ["voicekit", "voicekit-old"]}], got
+
+    def info_with(entries, client):
+        rs = regs(*entries)
+        with _patched(_client_config_files=lambda: [("cfg", Path(__file__))],
+                      _registrations_in=lambda c, p: rs, _python_processes=lambda: []):
+            return vk.server_info(connected_client=client)
+    i = info_with([(U, "voicekit", None), (D, "voicekit", None)],
+                  {"name": "claude-code", "version": "2.1.0"})
+    assert i["connected_client"] == {"name": "claude-code", "version": "2.1.0"}, i
+    assert i["same_client_duplicates"] == [] and "never twice in the same client" in i["note"] \
+        and "normal" in i["note"], i["note"]
+    i = info_with([(D, "voicekit", None), (D, "voicekit-old", None)],
+                  {"name": "claude-ai", "version": "0.9"})
+    assert "Claude Desktop — the client with the duplicate registration" in i["note"], i["note"]
+    i = info_with([(U, "voicekit", None)], {"name": "remote-devices", "version": "1"})
+    assert "bridge" in i["note"] and "'remote-devices'" in i["note"], i["note"]
+    i = info_with([(U, "voicekit", None)], None)
+    assert i["note"].startswith("One VoiceKit server, registered once"), i["note"]
 
 
 def test_paths_normalized_in_responses():
@@ -3454,7 +4656,7 @@ def test_paths_normalized_in_responses():
             "; probe\nask|File||\ntext|{{File}}||\n", encoding="utf-8")
         launched: list = []
 
-        def fake_launch(cmd, launched_as, file, wait, cwd=None):
+        def fake_launch(cmd, launched_as, file, wait, cwd=None, tokens=()):
             launched.append(cmd)
             return {"launched": launched_as, "file": file, "finished": False, "note": ""}
         with _patched(_ahk_processes=lambda: [], _launch_and_report=fake_launch):
@@ -3511,7 +4713,7 @@ def _fake_batch_launch(loops=()):
     to pretend are running."""
     launched: list = []
 
-    def fake(cmd, launched_as, file, wait, cwd=None):
+    def fake(cmd, launched_as, file, wait, cwd=None, tokens=()):
         launched.append(cmd)
         return {"launched": launched_as, "file": file, "finished": False, "note": ""}
     procs = [{"pid": 4242, "started": "", "cmd": c} for c in loops]
@@ -4296,7 +5498,7 @@ def test_privacy_tokens_round_trip_through_tool_inputs():
         assert "<file#" in shown
         launched: list = []
 
-        def fake(cmd, launched_as, file, wait, cwd=None):
+        def fake(cmd, launched_as, file, wait, cwd=None, tokens=()):
             launched.append(cmd)
             return {"launched": launched_as, "file": file, "finished": False, "note": ""}
         (s.root / "macros" / "ArgsZz.ahk").write_text("; raw\n", encoding="utf-8")
@@ -4354,8 +5556,9 @@ def test_privacy_snippet_code_tokens_unmask_and_reveal_are_audited():
     """run_ahk_snippet: a masked path inside a quoted string is expanded
     (escaped — names may hold ' ; or a backtick) and the code really opens the
     file; a token outside a string is refused. The output comes back masked,
-    or unmasked with unmask=True — audited, like every reveal, by token and
-    tool, never by the name."""
+    or unmasked with unmask=True — only once [Privacy] AllowBlanketUnmask=1
+    allows it — audited, like every reveal, by token and tool, never by the
+    name."""
     libs = tuple(p.name for p in (REAL_ROOT / "lib").glob("*.ahk"))
     with _privacy_sandbox(libs=libs) as s:
         odd = s.prof / "Documents" / "O'Brien; Pat`s"
@@ -4382,10 +5585,18 @@ def test_privacy_snippet_code_tokens_unmask_and_reveal_are_audited():
             gl = g["output"].splitlines()
             assert gl[2] == shown and gl[3] == shown.split("\\")[-1], gl
             assert not audit.exists(), "a masked call audits nothing"
+            # A blanket unmask is refused unless the user allowed it.
+            from fastmcp.exceptions import ToolError
+            _raises(lambda: server._guard(vk.run_ahk_snippet, code, 30, _unmask=True),
+                    "AllowBlanketUnmask=1", exc=ToolError)
+            assert not audit.exists(), "a refused unmask audits nothing"
+            (s.root / "logs" / "settings.ini").write_text(
+                "[Privacy]\nAllowBlanketUnmask=1\n", encoding="utf-8")
             u = server._guard(vk.run_ahk_snippet, code, 30, _unmask=True)
             assert "%USERPROFILE%\\Documents\\Clients\\Smith John\\2025 Invoice Smith.pdf" in u["output"]
             a = audit.read_text(encoding="utf-8")
-            assert "run_ahk_snippet | unmask" in a and "Smith" not in a, a
+            assert "run_ahk_snippet | unmask=True" in a and "Smith" not in a, a
+            (s.root / "logs" / "settings.ini").unlink()
         # reveal: one token, or a whole masked path.
         ftok = re.search(rf"<file#{_T}>", shown).group(0)
         assert vk.reveal(ftok)["text"] == "2025 Invoice Smith"
@@ -4399,6 +5610,203 @@ def test_privacy_snippet_code_tokens_unmask_and_reveal_are_audited():
         if server:
             g = server._guard(vk.reveal, shown)
             assert g["text"] == r["text"], "reveal's answer is not masked again"
+
+
+def test_privacy_scoped_unmask_shows_only_the_listed_tokens():
+    """Feedback #5: unmask=True on one call also sent a client workbook's
+    sheet names. Now unmask is a LIST: the answer is masked as usual and only
+    the exact tokens listed are shown in clear — a masked path counts as all
+    of its tokens; a token sharing hex digits, or the same hex under the
+    other kind, stays masked; a listed token not in the answer comes back in
+    unmask_unused; an unknown or one-way token refuses the call before
+    anything runs; the audit line carries tokens, never names; and if the
+    unmask itself fails, nothing unmasked leaves (fail closed)."""
+    import sys
+    server = _server_or_none()
+    with _privacy_sandbox() as s:
+        other = s.prof / "Documents" / "Clients" / "Doe Jane" / "Doe Jane Taxes.xlsx"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"x")
+        shown = _pv(str(s.inv))
+        shown_other = _pv(str(other))
+        dtok, ftok = re.findall(rf"<(?:dir|file)#{_T}>", shown)[1:]
+        otok = re.search(rf"<file#{_T}>", shown_other).group(0)
+        # privacy-level: the spec, then protect.
+        assert pv.unmask_spec(False, s.root) is None and pv.unmask_spec([], s.root) is None
+        assert pv.unmask_spec(ftok, s.root) == (ftok,)
+        assert pv.unmask_spec([shown], s.root) == tuple(re.findall(rf"<(?:dir|file)#{_T}>", shown))
+        rep: dict = {}
+        hexpart = ftok[6:-1]
+        lookalikes = f"<file#{hexpart}0> <dir#{hexpart}> <file#{hexpart[:-1]}>"
+        r = _pv({"out": f"{s.inv}\n{other}\n2025 Invoice Smith.pdf\n{lookalikes}",
+                 "n": 3}, unmask=(ftok,), report=rep)
+        lines = r["out"].split("\n")
+        assert lines[0] == shown.replace(ftok, "2025 Invoice Smith"), lines[0]
+        assert lines[1] == shown_other and "Doe" not in r["out"], "another token stays masked"
+        assert lines[2] == "2025 Invoice Smith.pdf", "a bare echo of the asked-for name"
+        assert lines[3] == lookalikes, "only the EXACT token string is replaced"
+        assert rep == {"unmasked": [ftok], "unused": []}, rep
+        # Validation: unknown, one-way, not-a-token and blanket refusals.
+        _raises(lambda: pv.unmask_spec(["<file#ffffff>", ftok, "<dir#eeeeee>"], s.root),
+                "<file#ffffff>, <dir#eeeeee>", "not a token this PC issued",
+                exc=pv.PrivacyError)
+        _raises(lambda: pv.unmask_spec(["<ssn#abcdef>"], s.root), "<ssn#abcdef>", "one-way",
+                exc=pv.PrivacyError)
+        _raises(lambda: pv.unmask_spec(["2025 Invoice Smith"], s.root), "privacy token",
+                exc=pv.PrivacyError)
+        _raises(lambda: pv.unmask_spec(True, s.root), "AllowBlanketUnmask=1",
+                exc=pv.PrivacyError)
+        _raises(lambda: _pv({"x": str(s.inv)}, unmask=True), "AllowBlanketUnmask=1",
+                exc=pv.PrivacyError)
+        if server is None:
+            return
+        from fastmcp.exceptions import ToolError
+        audit = s.root / "logs" / pv.AUDIT_FILE
+        printer = ["-c", "import sys; print('\\n'.join(sys.argv[1:]))"]
+        # Through the server: a whole masked path as the unmask entry.
+        g = server.run_process(sys.executable, printer + [shown, shown_other], unmask=[shown])
+        out = g["stdout"].splitlines()
+        assert out[0] == "%USERPROFILE%\\Documents\\Clients\\Smith John\\2025 Invoice Smith.pdf", g
+        ctok = re.search(rf"<dir#{_T}>", shown).group(0)          # 'Clients', shared
+        assert out[1] == shown_other.replace(ctok, "Clients"),             "the other client's own folder and file stay masked; the shared folder was asked for"
+        assert "Doe" not in json.dumps(g) and "unmask_unused" not in g, g
+        assert sorted(g["unmasked"]) == sorted(set(re.findall(rf"<(?:dir|file)#{_T}>", shown)))
+        a = audit.read_text(encoding="utf-8")
+        assert "| run_process | unmask " in a and ftok in a and dtok in a, a
+        assert "Smith" not in a and "Invoice" not in a and "Clients" not in a, a
+        # A listed token that isn't in the answer: harmless, reported.
+        g = server.run_process(sys.executable, printer + [shown], unmask=[ftok, otok])
+        assert g["unmasked"] == [ftok] and g["unmask_unused"] == [otok], g
+        assert "Doe" not in json.dumps(g)
+        assert f"not in the output: {otok}" in audit.read_text(encoding="utf-8")
+        # Refused BEFORE anything runs: an unknown or a one-way token.
+        marker = s.temp / "ran.txt"
+        touch = ["-c", f"open(r'{marker}', 'w').write('x')"]
+        for bad, needle in (("<file#ffffff>", "not a token this PC issued"),
+                            ("<ein#abcdef>", "one-way")):
+            e = _raises(lambda: server.run_process(sys.executable, touch, unmask=[ftok, bad]),
+                        bad, needle, exc=ToolError)
+            assert "Smith" not in e
+            assert not marker.exists(), f"{bad}: the program ran despite the refusal"
+        # read_job takes the same unmask, through the same path.
+        with _jobs_sandbox():
+            vk.JOBS_ROOT = s.temp / "VoiceKit" / "jobs"         # where a real job lives
+            j = server.run_process(sys.executable, printer + [shown], background=True)
+            assert re.fullmatch(r"j\d{8}-\d{6}-[0-9a-f]{4}", j["job_id"]), \
+                f"a job id must survive masking, or read_job can't use it: {j['job_id']}"
+            assert j["folder"] == f"%TEMP%\\VoiceKit\\jobs\\{j['job_id']}", j["folder"]
+            inside = _pv(str(vk.JOBS_ROOT / j["job_id"] / "Smith John.xlsx"))
+            assert re.fullmatch(rf"%TEMP%\\VoiceKit\\jobs\\{j['job_id']}\\<file#{_T}>\.xlsx",
+                                inside), f"what a job writes in its folder stays masked: {inside}"
+            rj = _poll(lambda: (lambda r: r if r.get("state") != "running" else None)(
+                server.read_job(j["job_id"], unmask=[ftok])), 20)
+        assert rj, "the job never finished"
+        blob = json.dumps(rj)
+        assert "2025 Invoice Smith" in blob and "Smith John" not in blob, rj
+        assert rj["unmasked"] == [ftok], rj
+        # Fail closed: the map changes between the check and the answer (the
+        # stored name no longer HMACs to the token) -> the answer is withheld.
+        tmap = s.root / "logs" / pv.MAP_FILE
+
+        def tamper_then_answer():
+            data = json.loads(tmap.read_text(encoding="utf-8"))
+            data["tokens"][hexpart]["t"] = "Someone Else"
+            tmap.write_text(json.dumps(data), encoding="utf-8")
+            return {"out": str(s.inv)}
+        tamper_then_answer.__name__ = "run_process"
+        e = _raises(lambda: server._guard(tamper_then_answer, _unmask=[ftok]), "withheld",
+                    exc=ToolError)
+        assert "Smith" not in e and "Someone" not in e, e
+        assert audit.read_text(encoding="utf-8").count("| run_process |") == 2, \
+            "a withheld answer is not audited as unmasked"
+
+
+def test_check_path_tells_unknown_tokens_from_missing_files():
+    """Feedback #6: a masked path handed back said "doesn't exist", and the
+    agent couldn't tell a token that didn't expand from a file that was
+    really gone. check_path answers exists / kind / size / items without
+    revealing a name: unknown_tokens names a token this PC never issued;
+    an expanded-but-missing path gives deepest_existing and missing_part,
+    both masked — even a missing name that merely starts like an existing
+    sibling. The 'not there' errors of the path-taking tools say the same."""
+    server = _server_or_none()
+    with _privacy_sandbox() as s:
+        shown = _pv(str(s.inv))
+        shown_dir = _pv(str(s.client))
+        gone = s.client / "2024 Invoice Smith.pdf"
+        gone.write_bytes(b"old")
+        shown_gone = _pv(str(gone))
+        gone.unlink()
+        # Writer level (real paths; the server masks them).
+        r = vk.check_path(f'"{shown}"')
+        assert r["exists"] is True and r["kind"] == "file" and r["size"] == s.inv.stat().st_size, r
+        assert r["tokens_resolved"] is True and r["unknown_tokens"] == [] and r["modified"], r
+        r = vk.check_path(shown_dir)
+        assert r["kind"] == "dir" and r["items"] == 1, r
+        r = vk.check_path(shown_gone)
+        assert r["exists"] is False and r["kind"] == "missing" and r["tokens_resolved"], r
+        assert r["deepest_existing"] == str(s.client) and r["missing_part"] == gone.name, r
+        assert "spelled right" in r["note"], r
+        # missing_part is re-derived from the masked missing_path by
+        # protect(segment_fields=) -- even for a name the bare-name pass skips.
+        nd = s.client.parent / "40017788"
+        nd.mkdir()
+        masked = _pv(str(nd / "y"))
+        nd.rmdir()
+        g = _pv(vk.check_path(masked), path_fields=vk.PATH_FIELDS["check_path"],
+                segment_fields=vk.SEGMENT_FIELDS["check_path"])
+        assert g["missing_part"] == g["missing_path"].split("\\")[-1] != "40017788", g
+        assert "40017788" not in json.dumps(g), g
+        r = vk.check_path("%USERPROFILE%\\Documents\\<dir#ffffff>\\x.pdf")
+        assert r["kind"] == "unresolved" and r["exists"] is None, r
+        assert r["unknown_tokens"] == ["<dir#ffffff>"] and r["tokens_resolved"] is False, r
+        assert r["deepest_existing"] == str(s.prof / "Documents"), r
+        assert "NOT the same as the file being gone" in r["note"], r
+        _raises(lambda: vk.check_path("Documents\\x.pdf"), "full path", exc=vk.VoiceKitError)
+        _raises(lambda: vk.check_path("  "), "Pass the path", exc=vk.VoiceKitError)
+        # The path-taking tools' "not there" errors say the tokens expanded.
+        e = _raises(lambda: vk._workflow_file_args([shown_gone]), "tokens all expanded",
+                    "check_path", exc=vk.VoiceKitError)
+        _raises(lambda: vk._run_cwd(shown_gone), "tokens all expanded", exc=vk.VoiceKitError)
+        _raises(lambda: vk._workflow_file_args(["%USERPROFILE%\\<file#ffffff>.pdf"]),
+                "Unknown privacy token <file#ffffff>", "check_path")
+        if server is None:
+            return
+        from fastmcp.exceptions import ToolError
+        e = _raises(lambda: server._guard(vk._workflow_file_args, [shown_gone]),
+                    "tokens all expanded", exc=ToolError)
+        assert "Smith" not in e, e
+        g = server.check_path(shown)
+        assert g["exists"] is True and g["path"] == shown, g
+        g = server.check_path(shown_gone)
+        assert g["deepest_existing"] == shown_dir and g["missing_path"] == shown_gone, g
+        assert g["missing_part"] == shown_gone.split("\\")[-1], g
+        assert "Smith" not in json.dumps(g) and "2024" not in json.dumps(g), g
+        # A missing name that starts like an existing sibling ('Smith John'
+        # exists; 'Smith John and jane' doesn't) is masked whole.
+        g = server.check_path(str(s.client.parent / "Smith John and jane" / "a.pdf"))
+        blob = json.dumps(g)
+        assert "jane" not in blob and "Smith" not in blob and " and" not in blob, g
+        assert re.fullmatch(rf"<dir#{_T}>", g["missing_part"]), g
+        # A digit-only or short missing name (an account number, initials):
+        # missing_part is the last segment of the MASKED missing_path -- the
+        # bare-name pass it used to rely on skips such names, so it showed
+        # them in clear (review finding).
+        for nm in ("40017788", "JD"):
+            nd = s.client.parent / nm
+            nd.mkdir()
+            (nd / "x.pdf").write_bytes(b"x")
+            masked = _pv(str(nd / "x.pdf"))
+            shutil.rmtree(nd)
+            g = server.check_path(masked)
+            assert g["kind"] == "missing" and g["missing_path"] == masked.rsplit("\\", 1)[0], g
+            assert g["missing_part"] == g["missing_path"].split("\\")[-1], g
+            assert re.fullmatch(rf"<dir#{_T}>", g["missing_part"]) and nm not in json.dumps(g), g
+        g = server.check_path("%USERPROFILE%\\Documents\\Clients\\<dir#ffffff>\\x.pdf")
+        assert g["unknown_tokens"] == ["<dir#ffffff>"] and g["kind"] == "unresolved", g
+        assert re.fullmatch(rf"%USERPROFILE%\\Documents\\<dir#{_T}>", g["deepest_existing"]), g
+        assert "Clients" not in json.dumps(g), g
+        assert not (s.root / "logs" / pv.AUDIT_FILE).exists(), "check_path reveals nothing"
 
 
 def test_privacy_exempt_fields_and_logs_through_the_server():

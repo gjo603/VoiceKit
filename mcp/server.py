@@ -73,9 +73,19 @@ def _install_quiet_cancel() -> bool:
         self._vk_client_cancelled = True        # respond() below goes quiet for good
         scope.cancel()
         self._completed = True                  # drops it from the in-flight table
+        # The worker thread can't be interrupted, but the processes it
+        # started can: end every bounded child this request registered
+        # (run_ahk_snippet, run_process, the UIA probe) — a bridge that gave
+        # up used to leave them running unseen, holding their files open.
+        killed = []
+        try:
+            killed = vk.kill_request((id(getattr(self, "_session", None)), str(self.request_id)))
+        except Exception:
+            pass
         try:
             logging.getLogger("voicekit.mcp").info(
-                "request %s cancelled by client; suppressing the reply", self.request_id)
+                "request %s cancelled by client; suppressing the reply; ended %d process(es)",
+                self.request_id, len(killed))
         except Exception:
             pass
 
@@ -111,6 +121,28 @@ def _make_server() -> FastMCP:
 
 
 mcp = _make_server()
+
+# The honest blocking cap (vk.max_wait_s: [MCP] MaxWaitSeconds in
+# logs\settings.ini, default vk.MAX_WAIT_S = 50 — under the 60 s a remote
+# bridge waits). Read at start for the parameter descriptions; every call
+# clamps against the live setting and says so when it does.
+_CAP = vk.max_wait_s()
+_CAP_TEXT = (f"Capped at {_CAP} s on this server (a remote bridge gives up at 60 s; "
+             f"[MCP] MaxWaitSeconds in logs\\settings.ini sets it) — a larger value is "
+             f"clamped and the reply says so.")
+
+# The scoped privacy opt-out shared by run_ahk_snippet, run_process and
+# read_job (privacy.unmask_spec / privacy.protect, applied in _guard).
+_UNMASK_TEXT = ("Privacy: the tokens to show in CLEAR in this one answer — a list of tokens "
+                "exactly as a response showed them (['<file#3a9f>', '<dir#1c2e>']) or whole "
+                "masked paths (every token in one counts). Everything else stays masked; "
+                "'unmasked' lists the tokens shown and 'unmask_unused' any not in the "
+                "answer. An unknown or one-way (<ssn#..>/<ein#..>) token refuses the call "
+                "before anything runs. Audited in logs\\privacy-audit.log (tool + tokens, "
+                "never names). unmask=True (everything in clear) is refused unless the user "
+                "set [Privacy] AllowBlanketUnmask=1 in logs\\settings.ini. To learn one name "
+                "without running anything: reveal(token); to test whether a masked path "
+                "exists: check_path.")
 
 
 # ---------------------------------------------------------------------------
@@ -333,17 +365,21 @@ def _xy(xy: Optional[str]) -> str:
     return ",".join(p.strip() for p in xy.split(",")) if xy else ""
 
 
-def _protect(obj, fn_name: str = "", unmask: bool = False, known: dict | None = None):
+def _protect(obj, fn_name: str = "", unmask=None, known: dict | None = None,
+             report: dict | None = None):
     """The outbound privacy pipeline (WP9): phase-1 path normalization
     (always on) and phase-2 masking (privacy.py — the [Privacy] mode in
     logs\\settings.ini). Exempt fields are authored source a caller sends
-    back, left byte-for-byte."""
+    back, left byte-for-byte. `unmask` is privacy.unmask_spec's answer: None,
+    a tuple of tokens to show in clear, or True (blanket, when allowed)."""
     return privacy.protect(obj, root=vk.REPO_ROOT, normalize=vk.normalize_paths_text,
-                           exempt=vk.NORMALIZE_EXEMPT.get(fn_name, ()), unmask=unmask,
-                           known=known)
+                           exempt=vk.NORMALIZE_EXEMPT.get(fn_name, ()), unmask=unmask or False,
+                           known=known, report=report,
+                           path_fields=vk.PATH_FIELDS.get(fn_name, ()),
+                           segment_fields=vk.SEGMENT_FIELDS.get(fn_name, ()))
 
 
-def _guard(fn, *args, _unmask: bool = False, **kwargs):
+def _guard(fn, *args, _unmask=False, **kwargs):
     """Run a writer call, turning its errors into ToolErrors — and attach the
     state of the always-on layer to every dict result.
 
@@ -360,10 +396,29 @@ def _guard(fn, *args, _unmask: bool = False, **kwargs):
     under the profile become <dir#..>/<file#..> tokens; strict mode adds
     SSN/EIN masks). Authored source a caller will send back
     (vk.NORMALIZE_EXEMPT — read_macro_source's 'source' and friends) is left
-    byte-for-byte. _unmask (run_ahk_snippet's audited opt-out) skips the
-    tokens for that one response."""
+    byte-for-byte.
+
+    _unmask is the audited opt-out of run_ahk_snippet / run_process /
+    read_job, checked by privacy.unmask_spec BEFORE the tool runs (an
+    unknown or one-way token, or a blanket True this PC doesn't allow,
+    refuses the call with nothing run): a list of tokens is masked as usual
+    and then only those exact tokens are shown in clear (the reply's
+    'unmasked' / 'unmask_unused' list tokens, never names); True skips the
+    tokens for that one response — only with [Privacy] AllowBlanketUnmask=1.
+    Errors are never unmasked."""
     name = getattr(fn, "__name__", "")
+    try:
+        unmask = privacy.unmask_spec(_unmask, vk.REPO_ROOT)
+    except Exception as e:              # noqa: BLE001 — refused before anything runs
+        raise ToolError(_protect_error(str(e) if isinstance(e, ValueError) else
+                                       f"unmask couldn't be checked ({type(e).__name__}); "
+                                       f"nothing was run.", name))
     privacy.start_call()
+    # Every bounded child the call starts registers under this request, so a
+    # client (or a remote bridge) that cancels it stops that work too — see
+    # _install_quiet_cancel and vk.kill_request.
+    req_key = _request_key()
+    req_token = vk.CURRENT_REQUEST.set(req_key)
     try:
         result = fn(*args, **kwargs)
     except (vk.VoiceKitError, ValueError) as e:
@@ -380,6 +435,9 @@ def _guard(fn, *args, _unmask: bool = False, **kwargs):
         raise ToolError(_protect_error(f"Internal error in {name or 'the tool'} "
                                        f"({type(e).__name__}): {e}", name,
                                        privacy.take_expanded()))
+    finally:
+        vk.CURRENT_REQUEST.reset(req_token)
+        vk.request_done(req_key)    # a cancel that arrived is no longer pending
     known = privacy.take_expanded()
     # Only dict results carry it: to_abc() and friends return tuples.
     if isinstance(result, dict):
@@ -392,13 +450,11 @@ def _guard(fn, *args, _unmask: bool = False, **kwargs):
             result.setdefault("voicekit", h)
         except Exception:
             pass          # health is a courtesy, never a reason to fail a call
-    if _unmask:
-        privacy.audit(vk.REPO_ROOT, name or "tool", "unmask=True (output returned "
-                      "without path tokens)")
     # EVERY result is protected, whatever its type — a list or a bare string
     # would otherwise go out untouched.
+    report: dict = {}
     try:
-        result = _protect(result, name, unmask=_unmask, known=known)
+        result = _protect(result, name, unmask=unmask, known=known, report=report)
     except Exception as e:          # noqa: BLE001 — fail CLOSED, never open
         # Masking itself failed (e.g. no key file could be created): the
         # unmasked result is never sent — only that it was withheld.
@@ -407,7 +463,38 @@ def _guard(fn, *args, _unmask: bool = False, **kwargs):
                         f"withheld rather than sent unmasked. Check that the VoiceKit "
                         f"logs folder is writable (logs/privacy.key, "
                         f"logs/privacy-tokens.json).")
+    # Audited only once the answer is on its way — by tool and TOKEN, never
+    # the name (privacy.audit never raises).
+    if unmask is True:
+        privacy.audit(vk.REPO_ROOT, name or "tool", "unmask=True (output returned "
+                      "without path tokens)")
+    elif unmask:
+        shown, unused = report.get("unmasked", []), report.get("unused", [])
+        privacy.audit(vk.REPO_ROOT, name or "tool",
+                      "unmask " + (", ".join(shown) if shown else "(none in the output)")
+                      + (f" (requested, not in the output: {', '.join(unused)})"
+                         if unused else ""))
+        if isinstance(result, dict):
+            # Tokens only — the very strings the caller sent.
+            result["unmasked"] = list(shown)
+            if unused:
+                result["unmask_unused"] = list(unused)
     return result
+
+
+def _request_key():
+    """(id(session), request id) of the MCP request this tool call serves —
+    the same pair _install_quiet_cancel's patched cancel sees on its
+    RequestResponder (_session, request_id) — or None outside a request (a
+    test calling a tool function directly). Never raises."""
+    try:
+        from fastmcp.server.dependencies import get_context
+        rc = get_context().request_context
+        if rc is None:
+            return None
+        return (id(rc.session), str(rc.request_id))
+    except Exception:                   # noqa: BLE001
+        return None
 
 
 def _protect_error(msg: str, fn_name: str, known: dict | None = None) -> str:
@@ -449,8 +536,15 @@ def create_launch_macro(
         files := A_Args.Length ? A_Args : ExplorerSelectedFiles()
     ExplorerSelectedFiles() returns full paths from the ACTIVE tab of the
     front-most Explorer window ([] if none) — insist on the count you need
-    rather than taking files[1] of several. There is no generic dry-run flag;
-    a script that wants one can honour its own '/dry' argument."""
+    rather than taking files[1] of several.
+
+    To hand a value back to whoever ran it, call VkResult(value) (from
+    lib\\_Common.ahk; text, numbers, Arrays, Maps): run_automation returns
+    each call's value in `result` when it waits on the run, and it is a
+    no-op in a voice run. VkTestMode() is true under run_automation(test=True)
+    — skip the real side effect (sending, moving, deleting) there. Don't use
+    FileAppend(x, "*") as the only output: a voice-launched macro has no
+    stdout."""
     return _guard(vk.create_launch_macro, name, ahk_body, opens)
 
 
@@ -784,9 +878,35 @@ def server_info() -> dict:
     client configs that register a VoiceKit server (Claude Code's
     ~/.claude.json, Claude Desktop's config) with their command paths. Call
     it when VoiceKit's tools show up twice or one seems missing — each
-    registration starts its own server with its own copy of the tools.
-    Read-only."""
-    return _guard(vk.server_info)
+    registration starts its own server with its own copy of the tools; the
+    note says which duplicates are in the SAME client (the real problem) and
+    which are just different clients (normal). connected_client is the
+    client of this session (its MCP clientInfo name and version). Tool-name
+    prefixes (mcp__voicekit__..., mcp__remote-devices__voicekit__...) come
+    from the client or a bridge and can change on a reconnect; the names
+    after them are stable — re-list the tools and retry. Read-only."""
+    return _guard(vk.server_info, connected_client=_connected_client())
+
+
+def _connected_client() -> dict | None:
+    """The MCP clientInfo ({name, version[, title]}) of the session this tool
+    call serves, from the FastMCP context — None outside a request or when
+    the client sent none. Never raises."""
+    try:
+        from fastmcp.server.dependencies import get_context
+        rc = get_context().request_context
+        params = getattr(getattr(rc, "session", None), "client_params", None) if rc else None
+        info = getattr(params, "clientInfo", None)
+        if info is None:
+            return None
+        out = {"name": str(getattr(info, "name", "") or ""),
+               "version": str(getattr(info, "version", "") or "")}
+        title = getattr(info, "title", None)
+        if title:
+            out["title"] = str(title)
+        return out
+    except Exception:                   # noqa: BLE001
+        return None
 
 
 @mcp.tool
@@ -835,9 +955,10 @@ def run_automation(
                     "or VoiceKit tool — e.g. 'Morning Tabs'. 'loop Morning Tabs' starts "
                     "the workflow's loop companion (repeats until the user stops it)."],
     wait_seconds: Annotated[int, "0 (default) = fire-and-forget. >0 = wait up to this long "
-                            "for it to finish and report the outcome. Capped at 120 — longer "
-                            "blocking waits get cancelled by the client and can wedge the "
-                            "connection; for long runs use 0 and check back."] = 0,
+                            "for it to finish and report the outcome. " + _CAP_TEXT +
+                            " Longer runs: pass 0 and check back (read_workflow_sheet, "
+                            "list_processes). A run still going when the wait ends keeps "
+                            "running; still_running names its processes."] = 0,
     args: Annotated[Optional[list[str]], "Optional command-line arguments for the script "
                     "(its A_Args), one list entry per argument — passed as an argv list, no "
                     "shell, so spaces and & need no quoting. For a WORKFLOW each must be an "
@@ -849,6 +970,19 @@ def run_automation(
                     "%USERPROFILE%/%TEMP% forms and privacy tokens (<dir#..>, <file#..>) "
                     "arrive as the real path. Refused for Workflow "
                     "Studio and for 'loop <name>'."] = None,
+    test: Annotated[bool, "True = a QUIET test run: MsgBox / TrayTip / InputBox / ToolTip / "
+                    "FileSelect / DirSelect are logged (returned in `dialogs`) instead of "
+                    "shown — MsgBox answers its default button (what Enter would), InputBox "
+                    "and the file/folder pickers are CANCELLED, ToolTip returns a real but "
+                    "invisible window; the macro's own OnError handlers run as on a voice "
+                    "run, and an error none of them handles comes back as `uncaught_error` "
+                    "(exit 3, no dialog, its OnExit callbacks skipped); VkTestMode() is true "
+                    "in the macro (only — not in programs it starts). wait_seconds 0 = wait up to "
+                    "the cap; on timeout the run and everything it started are KILLED. Quiet, "
+                    "NOT sandboxed: Gui windows still appear and real side effects (files, "
+                    "keystrokes, emails) still happen. Refused for loops, Workflow Studio and "
+                    "VoiceKit's own tools, a workflow that asks for input, a macro with a "
+                    "dialog-mode #Warn."] = False,
 ) -> dict:
     """Trigger an automation now — the MCP equivalent of the user saying
     'open <name>', with the same working directory the voice shortcut uses
@@ -860,10 +994,29 @@ def run_automation(
     is refused while another loop or batch is still running (only one runs at a
     time, and a second launch would cut the first short). For workflows,
     waiting (wait_seconds > 0) returns what the run did: ok, outcome, the
-    failing step and why. exit_code is not a success signal. There is no
-    generic dry-run: to test safely, pass a fixture file via `args` (a raw
-    script may implement its own '/dry' argument if it wants one)."""
-    return _guard(vk.run_automation, name, wait_seconds, args)
+    failing step and why. exit_code is not a success signal.
+
+    Any run it waits on returns `result` — the values the macro passed to
+    VkResult(value) (lib\\_Common.ahk), in order — and its `stdout`
+    (FileAppend(x, "*")) and `stderr` (FileAppend(x, "**")), each when
+    non-empty. The result channel is the launched macro's alone: a macro or
+    program it Run()s inherits the variables but VkResult / VkTestMode
+    ignore them there.
+
+    To TEST without disturbing the user: a fixture file you created under
+    %TEMP% in `args`, test=True, and VkResult in the macro for what to check
+    (VkTestMode() lets it skip a real side effect). test=True returns ok,
+    exit_code, result, dialogs, uncaught_error, stdout, stderr, warnings,
+    load_errors (only when it didn't load: exit 2 with AutoHotkey's load
+    error), timed_out and killed (possibly_left_running: COM servers such as
+    EXCEL.EXE started during a run that timed out, which no kill reaches).
+    What it does NOT cover: custom Gui
+    windows (they still appear), anything the macro Run()s in another
+    process, and real side effects — file writes, keystrokes, clicks and
+    emails still happen; it is quiet, not a sandbox. For a workflow, the
+    engine's own popups are suppressed too (their text is withheld — `run`
+    says what failed). There is no generic dry-run."""
+    return _guard(vk.run_automation, name, wait_seconds, args, test)
 
 
 @mcp.tool
@@ -905,8 +1058,8 @@ def run_workflow_batch(
     preview_rows: Annotated[int, "How many mapped rows a dry run previews (default 10, "
                             "max 50)."] = 10,
     wait_seconds: Annotated[int, "0 (default) = fire-and-forget. >0 = wait up to this long "
-                            "for the whole batch to finish and report the outcome. Capped at "
-                            "120 — for batches longer than ~2 minutes pass 0, then poll "
+                            "for the whole batch to finish and report the outcome. " +
+                            _CAP_TEXT + " For a longer batch pass 0, then poll "
                             "read_workflow_sheet: loop_running=False means it's done and any "
                             "collected values are final."] = 0,
 ) -> dict:
@@ -983,13 +1136,16 @@ def run_ahk_snippet(
                     "Log, Notify, Uia*, Browser*, ...) is taken at top level — `out := 1` "
                     "won't load; use it inside a function or rename. Quote inside \"...\" "
                     "as `\" (v1's \"\" won't load), or use single quotes."],
-    timeout_s: Annotated[int, "Kill the snippet after this many seconds (default 15, max 120). "
-                         "A timeout still returns whatever Out() wrote before it."] = 15,
-    unmask: Annotated[bool, "Privacy (WP9): True returns this one result WITHOUT the "
-                      "<dir#..>/<file#..> name tokens — for the debugging case where you must "
-                      "read real file names. Audited in logs\\privacy-audit.log; the profile "
-                      "still shows as %USERPROFILE%, and strict mode's SSN/EIN masks still "
-                      "apply. Leave False unless you need it."] = False,
+    timeout_s: Annotated[int, "Kill the snippet — and everything it started — after this "
+                         "many seconds (default 15; 0 = up to the cap). " + _CAP_TEXT +
+                         " A timeout still "
+                         "returns whatever Out() wrote before it, and 'killed' lists the "
+                         "processes ended (a COM server it drove — ComObject('Excel."
+                         "Application') — is started by Windows outside its tree: "
+                         "possibly_left_running names it). To run a PROGRAM (python, git, a CLI) use "
+                         "run_process instead — no cmd /c inside an AHK string; for longer "
+                         "work, run_process(background=True) + read_job."] = 15,
+    unmask: Annotated[bool | str | list[str], _UNMASK_TEXT] = False,
 ) -> dict:
     """Run a one-off AutoHotkey v2 snippet in a throwaway process — diagnostics
     without the registry. No bridge key, no module file, no Voice Access
@@ -1021,10 +1177,129 @@ def run_ahk_snippet(
     Privacy: a masked path pasted back INSIDE a quoted string ("%USERPROFILE%
     \\Documents\\<dir#1c2e>\\<file#3a9f>.pdf") is expanded to the real path on
     this PC; a token outside a string literal is refused. The output is masked
-    like every response (unmask=True to opt out, audited). Masking stops
+    like every response; unmask=[tokens] shows just those names in clear
+    (audited). Masking stops
     incidental leakage only — text a snippet deliberately Out()s (a document's
     contents) is sent as is."""
-    return _guard(vk.run_ahk_snippet, code, timeout_s, _unmask=bool(unmask))
+    return _guard(vk.run_ahk_snippet, code, timeout_s, _unmask=unmask)
+
+
+@mcp.tool
+def run_process(
+    exe: Annotated[str, "The program: a name found on PATH ('python', 'git', 'ffmpeg') or a "
+                   "full path to an .exe (%USERPROFILE% / %TEMP% forms and privacy tokens "
+                   "accepted). .bat/.cmd/.ps1/.py are refused with the explicit form "
+                   "(e.g. exe='cmd.exe', args=['/d', '/c', 'x.bat'])."],
+    args: Annotated[Optional[list[str]], "Arguments, one list entry per argument — an argv "
+                    "list, NO shell: spaces, quotes and & need no escaping, and nothing is "
+                    "redirected or piped. An argument may span lines (python -c with "
+                    "multi-line code works) — except for cmd.exe, which stops at the first "
+                    "line break. %USERPROFILE%/%TEMP% forms and privacy tokens "
+                    "arrive as the real path."] = None,
+    cwd: Annotated[Optional[str], "Working folder (full path). Default: %TEMP% for a "
+                   "foreground run, the job's own folder for a background job."] = None,
+    timeout_s: Annotated[Optional[int], "Foreground: kill the program and everything it "
+                         "started after this many seconds (default 30; 0 = up to the "
+                         "cap). " + _CAP_TEXT +
+                         " Background: its maximum lifetime (default "
+                         f"{vk.JOB_DEFAULT_LIFETIME_S} s; 0 = no limit)."] = None,
+    stdin: Annotated[Optional[str], "Text fed to its standard input (UTF-8). Default: "
+                     "empty — a program that waits for input gets end-of-file, never a "
+                     "hang."] = None,
+    env: Annotated[Optional[dict[str, Optional[str]]], "Environment variables set (or, with "
+                   "null, removed) on top of this server's environment. Values are never "
+                   "echoed back. PYTHONIOENCODING=utf-8 and PYTHONUNBUFFERED=1 are set "
+                   "unless already present (or named here), so python children print any "
+                   "character and their output reaches read_job / a timed-out reply as "
+                   "it is printed."] = None,
+    background: Annotated[bool, "True: start it as a background JOB and return its job_id at "
+                          "once — read_job polls it, stop_job ends it. For anything that "
+                          f"may take longer than {_CAP} s."] = False,
+    unmask: Annotated[bool | str | list[str], _UNMASK_TEXT] = False,
+) -> dict:
+    """Run a program directly and get its exit code, stdout and stderr — no
+    shell, no AutoHotkey, no quoting layers. Use this instead of a
+    run_ahk_snippet that wraps 'cmd /c python ...' in an AHK string.
+
+    Foreground (default): blocks until it exits or timeout_s, then returns
+    exit_code, stdout, stderr (decoded: UTF-8, else the console code page;
+    line endings as \\n; each capped at 100 KB — the first and last 50 KB
+    around a '... N bytes omitted ...' line, with *_truncated saying so),
+    timed_out, killed (pid + image of every process ended) and duration_s.
+    It runs hidden in a Windows job object: on a timeout — or when the
+    request is cancelled — the program AND every process it started are
+    ended (no orphan left holding a log file open), and so is anything it
+    leaves running when it exits. NOT reached: a COM server it drives
+    (Excel.Application from win32com, New-Object -ComObject) or an app it
+    hands work to through the shell — Windows starts those itself, outside
+    the job. After a timeout such COM servers are listed in
+    possibly_left_running (never killed: one could be the user's); check
+    list_processes before re-running on the same file. Start something
+    meant to keep running with background=True.
+
+    Background: returns job_id immediately; stdout/stderr go to files in
+    %TEMP%\\VoiceKit\\jobs\\<id>\\. read_job(job_id) gives its state, exit
+    code and output tails; stop_job ends its whole tree. A job outlives this
+    server (then its exit code is unknown); timeout_s is its maximum
+    lifetime. Finished job folders are pruned after 7 days (at most 50 kept).
+
+    Output is masked like every response (paths under the profile become
+    tokens); unmask=[tokens] shows just those names in clear (audited). This
+    runs real programs with the user's privileges — it is as
+    powerful as run_ahk_snippet."""
+    return _guard(vk.run_process, exe, args, cwd, timeout_s, stdin, env, bool(background),
+                  _unmask=unmask)
+
+
+@mcp.tool
+def read_job(
+    job_id: Annotated[Optional[str], "A job_id from run_process(background=True). Omit to "
+                      "list every job (id, program, state, exit code, start, duration)."] = None,
+    tail_lines: Annotated[int, "How many of the last stdout/stderr lines to return "
+                          "(default 50, max 500)."] = 50,
+    unmask: Annotated[bool | str | list[str], _UNMASK_TEXT] = False,
+) -> dict:
+    """A background job's state — running / exited / killed (its lifetime
+    ran out) / stopped — its exit code, duration, the tail of its stdout and
+    stderr with their sizes, and any processes it left running after it
+    exited. Poll this instead of blocking: it returns at once. A job started
+    before this server restarted still shows its output, but its exit code
+    can't be known (the reply says so). Read-only."""
+    return _guard(vk.read_job, job_id, tail_lines, _unmask=unmask)
+
+
+@mcp.tool
+def stop_job(
+    job_id: Annotated[str, "The job to stop (from run_process(background=True) or read_job)."],
+    grace_s: Annotated[int, "Seconds to wait for it to finish on its own first (default 0 = "
+                       "stop now). " + _CAP_TEXT] = 0,
+) -> dict:
+    """End a background job and everything it started (its whole process
+    tree, through the Windows job object it runs in) and report what was
+    killed (pid + image). Also ends processes a finished job left running.
+    After a server restart it falls back to taskkill /T from the job's pid
+    (checked against the process's start time, so a reused pid is never
+    hit)."""
+    return _guard(vk.stop_job, job_id, grace_s)
+
+
+@mcp.tool
+def list_processes(
+    name: Annotated[Optional[str], "Only processes whose image name contains this "
+                    "(case-insensitive), e.g. 'python' or 'excel'. Omit for all."] = None,
+    include_command_line: Annotated[bool, "Include each command line (default True; capped "
+                                    "at 2000 characters each)."] = True,
+    max_rows: Annotated[int, "Cap on rows returned (default 200, max 2000); VoiceKit's own "
+                        "processes are listed first."] = 200,
+) -> dict:
+    """Running processes with pid, parent pid, image, start time and command
+    line — and a 'voicekit' tag on VoiceKit's own: 'this MCP server',
+    'VoiceKit MCP server (other instance)', 'VoiceKit master', 'module body
+    <name>', 'macro <name>', 'loop <name>', 'job <id>', 'snippet',
+    'run_process'. Note that 'python.exe' includes this MCP server itself:
+    to know whether YOUR program is still running, check its pid (or
+    read_job), never ProcessExist('python.exe'). Read-only."""
+    return _guard(vk.list_processes, name, include_command_line, max_rows)
 
 
 @mcp.tool
@@ -1038,10 +1313,35 @@ def reveal(
     because on a PC that handles client files they are often client names.
     You rarely need this — pass tokens back as-is wherever a tool acts on a path or value (they're
     expanded locally). Call reveal only when you must read the name itself
-    (e.g. to tell the user which file failed). Every call is logged locally
+    (e.g. to tell the user which file failed). To read a name where it
+    appears in a run's output instead, pass unmask=['<file#..>'] to
+    run_ahk_snippet / run_process / read_job: only the tokens you list are
+    shown in clear (a blanket unmask=True is refused unless the user allowed
+    it in logs\\settings.ini). To learn whether a masked path still exists,
+    use check_path — it reveals nothing. Every reveal is logged locally
     (token and time, never the name). <ssn#..>/<ein#..> (strict mode) are
     one-way and refused. Read-only."""
     return _guard(vk.reveal, token)
+
+
+@mcp.tool
+def check_path(
+    path: Annotated[str, "A path exactly as a response showed it — %USERPROFILE% / %TEMP% "
+                    "forms and privacy tokens welcome ('%USERPROFILE%\\Documents\\<dir#1c2e>"
+                    "\\<file#3a9f>.pdf'); surrounding quotes are stripped."],
+) -> dict:
+    """Does this (possibly masked) path exist — without revealing any name?
+    Returns exists, kind ('file' / 'dir' / 'missing', or 'unresolved' when a
+    token in it won't expand), size and modified for a file, items for a
+    folder (counted up to 10 000), and tokens_resolved / unknown_tokens. That
+    splits the two cases a bare "doesn't exist" can't: a token this PC never
+    issued (unknown_tokens lists it — re-read the listing that showed the
+    path) versus a path that expanded fine but has nothing there (moved,
+    renamed, deleted) — then deepest_existing is the longest part that still
+    exists and missing_part the first part that doesn't (the last segment
+    of the masked missing_path, so masked even when it is short or
+    all digits). Read-only; not audited (nothing is revealed)."""
+    return _guard(vk.check_path, path)
 
 
 @mcp.tool
@@ -1105,7 +1405,10 @@ def stop_module(
     name: Annotated[str, "The hotkey module whose running body to stop, e.g. "
                     "'Web Scrape'."],
     grace_s: Annotated[int, "Seconds to wait for a graceful exit before force-killing "
-                       "(0-60, default 5). 0 = kill immediately."] = 5,
+                       "(default 5; 0 = kill immediately). " + _CAP_TEXT + " Less the ~10 s "
+                       "the call spends around the wait (process scans, the post-kill wait), "
+                       "so the whole call stays inside the cap — grace_capped says when "
+                       "it was clamped."] = 5,
 ) -> dict:
     """Stop a module's running body process. Graceful first: drops the stop
     flag that BodyStopRequested() (lib/_Common.ahk) consumes — a body that

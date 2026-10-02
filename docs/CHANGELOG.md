@@ -8,6 +8,188 @@ names).
 
 ---
 
+### 2026-10-01 — quiet-harness feedback: run programs, an honest cap, quiet test runs — BUILT
+
+An agent drove VoiceKit's MCP through a remote bridge (per-call limit 60 s)
+to build and test a Python-backed macro. Its verdict: the read/patch tools
+were safe, but most of the session went on launching Python through
+`cmd /c` inside AHK strings, on processes that outlived their call, and on a
+"safe" fixture test that popped a dialog on the user's desktop. Its own
+ranking: "if you can only do two things, do #1 and #3". Branch
+`feedback-quiet-harness`; details in `docs\architecture\mcp.md`
+("Processes: one primitive, an honest cap, background jobs", "Quiet test
+runs and a result channel", "reveal / unmask", "check_path", "Server
+identity").
+
+- **#1 No way to run a program directly → `run_process`.** `exe` + an
+  `args` list, no shell, no AHK quoting; returns `exit_code`, `stdout`,
+  `stderr` (decoded — UTF-16, UTF-8, the console code page — and capped at
+  100 KB each, head + tail kept), `timed_out`, `killed`, `duration_s`.
+  `.bat`/`.cmd`/`.ps1`/`.py` are refused with the explicit form (`cmd.exe /d
+  /c`, `powershell -File`, the interpreter) — batch arguments can't be passed
+  safely through cmd's own parsing. Paths and args accept `%USERPROFILE%` /
+  `%TEMP%` forms and privacy tokens.
+- **#2 Timeouts that lied, and processes left running.**
+  - **One honest cap**: `max_wait_s()` — 50 s by default (the bridge gives up
+    at 60), `[MCP] MaxWaitSeconds` in `logs\settings.ini` (5–230) for a
+    client that waits longer. Every blocking wait clamps to it
+    (`run_ahk_snippet` / `run_process` `timeout_s`, `run_automation` /
+    `run_workflow_batch` `wait_seconds`, `stop_job` `grace_s`), the reply says
+    when it did (`timeout_capped`, `wait_capped`, `grace_capped`), and the
+    parameter descriptions state it. The scattered 120 s limit is gone.
+  - **The whole tree ends**: every bounded child (snippets, `run_process`,
+    the UIA probe) starts suspended inside a Windows job object (`_ProcTree`),
+    so a timeout kills the program *and everything it started* — the old
+    `subprocess.run(timeout=)` only ever killed AutoHotkey — and names what it
+    killed. A cancelled request (a bridge giving up) now ends its processes
+    too: the request id travels in a contextvar from `_guard` to the patched
+    cancel. A snippet that leaves an app running on purpose reports it in
+    `left_running`; the user's own automations are never put in a job.
+  - **Background jobs**: `run_process(background=True)` returns a `job_id` at
+    once; `read_job` (state, exit code, output tails, leftovers; no id = the
+    list) and `stop_job`. Output in `%TEMP%\VoiceKit\jobs\<id>\`; a lifetime
+    (default 1 h); jobs survive a server restart.
+- **#3 A fixture test popped a dialog → `run_automation(test=True)` and
+  `VkResult`.** Test mode loads `lib\TestShim.ahk` ahead of the macro with
+  AutoHotkey's `/include` switch, and its `MsgBox` / `TrayTip` / `InputBox` /
+  `ToolTip` / `FileSelect` / `DirSelect` replace the built-ins for the whole
+  script: each is logged instead of shown. MsgBox answers its default button
+  (what Enter would — the table measured against real dialogs); InputBox,
+  FileSelect and DirSelect are cancelled; ToolTip returns a real, invisible
+  window. The macro's own `OnError` handlers run first; an error none of
+  them handles is logged and exits 3, never a dialog and never the user's
+  `errors.log`. The reply carries `ok`, `exit_code`, `result`, `dialogs`,
+  `uncaught_error`, `stdout`, `stderr`, `warnings`, `load_errors`; a timeout or cancel
+  kills the tree. A workflow runs quietly too (the engine's failure popup
+  included, its text withheld as the engine's privacy rule requires).
+  **`VkResult(value)`** in `lib\_Common.ahk` is the standard way to hand a
+  value back (one JSON line per call; text, numbers, arrays, maps) — returned
+  as `result` by any run `run_automation` waits on, a no-op on a voice run;
+  `VkTestMode()` lets a macro skip a real side effect. `FileAppend(x, "*")` now
+  works in a waited run too (stdout goes to a file, returned as `stdout`).
+- **#4 Tool names changed mid-session; "registered 3 times".** `server_info`
+  now names the session's own client (`connected_client`, from MCP
+  `clientInfo`), lists `same_client_duplicates` — only registrations ONE
+  client loads twice (Claude Code's user / project / `.mcp.json` scopes
+  worked out, a same-named narrower entry replacing the wider one) — and
+  says plainly that entries in different clients are normal. It and the
+  session instructions explain that the `mcp__<server>__` prefix comes from
+  the client or a bridge: it can change on a reconnect, the names after it
+  are stable — re-list and retry.
+- **#5 `unmask=True` was too broad → scoped (the user's decision).**
+  `run_ahk_snippet`, `run_process` and `read_job` take `unmask=['<file#..>',
+  ...]`: the answer is masked as usual and only those exact tokens are shown
+  in clear (`unmasked` / `unmask_unused` list tokens, never names). An unknown
+  or one-way token refuses the call before anything runs; a blanket
+  `unmask=True` is refused unless `[Privacy] AllowBlanketUnmask=1`. Audited by
+  token, as before.
+- **#6 "Doesn't exist" was ambiguous → `check_path`.** Says whether a masked
+  path's tokens expanded (`tokens_resolved` / `unknown_tokens`) and, if they
+  did, whether anything is there — for a missing path the deepest part that
+  exists and the first part that doesn't, both masked (the missing part is
+  cut from the masked path, so even `JD` or `40017788` stays masked). The "isn't there"
+  errors of `run_automation` (workflow args), a batch `source` and
+  `run_process` (`exe`, `cwd`) say which case it is.
+- **#7 `ProcessExist("python.exe")` matched VoiceKit's server →
+  `list_processes`**: pid, parent, image, start time, command line, and a
+  `voicekit` tag on VoiceKit's own processes (this server, other instances,
+  the master, bodies, macros, loops, snippets, `run_process` runs, jobs).
+- **Discoverable**: the session instructions gained one line each for
+  `run_process` + the cap + background jobs, quiet tests + `VkResult`,
+  `list_processes`, `check_path` / scoped unmask, and the prefix rule.
+- **Deliberately not done**:
+  - #4's renaming itself — the prefix is the client's or the bridge's;
+    VoiceKit can't keep a name stable across a reconnect it doesn't see.
+  - A distinct process name for the server (a renamed `python.exe` copy, or a
+    launcher exe) — it would have to ship and be kept in step with every
+    venv; `list_processes` tags the server instead.
+  - Quieting `Gui` windows in test mode — replacing `Gui` would change what
+    the macro *is*. Test mode is quiet, not sandboxed: custom windows still
+    appear, programs the macro `Run()`s are untouched, and real side effects
+    happen (use a `%TEMP%` fixture and `VkTestMode()`). A workflow with inputs
+    and VoiceKit's own Gui tools are refused in test mode.
+  - Confirm-on-the-desktop before unmasking a client folder — considered;
+    the user chose scoped tokens + an opt-in setting instead.
+  - A generic dry-run flag (still none — VoiceKit can't know what "dry"
+    means for a raw script).
+- **Review fixes (same branch, before merge)** — each a confirmed finding:
+  - `stop_module`'s `grace_s` was clamped at 60, so one call could outlast the
+    bridge: it goes through `_cap_wait` now, with the time the call spends
+    around the wait (scans, the post-kill wait) reserved, and says so
+    (`grace_capped`). `_cap_wait(reserve=)` is how a call with fixed overhead
+    stays inside the cap.
+  - `VOICEKIT_RESULT_FILE` / `VOICEKIT_TEST` leaked to every process a run
+    started (AutoHotkey's `Run()` hands the environment on) — so a macro it
+    launched, or a master reloaded from a Home window a waited run opened,
+    wrote into a run folder deleted when the run ended (`VkResult` threw: an
+    error dialog on a voice run), or believed it was under test. They now
+    carry `VOICEKIT_RUN_SCRIPT` and act only in that script (`VkRunScoped`,
+    compared as full long paths); `VkResult` on a gone run folder returns
+    false instead of throwing.
+  - A cancel that landed before the tool's tree existed was lost (the run
+    went its full timeout): cancelled requests are remembered until the
+    call returns (`request_done`), a run not started yet starts nothing, and
+    a tree that registers after the cancel is ended as it registers.
+  - "Kills everything it started" overclaimed: a COM server the program
+    drives (`Excel.Application`) is started by DcomLaunch, outside the job
+    (measured). Said in the docs; after a timeout such servers started during
+    the run come back as `possibly_left_running` (never killed).
+  - Background jobs and `list_processes` showed names that came in as
+    tokens in clear (a later call had no record of them): every launch
+    remembers the tokens its inputs carried (a job in `meta.json`, never the
+    names) and those calls re-expand them, so the names are masked.
+  - `check_path`'s `missing_part` showed a short or digit-only name its
+    `missing_path` masked: it is now cut from the masked path
+    (`privacy.protect(segment_fields=)`).
+  - Test mode: the macro's own `OnError` handlers were bypassed (the shim
+    exited first) and an `OnExit` that refused the exit let the stock error
+    dialog through. The shim now notes the error first and lets the chain
+    run; only when AutoHotkey creates its error dialog does a CBT hook end
+    the run (exit 3) before the dialog exists — measured: the OnError chain
+    is fixed when the error is raised, and `ExitApp` from a handler is
+    vetoable. A test run's `OnExit` callbacks are skipped after an uncaught
+    error.
+  - The docs said InputBox is "answered as Enter would"; it is cancelled
+    (deliberately — a test supplies values through `args`). Reworded.
+  - The shim's `ToolTip` returned 0, so a macro that moved or faded its
+    tooltip by HWND failed its test: it returns a real window (zero-size,
+    alpha 0, one per tooltip number, destroyed on hide — as measured on the
+    real one).
+  - `read_job` showed nothing while a Python job ran, and a timed-out run lost
+    its output (a file stdout is block-buffered): `PYTHONUNBUFFERED=1` unless
+    the caller's env names it.
+  - A macro's `FileAppend(x, "**")` was reported as `load_errors` ("It didn't
+    load") after a clean run: stderr is a load error only on exit 2 with
+    AutoHotkey's `<file> (<line>) : ==>` text; otherwise it is `stderr`.
+  - A macro's `stdout` decoded ANSI text as the OEM code page (`café —` came
+    back as `cafΘ ù`): AutoHotkey output falls back to the ANSI code page.
+  - `run_process` refused multi-line arguments, blocking `python -c` with a
+    few lines — CreateProcess passes them intact (measured); only `cmd.exe`,
+    which stops at the first line break, still refuses them.
+  - `timeout_s=0` meant "no limit" for a job but a 1-second kill in the
+    foreground: it now means "up to the cap" for `run_process` and
+    `run_ahk_snippet`.
+- Tests: conformance adds the process primitive (grandchildren killed on
+  timeout and on a cancel over the wire, output capping, refusals, jobs,
+  `list_processes`, the cap), test mode (a dialog watcher sees no `#32770`
+  window; results round-trip; a workflow; refusals), scoped unmask,
+  `check_path`, and `server_info`'s client grouping + `connected_client`
+  over the wire; `common-selftest` section 15 pins `VkResult` / `VkTestMode`
+  (scoped to the run's script, a gone run folder) and the shim's whole
+  MsgBox default table in a child process, plus a macro whose own OnError
+  handler runs, a vetoing OnExit, a grandchild that inherits the run's
+  variables, and ToolTip's window. The review fixes add
+  `test_a_cancel_before_the_tree_exists_still_ends_it`,
+  `test_python_children_print_unbuffered`,
+  `test_foreground_timeout_zero_means_up_to_the_cap`,
+  `test_stop_module_grace_is_capped_with_the_call`,
+  `test_com_servers_left_by_a_timeout_are_reported`,
+  `test_background_jobs_and_list_processes_keep_token_names_masked`,
+  `test_run_automation_test_mode_stderr_ansi_and_handled_errors`, and a
+  digit-only `missing_part` in the `check_path` test.
+
+---
+
 ### 2026-09-30 — privacy masking of MCP results (WP9 phase 2) — BUILT
 
 An office that handles client documents keeps client names in its file and

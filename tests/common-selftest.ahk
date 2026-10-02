@@ -446,5 +446,204 @@ Check("a dialog destroyed as it appears doesn't throw", threw = "", threw)
 Check("...and the owner is still enabled", !(WinGetStyle("ahk_id " ownerHwnd) & WS_DISABLED))
 owner.Destroy()
 
+; ---------- 15. VkResult / VkTestMode, and lib\TestShim.ahk ----------------
+; The env vars run_automation sets are set HERE, by the test itself (and
+; cleared after): VkResult/VkTestMode read them in this process, and the
+; shim child below inherits them.
+resFile := box "\vkresult.txt"
+EnvSet("VOICEKIT_RESULT_FILE")
+EnvSet("VOICEKIT_TEST")
+EnvSet("VOICEKIT_RUN_SCRIPT")
+Check("VkResult is a no-op without a result file (a voice run)",
+    VkResult("x") = false && !FileExist(resFile))
+Check("VkTestMode is false outside a test run", !VkTestMode())
+; The run variables are for ONE script (%VOICEKIT_RUN_SCRIPT%): a process
+; that merely inherited them (anything the run's script Run()s) ignores them.
+EnvSet("VOICEKIT_RESULT_FILE", resFile)
+EnvSet("VOICEKIT_TEST", "1")
+EnvSet("VOICEKIT_RUN_SCRIPT", A_ScriptDir "\some-other-macro.ahk")
+Check("VkResult is a no-op in a script the run didn't launch",
+    VkResult("x") = false && !FileExist(resFile))
+Check("VkTestMode is false in a script the run didn't launch", !VkTestMode())
+EnvSet("VOICEKIT_RUN_SCRIPT", A_ScriptDir "\..\tests\" StrUpper(A_ScriptName))
+Check("VkTestMode is true under VOICEKIT_TEST=1 for the run's own script (any spelling)", VkTestMode())
+; A result file whose run has ended (its folder deleted) is a no-op, never
+; a throw -- a throw there was an error dialog on a voice run.
+EnvSet("VOICEKIT_RESULT_FILE", box "\no-such-run\result.txt")
+threw := ""
+try got := VkResult("late")
+catch as e
+    threw := e.Message
+Check("VkResult after its run folder is gone returns false, no throw",
+    threw = "" && got = false && !DirExist(box "\no-such-run"), threw)
+EnvSet("VOICEKIT_RESULT_FILE", resFile)
+VkResult("two`nlines `"q`" \ tab`t")
+VkResult(42)
+VkResult(1.5)
+VkResult(["a", 2, Map("k", "v")])
+VkResult({name: "x"})
+threw := ""
+try VkResult(VkResult)
+catch TypeError as e
+    threw := e.Message
+Check("VkResult refuses a value it can't represent, naming its type", InStr(threw, "not a Func"), threw)
+resLines := StrSplit(Trim(FileRead(resFile, "UTF-8"), "`n"), "`n")
+Check("VkResult: one line per value", resLines.Length = 5, resLines.Length)
+for i, w in ['"two\nlines \"q\" \\ tab\t"', '42', '1.5', '["a",2,{"k":"v"}]', '{"name":"x"}']
+    Check("VkResult record " i " is " w, resLines.Length >= i && resLines[i] == w,
+        resLines.Length >= i ? resLines[i] : "missing")
+EnvSet("VOICEKIT_RESULT_FILE")
+EnvSet("VOICEKIT_TEST")
+EnvSet("VOICEKIT_RUN_SCRIPT")
+
+; The shim, loaded the way run_automation loads it (/include ahead of the
+; macro), into a child that includes a SANDBOX copy of _Common.ahk (so an
+; error that slipped past the shim would log to box\logs, never the real
+; logs\). Every MsgBox must answer with its default button -- the table
+; was measured against real dialogs on a private desktop (lib\TestShim.ahk)
+; -- with no dialog on screen, and the uncaught error at the end must exit
+; 3 through the shim's OnError, not a dialog.
+DirCreate(box "\lib")
+DirCreate(box "\logs")
+FileCopy(A_ScriptDir "\..\lib\_Common.ahk", box "\lib\_Common.ahk", true)
+shimChild := box "\macros\ShimChild.ahk"
+shimLog := box "\shim-log.txt"
+shimOut := box "\shim-out.txt"
+Put(shimChild, JoinList([
+    '#Requires AutoHotkey v2.0',
+    '#SingleInstance Off',
+    '#Include "%A_ScriptDir%\..\lib\_Common.ahk"',
+    'acc := ""',
+    'for opt in ["", "OKCancel", "YesNo", "YesNoCancel Default2", "4 256", "3 512", '
+        . '"AbortRetryIgnore", "2 512", "RetryCancel Default2", "CancelTryAgainContinue", '
+        . '"6 Default3", "YN", "Y/N/C Default3", "O/C", "1 256 16 262144", "YesNo Default3", '
+        . '"OK Default2", "4 Default4", "0x104", "Iconx T30 Owner123"]',
+    '    acc .= MsgBox("t", "vk shim child", opt) "|"',
+    'ib := InputBox("p", "vk shim child")',
+    'tt := ToolTip("tip")',
+    'ttOk := tt && WinExist("ahk_id " tt) && WinGetClass("ahk_id " tt) = "tooltips_class32"',
+    'WinSetTransparent(200, "ahk_id " tt)',
+    'WinMove(5, 5, , , "ahk_id " tt)',
+    'ttOk := ttOk && ToolTip("again") = tt && ToolTip() = 0 && !WinExist("ahk_id " tt)',
+    'acc .= Type(ib) ":" ib.Result ":" ib.Value "|" Type(FileSelect("M")) "|" FileSelect() "|" '
+        . 'DirSelect() "|" (ttOk ? "tt" : "no-tt:" tt) "|" TrayTip("tray", "vk shim child")',
+    'FileAppend(acc, A_Args[1], "UTF-8")',
+    'm := Map()',
+    'gone := m["no such key"]',
+    'FileAppend("not reached", A_Args[1], "UTF-8")'], "`n") "`n")
+shimPid := 0, shimSawDialog := ""
+ShimWatch() {
+    global shimSawDialog
+    for t in ["vk shim child ahk_class #32770", "ShimChild.ahk ahk_class #32770",
+            "ahk_class #32770 ahk_pid " shimPid]
+        if WinExist(t)
+            shimSawDialog := t
+}
+ShimKill() {
+    global shimPid
+    try ProcessClose(shimPid)
+}
+; The env a test run gets (run_automation's _run_env): the child is the
+; run's script, so VkTestMode() is true in it and _Common's
+; LogUncaughtError stays out of errors.log.
+ShimEnv(child, log) {
+    EnvSet("VOICEKIT_TEST", "1")
+    EnvSet("VOICEKIT_TEST_LOG", log)
+    EnvSet("VOICEKIT_RUN_SCRIPT", child)
+}
+ShimEnvClear() {
+    for v in ["VOICEKIT_TEST", "VOICEKIT_TEST_LOG", "VOICEKIT_RUN_SCRIPT", "VOICEKIT_RESULT_FILE"]
+        EnvSet(v)
+}
+ShimEnv(shimChild, shimLog)
+SetTimer(ShimWatch, 50)
+SetTimer(ShimKill, -20000)
+shimExit := RunWait('"' A_AhkPath '" /ErrorStdOut /include "' A_ScriptDir '\..\lib\TestShim.ahk" "'
+    . shimChild '" "' shimOut '"', , "Hide", &shimPid)
+SetTimer(ShimWatch, 0)
+SetTimer(ShimKill, 0)
+ShimEnvClear()
+Check("shim: no dialog appeared", shimSawDialog = "", shimSawDialog)
+Check("shim: an uncaught error exits 3, through the shim", shimExit = 3, shimExit)
+got := FileExist(shimOut) ? FileRead(shimOut, "UTF-8") : ""
+Check("shim: every MsgBox answers its default button",
+    InStr(got, "OK|OK|Yes|No|No|Cancel|Abort|Ignore|Cancel|Cancel|Continue|Yes|Cancel|OK|Cancel|Yes|OK|Yes|No|OK|") = 1,
+    got)
+Check("shim: InputBox cancels as a plain {Result, Value} object; pickers cancel; "
+    . "ToolTip returns a real window ahk_id finds (one per number, gone on hide -> 0)",
+    InStr(got, "|Object:Cancel:|Array|||tt|"), got)
+Check("shim: nothing ran past the error", !InStr(got, "not reached"))
+logTxt := FileExist(shimLog) ? FileRead(shimLog, "UTF-8") : ""
+Check("shim: each MsgBox logged as one JSON line", Count(shimLog, '{"kind":"MsgBox"') = 20,
+    Count(shimLog, '{"kind":"MsgBox"'))
+Check("shim: the error is logged with its type and line",
+    InStr(logTxt, '"kind":"error"') && InStr(logTxt, '"type":"UnsetItemError"') && InStr(logTxt, '"line":16'),
+    SubStr(logTxt, -300))
+Check("shim: InputBox / TrayTip / ToolTip / FileSelect / DirSelect logged",
+    InStr(logTxt, '"kind":"InputBox"') && InStr(logTxt, '"kind":"TrayTip"') && InStr(logTxt, '"kind":"ToolTip"')
+    && Count(shimLog, '"kind":"FileSelect"') = 2 && InStr(logTxt, '"kind":"DirSelect"'))
+Check("shim: _Common's own error logger never ran (errors.log untouched)", !FileExist(box "\logs\errors.log"))
+
+; The macro's OWN OnError handlers run first, as on a voice run: one that
+; returns -1 has handled the error and the macro goes on. Only an error
+; nobody handles ends the run (exit 3, logged) -- even with an OnExit
+; callback that vetoes every exit (ExitApp from the handler used to be
+; vetoed, and the stock error dialog then appeared). Along the way it
+; RunWaits a grandchild that includes _Common: it inherits the run's
+; variables but is not the run's script, so VkTestMode() and VkResult()
+; are off in it.
+handled := box "\macros\HandledChild.ahk"
+grand := box "\macros\Grandchild.ahk"
+hLog := box "\handled-log.txt"
+hOut := box "\handled-out.txt"
+hRes := box "\handled-result.txt"
+Put(grand, JoinList([
+    '#Requires AutoHotkey v2.0',
+    '#SingleInstance Off',
+    '#Include "%A_ScriptDir%\..\lib\_Common.ahk"',
+    'FileAppend("gc:" VkTestMode() ":" VkResult("from grandchild") "|", A_Args[1], "UTF-8")'], "`n") "`n")
+Put(handled, JoinList([
+    '#Requires AutoHotkey v2.0',
+    '#SingleInstance Off',
+    '#Include "%A_ScriptDir%\..\lib\_Common.ahk"',
+    'OnExit((*) => 1)',
+    'OnError(Handled)',
+    'Handled(e, m) {',
+    '    FileAppend("handled:" e.Extra "|", A_Args[1], "UTF-8")',
+    '    return -1',
+    '}',
+    'x := Map()["first"]',
+    'FileAppend("continued:" VkTestMode() ":" VkResult("from child") "|", A_Args[1], "UTF-8")',
+    "RunWait('`"' A_AhkPath '`" `"' A_ScriptDir '\Grandchild.ahk`" `"' A_Args[1] '`"')",
+    'OnError(Handled, 0)',
+    'y := Map()["second"]',
+    'FileAppend("not reached", A_Args[1], "UTF-8")'], "`n") "`n")
+shimSawDialog := ""
+ShimEnv(handled, hLog)
+EnvSet("VOICEKIT_RESULT_FILE", hRes)
+SetTimer(ShimWatch, 50)
+SetTimer(ShimKill, -20000)
+hExit := RunWait('"' A_AhkPath '" /ErrorStdOut /include "' A_ScriptDir '\..\lib\TestShim.ahk" "'
+    . handled '" "' hOut '"', , "Hide", &shimPid)
+SetTimer(ShimWatch, 0)
+SetTimer(ShimKill, 0)
+ShimEnvClear()
+hGot := FileExist(hOut) ? FileRead(hOut, "UTF-8") : ""
+hLogTxt := FileExist(hLog) ? FileRead(hLog, "UTF-8") : ""
+hResTxt := FileExist(hRes) ? FileRead(hRes, "UTF-8") : ""
+Check("shim: the macro's own OnError handler ran and the macro went on",
+    InStr(hGot, "handled:first|continued:1:1|") = 1, hGot)
+Check("shim: a grandchild that inherited the run's variables ignores them",
+    InStr(hGot, "|gc:0:0|"), hGot)
+Check("shim: only the run's own script reached the result file",
+    InStr(hResTxt, "from child") && !InStr(hResTxt, "from grandchild"), hResTxt)
+Check("shim: the unhandled error still ends it with 3 despite a vetoing OnExit", hExit = 3, hExit)
+Check("shim: ...with no dialog", shimSawDialog = "", shimSawDialog)
+Check("shim: ...nothing ran past it", !InStr(hGot, "not reached"), hGot)
+Check("shim: only the UNHANDLED error is logged",
+    InStr(hLogTxt, '"kind":"error"') && InStr(hLogTxt, '"extra":"second"') && !InStr(hLogTxt, '"extra":"first"'),
+    hLogTxt)
+Check("shim: errors.log still untouched", !FileExist(box "\logs\errors.log"))
+
 try DirDelete(box, true)
 TestEnd()

@@ -9,6 +9,48 @@ starting points taken from CLAUDE.md — verify against current code before buil
 
 ## Open
 
+### 2026-10-01 — quiet-harness feedback (an agent tested a Python-backed macro through a remote bridge)
+
+Seven items, the agent's own ranking first ("if you can only do two things,
+do #1 and #3"). All built on branch `feedback-quiet-harness`; what shipped
+and what was deliberately left out is in `docs\CHANGELOG.md` (2026-10-01).
+
+1. ~~**Run a program directly (#1).**~~ **BUILT 2026-10-01** — `run_process`
+   (argv, no shell, stdout/stderr/exit code; `.bat`/`.cmd`/`.ps1`/`.py`
+   refused with the explicit form).
+2. ~~**Timeouts that lied; processes left running (#2).**~~ **BUILT
+   2026-10-01** — one cap (`max_wait_s()`, 50 s, `[MCP] MaxWaitSeconds`),
+   clamps reported; a timeout or a cancelled request ends the whole process
+   tree (job object); background jobs (`run_process(background=True)`,
+   `read_job`, `stop_job`).
+3. ~~**Quiet fixture tests + a result channel (#3).**~~ **BUILT 2026-10-01** —
+   `run_automation(test=True)` (`lib\TestShim.ahk` via `/include`: MsgBox /
+   TrayTip / InputBox / ToolTip / pickers logged, uncaught errors exit 3),
+   `VkResult(value)` / `VkTestMode()`. Still open: **custom `Gui` windows are
+   not quieted** (replacing `Gui` would change what the macro is), so a
+   workflow with inputs (its ask dialog is a Gui) and VoiceKit's own Gui
+   tools are refused in test mode — feed a workflow's inputs through
+   `run_workflow_batch` instead. A headless ask (inputs passed as test
+   values) would close that gap if a real case needs it.
+4. ~~**Tool names changed mid-session; "registered 3 times" (#4).**~~
+   **SHIPPED 2026-10-01** — `server_info` names the connected client and
+   only the same-client duplicates; it and the session instructions say the
+   prefix is the client's / bridge's and the names after it are stable. Not
+   fixable here: the renaming itself happens in the client or bridge.
+5. ~~**`unmask=True` too broad (#5).**~~ **BUILT 2026-10-01** — scoped
+   `unmask=[tokens]` on `run_ahk_snippet` / `run_process` / `read_job`;
+   blanket refused unless `[Privacy] AllowBlanketUnmask=1`. Considered and
+   not chosen (the user's decision): a confirm-on-the-desktop prompt before
+   unmasking anything inside a client folder.
+6. ~~**A masked path said "doesn't exist" (#6).**~~ **BUILT 2026-10-01** —
+   `check_path` (token expanded vs. nothing there, without revealing), and
+   the tools' "not there" errors say which.
+7. ~~**`ProcessExist("python.exe")` matched VoiceKit's server (#7).**~~
+   **BUILT 2026-10-01** — `list_processes` with command lines and a
+   `voicekit` tag. Not done: a distinct process name for the server (a
+   renamed interpreter or launcher exe to ship and keep in step with every
+   venv) — the tag answers the question without it.
+
 ### 2026-09-29 — document-extraction feedback (an agent built a PDF data extractor via the MCP)
 
 The session ran on a second PC's **installed** copy, so everything here

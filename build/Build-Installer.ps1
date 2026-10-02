@@ -120,7 +120,7 @@ Get-Content -LiteralPath (Join-Path $build 'Install-VoiceKit.cmd') |
 foreach ($must in 'VoiceKit.ahk', 'VoiceKitLauncher.ahk', 'AutoHotkey64.exe',
                   'lib\_Common.ahk', 'lib\Watchdog.ahk', 'lib\Acc.ahk', 'lib\UIA.ahk',
                   'lib\Clip.ahk', 'lib\ExplorerSel.ahk', 'lib\Workflow.ahk', 'lib\Browser.ahk',
-                  'lib\LoopRunner.ahk', 'lib\WorkflowLoop.ahk',
+                  'lib\LoopRunner.ahk', 'lib\WorkflowLoop.ahk', 'lib\TestShim.ahk',
                   'lib\AI.ahk', 'lib\Json.ahk', 'lib\Theme.ahk',
                   'macros\VoiceKitHome.ahk', 'macros\AskAI.ahk', 'macros\NewAutomation.ahk',
                   'macros\WorkflowStudio.ahk', 'macros\RecordMySteps.ahk', 'macros\SplitPages.ahk',
