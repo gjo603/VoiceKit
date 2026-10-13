@@ -17,7 +17,9 @@
 
 #SingleInstance Off
 SetTitleMatchMode 2
-SetTimer(() => ExitApp(3), -25000)          ; never outlive the caller's wait
+; Never outlive the caller's wait (30 s). UiaDumpTree stops its own walk at
+; UIA_DUMP_TIME_MS (15 s) and reports what it saw, so this is the backstop.
+SetTimer(() => ExitApp(3), -25000)
 
 if (A_Args.Length < 2)
     ExitApp(2)
@@ -93,14 +95,25 @@ if (mode = "tree") {
     if !hwnd
         Report("error=Window not found: " (crit = "" ? "(active window)" : OneLine(crit)))
 
-    tree := UiaDumpTree(hwnd, maxDepth, nameFilter, maxLines)
-    if (tree = "" && nameFilter = "")
-        Report("error=UIA cannot read that window")
+    tree := UiaDumpTree(hwnd, maxDepth, nameFilter, maxLines, &stats)
+    ; Nothing visited = the window itself couldn't be read (a filter that
+    ; matched nothing still visits nodes, and is an answer, not an error).
+    if (stats.visited = 0)
+        Report("error=UIA cannot read that window" (stats.why != "" ? ": " OneLine(stats.why) : ""))
     cnt := (tree = "") ? 0 : StrSplit(tree, "`n").Length
     out := ""
     try out .= "window_title=" OneLine(WinGetTitle(hwnd)) "`n"
     try out .= "window_class=" WinGetClass(hwnd) "`n"
     try out .= "window_exe=" WinGetProcessName(hwnd) "`n"
+    ; How complete the walk was, and what it saw (see UiaDumpTree): the
+    ; writer turns these into the note that says a short answer was cut.
+    out .= "max_depth=" maxDepth "`n"
+    out .= "visited=" stats.visited "`n"
+    out .= "cut_at_depth=" stats.cutAtDepth "`n"
+    out .= "budget_hit=" (stats.budgetHit ? 1 : 0) "`n"
+    out .= "time_hit=" (stats.timeHit ? 1 : 0) "`n"
+    out .= "lines_hit=" (stats.linesHit ? 1 : 0) "`n"
+    out .= "fingerprint=" stats.fingerprint "`n"
     out .= "lines=" cnt "`n`n" tree
     Report(out)
 }

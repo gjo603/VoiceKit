@@ -55,3 +55,8 @@ tests/*.stop
 # Hand-made backup copies (e.g. lib\_Common.ahk.bak-20260805) — a stale
 # duplicate of a tracked file must never be swept into a commit.
 *.bak*
+
+# Claude Code's project instructions (2026-10-12): a local development aid,
+# kept on disk but never pushed to GitHub (and never shipped — the build
+# drops it too). The design notes it points at live in docs\architecture\.
+CLAUDE.md

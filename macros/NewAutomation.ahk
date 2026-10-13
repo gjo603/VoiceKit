@@ -411,7 +411,7 @@ DraftSystemPrompt() {
         . '- wait: a = milliseconds to pause, or a RANGE like "600-1400" to pause a random amount in between. Use this only when there is nothing observable to wait on — prefer waitfor. Use a range whenever the workflow will be repeated against a website: pausing the identical number of milliseconds every pass is the easiest robot pattern to detect.' "`n"
         . '- waitfor: waits until something is actually true, then continues at once. a = window; b = the element name or on-screen text to wait for (empty for the window/clipboard conditions); c = one of winexists, winnotexists, elementexists, elementnotexists, textvisible, textnotvisible, clipboardchanged - optionally followed by ",<seconds>" (default 10), e.g. "textvisible,30". Use it after anything slow: a page loading, a save, a search. clipboardchanged needs no window and waits for a copy to land.' "`n"
         . "- text: a = text to type into the focused window.`n"
-        . "- fill: a = window; b = the EXACT on-screen label of an input box (its accessible name - for a web form, the field's label), with #2, #3... appended when several boxes share that label (Amount#2 = the second; write ## for a # that is part of the label itself, e.g. Line ##4); c = the value to put in it (may use {{Name}}; an empty c clears the box). It clicks the box, types the value and checks the box took it. Prefer fill over click + text for form fields.`n"
+        . "- fill: a = window; b = the EXACT on-screen label of an input box (its accessible name - for a web form, the field's label), with #2, #3... appended when several boxes share that label (Amount#2 = the second; write ## for a # that is part of the label itself, e.g. Line ##4); c = the value to put in it (may use {{Name}}; an empty c clears the box). It clicks the box, types the value and checks the box took it. Prefer fill over click + text for form fields. When every box shares one name, b can name the visible TEXT just before the box instead, in double quotes: after `"Insurance`" (the first box after that text), after `"Deductions`" > `"Insurance`" (Insurance within the Deductions section), after `"Insurance`"#2 (the 2nd box after it); as a step: {`"type`":`"fill`",`"a`":`"Chrome`",`"b`":`"after \`"Deductions\`" > \`"Insurance\`"`",`"c`":`"{{Insurance}}`"}. No double quote inside the text.`n"
         . "- ask: a = a short label for a value the USER should supply when the workflow runs (e.g. 'Customer name'); b = suggested answer (optional). All ask inputs are collected in dialogs before the run starts, and the answer is typed into the focused window at this step's position. Use ask instead of text whenever the description implies the value changes each run.`n"
         . "- collect: a = a short label for a value the workflow should GRAB from the screen and save (it becomes a column in the workflow's results sheet); b = the exact on-screen name of the box to read (optional — leave empty to copy whatever text the previous steps left SELECTED, e.g. after a select-all or a double-click on a word). Use collect when the description implies reading or saving something the app shows.`n"
         . "- set: a = a name (no braces) for a value; b = the value, which may itself contain {{other}} references. Use it to build a value once and reuse it.`n"
@@ -423,7 +423,8 @@ DraftSystemPrompt() {
         . "- close: a = window to close.`n"
         . '- if: a = window; b = element name or on-screen text ("" for the window conditions); c = one of winexists, winnotexists, elementexists, elementnotexists, textvisible, textnotvisible. Use textvisible/textnotvisible to react to what the app says, e.g. "No results found".' "`n"
         . "- else: no fields. endif: no fields.`n"
-        . "- NEVER use a capture step (running a command and saving its output): drafts can't contain commands. If the task needs one, draft the other steps; the user adds the command in Workflow Studio.`n`n"
+        . "- NEVER use a capture step (running a command and saving its output): drafts can't contain commands. If the task needs one, draft the other steps; the user adds the command in Workflow Studio.`n"
+        . "- NEVER use a module step (running one of the user's hotkey modules): you can't know their names. If the task needs one, draft the other steps; the user adds it in Workflow Studio.`n`n"
         . "Named values:`n"
         . "- Every ask label, collect label and set name becomes a value you can reuse ANYWHERE later by writing {{Name}} — in text, keys, run targets, window criteria and element names.`n"
         . "- That is how one answer reaches two places: ask once for 'Customer', then write {{Customer}} in every step that needs it. Never ask for the same thing twice.`n"
@@ -491,6 +492,15 @@ ParseDraftInner(raw, &perr) {
             perr := "Draft step " i " runs a command ('capture') — Draft With AI can't add commands. "
                 . "Draft it without that step, then add it yourself in Workflow Studio "
                 . "(Add → Run a command and save its output)"
+            return ""
+        }
+        ; module runs one of the user's hotkey modules — a program — by its
+        ; phrase, which the drafter can't know: a guessed name is refused at
+        ; save time at best. Named, like capture, so the user knows why.
+        if (t = "module") {
+            perr := "Draft step " i " runs a hotkey module ('module') — Draft With AI can't pick one. "
+                . "Draft it without that step, then add it yourself in Workflow Studio "
+                . "(Add → Run a hotkey module and wait for it to finish)"
             return ""
         }
         if !validTypes.Has(t) {

@@ -338,6 +338,186 @@ Check("nameFilter keeps the match", InStr(filt, 'Button "Press Me Zz"') > 0)
 Check("nameFilter drops everything else", !InStr(filt, 'Edit "'), "got: " filt)
 Check("UiaDumpTree of hwnd 0 is empty", UiaDumpTree(0) = "")
 
+; ---- the dump says how complete it was (2026-10-12) -------------------
+; A dump capped at depth 25 showed a web form's inputs as empty groups and a
+; filtered dump came back empty with no warning. &stats reports the walk.
+Say("about to: UiaCrc32 (ntdll RtlComputeCrc32)")
+crcAscii := DllCall("ntdll\RtlComputeCrc32", "uint", 0, "astr", "123456789", "int", 9, "uint")
+Check("RtlComputeCrc32 is the standard CRC-32 (check value CBF43926)", crcAscii = 0xCBF43926,
+    Format("{:08X}", crcAscii))
+Check("UiaCrc32 chains (two halves = the whole)",
+    UiaCrc32("ef", UiaCrc32("abcd")) = UiaCrc32("abcdef"))
+Check("UiaCrc32 of different text differs", UiaCrc32("abc") != UiaCrc32("abd"))
+
+Say("about to: UiaDumpTree &stats")
+full := UiaDumpTree(hwnd, 8, "", 300, &stFull)
+Check("stats count the visited nodes", stFull.visited >= 6, "visited=" stFull.visited)
+Check("nothing is cut at depth 8 in a flat window", stFull.cutAtDepth = 0, "cut=" stFull.cutAtDepth)
+Check("...and no budget, time or line cap was hit",
+    !stFull.budgetHit && !stFull.timeHit && !stFull.linesHit)
+Check("the fingerprint is 8 hex digits", RegExMatch(stFull.fingerprint, "^[0-9a-f]{8}$") > 0,
+    stFull.fingerprint)
+UiaDumpTree(hwnd, 8, "Press Me", 50, &stFilt)
+Check("a filtered dump has the SAME fingerprint and node count",
+    stFilt.fingerprint = stFull.fingerprint && stFilt.visited = stFull.visited,
+    stFilt.fingerprint " vs " stFull.fingerprint)
+UiaDumpTree(hwnd, 8, "", 3, &stCap)
+Check("a line-capped dump says linesHit", stCap.linesHit = true)
+Check("...but keeps walking (same fingerprint, same count)",
+    stCap.fingerprint = stFull.fingerprint && stCap.visited = stFull.visited,
+    stCap.visited " vs " stFull.visited)
+shallowDump := UiaDumpTree(hwnd, 1, "Lv Row 12", 50, &stShallow)
+Check("a filter below maxDepth matches nothing...", shallowDump = "")
+Check("...and stats say subtrees were cut there (the list's rows)", stShallow.cutAtDepth >= 1,
+    "cut=" stShallow.cutAtDepth)
+Check("UiaTreeFingerprint agrees with UiaDumpTree", UiaTreeFingerprint(hwnd, 8, &stFp) = stFull.fingerprint)
+Check("...and its stats don't claim a line cap (it collects no lines)",
+    !stFp.linesHit && !stFp.timeHit && stFp.visited = stFull.visited)
+UiaDumpTree(0, 8, "", 300, &stNone)
+Check("an unreadable window: nothing visited, why says so",
+    stNone.visited = 0 && InStr(stNone.why, "hwnd 0") > 0, stNone.why)
+Check("...and no fingerprint", stNone.fingerprint = "" && UiaTreeFingerprint(0) = "")
+; The point of the fingerprint: same title, different content. Rename the
+; button in the target (WM_SETTEXT from here), then put it back.
+btnHwnd := Integer(TargetState("btnhwnd"))
+ControlSetText("Renamed Zz", btnHwnd)
+Sleep(300)
+fpChanged := UiaTreeFingerprint(hwnd)
+ControlSetText("Press Me Zz", btnHwnd)
+Sleep(300)
+Check("the fingerprint changes when the content changes under the same title",
+    fpChanged != "" && fpChanged != stFull.fingerprint, fpChanged " vs " stFull.fingerprint)
+Check("...and comes back when the content does", UiaTreeFingerprint(hwnd) = stFull.fingerprint)
+
+; ---- &why: an empty answer says WHY (2026-10-12) ----------------------
+; "No match", "couldn't get the window root" and "the lookup threw" used to
+; look identical; one session blamed a flaky browser for a page change.
+Say("about to: the &why texts")
+whyW := "unset"
+Check("UiaFromWindow(0) is refused with a reason", UiaFromWindow(0, &whyW) = "" && InStr(whyW, "hwnd 0") > 0, whyW)
+Check("...and a good window has an empty why", UiaFromWindow(hwnd, &whyW) != "" && whyW = "", whyW)
+goneGui := Gui(, "VKUiaGone_ZZ")
+goneHwnd := goneGui.Hwnd
+goneGui.Destroy()
+Check("a closed window's why says it has closed",
+    UiaFromWindow(goneHwnd, &whyW) = "" && InStr(whyW, "has closed") > 0, whyW)
+Check("a hit has an empty why", UiaFind(hwnd, "Press Me Zz", 2000, 1, &whyW) != "" && whyW = "", whyW)
+UiaFind(hwnd, "No Such Xyz Zz", 600, 1, &whyW)
+Check("a miss says 'no match' with elapsed ms and attempts",
+    RegExMatch(whyW, "^no match after \d+ ms \(\d+ attempts?\)$") > 0, whyW)
+UiaFindAll(hwnd, "No Such Xyz Zz", 300, 0, &whyW)
+Check("UiaFindAll's miss says the same", RegExMatch(whyW, "^no match after \d+ ms") > 0, whyW)
+UiaFind(hwnd, "Name Field", 400, 99, &whyW)
+Check("too few matches for the occurrence says how many there were",
+    InStr(whyW, "only 2 matches, wanted occurrence 99") = 1, whyW)
+t0 := A_TickCount
+UiaFindEdit(0, "Name Field", 2000, 1, &whyW)
+Check("a find on hwnd 0 says so at once (not after the timeout)",
+    InStr(whyW, "hwnd 0") > 0 && A_TickCount - t0 < 1000, whyW)
+UiaFindById(hwnd, "no.such.id.zz", 300, 1, &whyW)
+Check("UiaFindById passes why through", InStr(whyW, "no match") = 1, whyW)
+UiaFindOfType(hwnd, "Name Field", UIA_TYPE_CHECKBOX(), 300, 1, &whyW)
+Check("UiaFindOfType passes why through", InStr(whyW, "no match") = 1, whyW)
+UiaWaitFor(hwnd, "No Such Xyz Zz", 300, &whyW)
+Check("UiaWaitFor passes why through", InStr(whyW, "no match") = 1, whyW)
+UiaFindAllCond(hwnd, "", 300, 0, &whyW)
+Check("a missing condition is named", InStr(whyW, "condition") > 0, whyW)
+Check("UiaFindFirst with no start element says so",
+    UiaFindFirst("", cond, 4, &whyW) = "" && InStr(whyW, "no start element") = 1, whyW)
+Check("UiaFindFirst with no condition says so",
+    UiaFindFirst(root, "", 4, &whyW) = "" && InStr(whyW, "no search condition") = 1, whyW)
+Check("UiaFindElements of nothing says so",
+    UiaFindElements("", cond, 4, 0, &whyW).Length = 0 && InStr(whyW, "no start element") = 1, whyW)
+UiaClickName(0, "Zz Nothing", 300, &whyW)
+Check("a click helper says the SEARCH failed, not that the name is absent",
+    InStr(whyW, "couldn't search the window for 'Zz Nothing'") = 1 && InStr(whyW, "hwnd 0"), whyW)
+UiaClickName(hwnd, "Zz Nothing", 300, &whyW)
+Check("...while a plain miss keeps the virtualization advice",
+    InStr(whyW, "no element named 'Zz Nothing'") = 1 && InStr(whyW, "VIRTUALIZE"), whyW)
+
+; ---- scoped searches can't come back from outside (2026-10-12) --------
+; Chrome's FindFirst, started at three different label groups, returned the
+; SAME (wrong) box all three times. The Win32 provider here is correct, so
+; this pins the containment helper both ways, the scoped finds, the walk
+; fallback, and — by handing UiaKeepInScope an out-of-scope hit directly —
+; what happens when a provider does misbehave.
+Say("about to: UiaIsWithin / UiaIsTopLevel")
+listEl := UiaFromWindow(Integer(TargetState("lvhwnd")))
+Check("the list is reachable", listEl != "")
+nameCond := UiaPropCondition(UIA_PROP_NAME(), "Lv Row 3")
+allRow3 := UiaFindElements(root, nameCond, UIA_SCOPE_SUBTREE())
+Check("the window has 3 elements named 'Lv Row 3' (row, its text, the outside text)",
+    allRow3.Length = 3, "got " allRow3.Length)
+rowIn := allRow3[1], outsideTxt := allRow3[allRow3.Length]
+outsideBtn := UiaFind(hwnd, "Outside Only Zz", 2000)
+Check("the row is within the list", UiaIsWithin(rowIn, listEl) = true)
+Check("the list is within itself", UiaIsWithin(listEl, listEl) = true)
+Check("the outside text is NOT within the list", UiaIsWithin(outsideTxt, listEl) = false)
+Check("the outside button is NOT within the list", UiaIsWithin(outsideBtn, listEl) = false)
+Check("containment is not symmetric (the list is not within its row)",
+    UiaIsWithin(listEl, rowIn) = false)
+Check("UiaIsWithin of nothing is false", UiaIsWithin("", listEl) = false)
+Check("the window element is top-level", UiaIsTopLevel(root) = true)
+Check("...the list is not", UiaIsTopLevel(listEl) = false)
+
+Say("about to: UiaFindFirst / UiaFindElements from a sub-element")
+hitIn := UiaFindFirst(listEl, nameCond, UIA_SCOPE_DESCENDANTS(), &whyW)
+Check("a search from the list finds the row inside it",
+    hitIn != "" && UiaControlType(hitIn) = UIA_TYPE_LISTITEM() && whyW = "", whyW)
+Check("a search from the list for a name only OUTSIDE it finds nothing",
+    UiaFindFirst(listEl, UiaPropCondition(UIA_PROP_NAME(), "Outside Only Zz"), 4, &whyW) = ""
+    && whyW = "no match", whyW)
+inList := UiaFindElements(listEl, nameCond, UIA_SCOPE_DESCENDANTS(), 0, &whyW)
+okIn := inList.Length = 2 && whyW = ""
+for e in inList
+    okIn := okIn && UiaIsWithin(e, listEl)
+Check("FindAll from the list returns only the 2 inside it", okIn, "got " inList.Length " why=" whyW)
+
+Say("about to: UiaFindFirstWalk (the reliable fallback)")
+walked := UiaFindFirstWalk(listEl, nameCond, UIA_SCOPE_DESCENDANTS(), &whyW)
+Check("the walk finds the same row FindFirst did", UiaSameElement(walked, hitIn) && whyW = "", whyW)
+textCond := UiaAndCondition(nameCond, UiaIntCondition(UIA_PROP_CONTROLTYPE(), UIA_TYPE_TEXT()))
+walkedTxt := UiaFindFirstWalk(listEl, textCond, UIA_SCOPE_DESCENDANTS())
+Check("a walk for the Text named 'Lv Row 3' returns the one INSIDE the list",
+    walkedTxt != "" && UiaIsWithin(walkedTxt, listEl) && !UiaSameElement(walkedTxt, outsideTxt))
+Check("a walk for a name only outside finds nothing",
+    UiaFindFirstWalk(listEl, UiaPropCondition(UIA_PROP_NAME(), "Outside Only Zz"), 4, &whyW) = ""
+    && whyW = "no match", whyW)
+Check("a children-only walk reaches a row", UiaFindFirstWalk(listEl, nameCond, 2) != "")
+Check("an element-only walk tests just the start", UiaFindFirstWalk(listEl, nameCond, 1) = "")
+; The walk is bounded by time too: a miss over a big subtree must give up
+; and say so. A 1 ms limit over the whole window either finishes first
+; (a fast machine) or stops with the "stopped after" reason — never a hit.
+missCond := UiaPropCondition(UIA_PROP_NAME(), "Nowhere At All Zz")
+tWalk := A_TickCount
+wMiss := UiaFindFirstWalk(root, missCond, 4, &whyT, 1)
+Check("a time-limited walk that misses returns nothing with a reason",
+    wMiss = "" && (whyT = "no match" || RegExMatch(whyT, "^no match .* stopped after \d+ nodes / \d+ ms")),
+    whyT)
+Check("...and gives up quickly", A_TickCount - tWalk < 3000, (A_TickCount - tWalk) " ms")
+
+Say("about to: UiaKeepInScope / UiaScopedHits (a provider answering from outside)")
+kept := UiaKeepInScope(outsideTxt, listEl, nameCond, UIA_SCOPE_DESCENDANTS(), &whyW)
+Check("an out-of-scope hit is replaced by the walk's in-scope match",
+    kept != "" && UiaSameElement(kept, hitIn), "type=" (kept != "" ? UiaControlType(kept) : "none"))
+Check("...and why says the provider answered from OUTSIDE", InStr(whyW, "OUTSIDE") > 0, whyW)
+keptNone := UiaKeepInScope(outsideBtn, listEl, UiaPropCondition(UIA_PROP_NAME(), "Outside Only Zz"), 4, &whyW)
+Check("...and when nothing inside matches, it is empty with both reasons",
+    keptNone = "" && InStr(whyW, "OUTSIDE") && InStr(whyW, "no match"), whyW)
+Check("an in-scope hit passes straight through",
+    UiaSameElement(UiaKeepInScope(hitIn, listEl, nameCond, 4, &whyW), hitIn) && whyW = "", whyW)
+Check("a window-root start is never second-guessed",
+    UiaSameElement(UiaKeepInScope(outsideTxt, root, nameCond, 4), outsideTxt))
+scoped := UiaScopedHits([rowIn, outsideTxt], listEl, &dropped)
+Check("UiaScopedHits drops the stray", scoped.Length = 1 && dropped = 1
+    && UiaSameElement(scoped[1], rowIn), "kept " scoped.Length " dropped " dropped)
+rowsIn := UiaFindElements(listEl, UiaIntCondition(UIA_PROP_CONTROLTYPE(), UIA_TYPE_LISTITEM()), 4, 0, &whyW)
+Check("40 rows from the list, none dropped", rowsIn.Length = 40 && whyW = "", rowsIn.Length " " whyW)
+rowsIn.Push(outsideBtn)
+scoped := UiaScopedHits(rowsIn, listEl, &dropped)
+Check("a stray at the end of a long list is caught (the ends are always sampled)",
+    scoped.Length = 40 && dropped = 1, "kept " scoped.Length " dropped " dropped)
+
 ; ---- the own-process guards -------------------------------------------
 ; Deliberately LAST. All three entrances must refuse our own process; if a
 ; guard ever regresses, its call does not fail, it HANGS — the runner's
@@ -348,6 +528,11 @@ selfGui := Gui("+AlwaysOnTop", "VKUiaSelf_ZZ")
 selfGui.AddButton("w200", "Self Button Zz")
 selfGui.Show("Hide")
 Check("our own process is refused", UiaFromWindow(selfGui.Hwnd) = "")
+whyW := ""
+UiaFromWindow(selfGui.Hwnd, &whyW)
+Check("...and why names the own-process rule", InStr(whyW, "own process") > 0, whyW)
+UiaFind(selfGui.Hwnd, "Self Button Zz", 300, 1, &whyW)
+Check("...and so does a find on it (refused before any UIA call)", InStr(whyW, "own process") > 0, whyW)
 Check("UiaOtherProcess says no to our own window", UiaOtherProcess(selfGui.Hwnd) = false)
 Check("UiaOtherProcess says yes to the target", UiaOtherProcess(hwnd) = true)
 

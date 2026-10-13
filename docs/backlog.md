@@ -9,6 +9,40 @@ starting points taken from CLAUDE.md — verify against current code before buil
 
 ## Open
 
+### 2026-10-12 — ProConnect-session feedback (an agent automated a tax web app in Chrome)
+
+Nine items, all built on branch `feedback-quiet-harness`; what shipped and
+what was deliberately left out is in `docs\CHANGELOG.md` (2026-10-12).
+
+1. ~~**`dump_uia_tree` silently stopped at depth 25 (#1).**~~ **BUILT** — cap
+   100, and the dump reports `cut_at_depth` / `budget_hit` with a plain-words
+   note, loudest when a `name_filter` found nothing in a cut walk.
+2. ~~**Empty UIA finds couldn't say why (#2).**~~ **BUILT** — a trailing
+   `&why` on every find in `lib\UIA.ahk`.
+3. ~~**A find from a sub-element returned an element outside it (#3).**~~
+   **BUILT** — containment check + walk fallback (`UiaIsWithin`,
+   `UiaFindFirstWalk`), a header warning, tests. **Still open: confirm on
+   live Chrome** — only Win32 targets and an injected stray were tested.
+4. ~~**`fill` by position relative to a label (#4).**~~ **BUILT** —
+   `after "Deductions" > "Insurance"#N`; `>` means within (2026-10-12): a
+   section whose element contains its content bounds the search and a miss
+   fails by name. Still open: a section the page doesn't group (a bare
+   heading, sibling content) is only ORDERED, so `#3` can still run past it
+   there (logged) — not yet tried on the live site, where whether
+   ProConnect's sections are containers is unmeasured.
+5. ~~**A workflow can't wait for a hotkey module (#5).**~~ **BUILT** — the
+   `module` step. Still open: deleting a module that a workflow names isn't
+   blocked or warned about (the run fails with "No hotkey module
+   answers…"); glance at the Studio's module dropdown layout on screen.
+6. ~~**No dry run for bodies (#6).**~~ **BUILT** — `run_automation(dry_run=True)`,
+   also for an isolated module by name.
+7. ~~**Replace's companion hotkey undocumented (#7).**~~ **BUILT** —
+   `create_workflow` returns `hotkey`.
+8. ~~**UIA function list only in the source (#8).**~~ **BUILT** —
+   `read_reference('uia')` / `('browser')`, generated from the source.
+9. ~~**Nothing flags a changed page (#9).**~~ **BUILT** — the dump's
+   `fingerprint` (`UiaTreeFingerprint` for snippets).
+
 ### 2026-10-01 — quiet-harness feedback (an agent tested a Python-backed macro through a remote bridge)
 
 Seven items, the agent's own ranking first ("if you can only do two things,
@@ -84,14 +118,17 @@ Priority order is the user's; WP numbers point into the roadmap.
 5. ~~**Fill-by-label step — MEDIUM (WP8).**~~ **BUILT 2026-09-30** —
    `fill|<window>|<label>[#N]|<value>`: find, click, focus gate, type, read
    back; `#N` for duplicate labels; fill-value `{{names}}` are workflow
-   inputs so a batch reaches them (see `docs\CHANGELOG.md`). Still open:
-   dump a real web form app's input screen (`dump_uia_tree`) and tune — whether
-   its labels are the inputs' accessible names, how many repeat, and whether
-   its boxes reformat in a way `WfFillMatches` doesn't cover.
+   inputs so a batch reaches them (see `docs\CHANGELOG.md`). Partly answered
+   2026-10-12: on the tax web app every input's accessible name was the same
+   ("expanded detail input"), so the labels are NOT the inputs' names there —
+   the relative `after "…"` form was built for that. Still open: whether its
+   boxes reformat in a way `WfFillMatches` doesn't cover.
 6. ~~**`run_automation` args / dry-run — MEDIUM (WP5).**~~ **BUILT
    2026-09-30** — `args` (argv list; a workflow's args are its selection),
    voice-launch working directory, documented `/dry` convention, no generic
-   flag. Phase 2 (`run_workflow_batch(files=...)`) not built — the
+   flag (a generic one, which replaces the input built-ins rather than
+   trusting the script, shipped 2026-10-12: `run_automation(dry_run=True)`,
+   see `docs\CHANGELOG.md`). Phase 2 (`run_workflow_batch(files=...)`) not built — the
    selection is one snapshot per run (a whole loop shares it) and batch rows
    only seed ask labels; meanwhile a workflow can take a path as an ask
    label and batch over a CSV of paths.

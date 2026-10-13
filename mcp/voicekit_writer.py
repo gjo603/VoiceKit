@@ -103,9 +103,21 @@ STEP_TYPES = ("run", "focus", "waitwin", "wait", "text", "keys",
               # {{selected_files}} arrive QUOTED in the command (and in a run
               # target), written with or without quotes around them.
               "capture",
+              # module|<module>|<seconds>| — run an ISOLATED hotkey module's
+              # body (hotkeys\\bodies\\<Base>.body.ahk) and WAIT for it: exit
+              # code 0 carries on, anything else stops the run (ExitApp(1) is
+              # how a body says it failed; an uncaught error ends it with 3,
+              # no dialog). paramA = the module's phrase as list_automations
+              # shows it (module_step_target; stored as the bridge-map phrase)
+              # — never substituted. paramB = most seconds to wait (blank = 60,
+              # at most 3600); a timeout or Stop ends its process tree. The run
+              # record says only "Module '<phrase>' failed (exit code N)".
+              "module",
               # fill|<window>|<label>[#N]|<value> — find an input box by its
               # label (its accessible name; "Amount#2" = the 2nd box with that
-              # label, "##" a literal "#"), click it, refuse to type unless the
+              # label, "##" a literal "#") — or by the text BEFORE it, when
+              # every box shares one name: after "Insurance", after
+              # "Deductions" > "Insurance"#2 (fill_label) — click it, refuse to type unless the
               # keyboard focus landed on it, type the value and READ IT BACK.
               # paramC is the value and — alone among paramC slots — takes
               # {{Name}}. "" clears the box; a line break is refused. A failure
@@ -134,16 +146,24 @@ WAIT_MS_RE = re.compile(r"^\d+(\s*-\s*\d+)?$")
 # AHK's IsNumber and Python's float() disagree on). Mirrors WfCaptureSecs.
 CAPTURE_SECS_RE = re.compile(r"^\d+(\.\d+)?$")
 
+# A module step's wait (paramB): blank = the engine's 60 s, else a positive
+# number of seconds (CAPTURE_SECS_RE's forms) up to this. Mirrors
+# WfModuleSecs, which quietly reads junk as 60 and caps at an hour.
+MODULE_MAX_SECS = 3600
+
 _FILL_LABEL_RE = re.compile(r"^(.*?)(#+)([0-9]+)$", re.S)
 
 
 def fill_label(raw: str) -> dict:
-    """A fill step's label -> {name, occ, explicit, err}. Mirrors lib\\Workflow.ahk
-    WfFillLabel exactly (tests\\engine-fill-selftest.ahk and test_conformance
-    share one table): "Amount#2" is the 2nd input labelled Amount; an ODD run
-    of # before trailing digits ends in the separator, the rest are "##"
-    pairs meaning a literal "#"; any other "#" is literal."""
+    """A fill step's label -> {name, occ, explicit, err, anchors}. Mirrors
+    lib\\Workflow.ahk WfFillLabel exactly (tests\\engine-fill-selftest.ahk and
+    test_conformance share one table): "Amount#2" is the 2nd input labelled
+    Amount; an ODD run of # before trailing digits ends in the separator, the
+    rest are "##" pairs meaning a literal "#"; any other "#" is literal.
+    A label starting `after "` is the RELATIVE form (_fill_after_label)."""
     s = (raw or "").strip(" \t")          # AHK Trim: spaces and tabs
+    if _FILL_AFTER_RE.match(s):
+        return _fill_after_label(s)
     occ, explicit = 1, False
     m = _FILL_LABEL_RE.match(s)
     if m and len(m.group(2)) % 2 == 1:
@@ -156,7 +176,68 @@ def fill_label(raw: str) -> dict:
         err = "has no label — give the input's label as it appears on screen"
     elif explicit and occ < 1:
         err = "'#0' isn't an input number — count from #1 (the first input with that label)"
-    return {"name": name, "occ": occ, "explicit": explicit, "err": err}
+    return {"name": name, "occ": occ, "explicit": explicit, "err": err, "anchors": []}
+
+
+# The relative fill label: `after "Insurance"`, `after "Deductions" > "Insurance"#2`.
+# Whitespace is spelled [ \t\n\r\f] on BOTH sides — Python's \s also takes a
+# vertical tab, AutoHotkey's PCRE doesn't — and the #N ends at the very end
+# (\Z here, \z there: PCRE's $ also passes a final CR / CR LF, Python's a
+# final LF), so the two parse every label the same way (FILL_LABELS pins it).
+_FILL_AFTER_RE = re.compile(r"after[ \t\n\r\f]*(?=\")", re.I | re.A)
+_FILL_ANCHOR_RE = re.compile(r"\"([^\"]*)\"[ \t\n\r\f]*", re.A)
+_FILL_AFTER_OCC_RE = re.compile(r"#([0-9]+)\Z")
+
+
+def _fill_after_label(s: str) -> dict:
+    """The relative form of a fill label — mirrors WfFillAfterLabel: the box is
+    the Nth input after the last quoted text, each text found after the one
+    before it. Texts are quoted (so > and # are literal inside them) and can't
+    contain a double quote. On success name is the canonical spelling; on an
+    error it is the trimmed input and anchors is []."""
+    out = {"name": s, "occ": 1, "explicit": False, "err": "", "anchors": []}
+    rest = s[_FILL_AFTER_RE.match(s).end():]
+    anchors = []
+    while True:
+        q = _FILL_ANCHOR_RE.match(rest)
+        if not q:
+            out["err"] = ("label has a quote that never closes — write after \"Insurance\" "
+                          "(a double quote can't be part of the text itself)"
+                          if rest.startswith('"') else
+                          "label's 'after' needs its text in double quotes — after \"Insurance\", "
+                          "or after \"Deductions\" > \"Insurance\"")
+            return out
+        a = q.group(1).strip(" \t")
+        if not a:
+            out["err"] = ("label has an empty after \"\" — put the text that comes just before "
+                          "the box between the quotes")
+            return out
+        anchors.append(a)
+        rest = rest[q.end():]
+        if not rest:
+            break
+        if rest.startswith(">"):
+            rest = rest[1:].lstrip(" \t")
+            if not rest:
+                out["err"] = ("label ends with '>' — follow it with the next quoted text: "
+                              "after \"Deductions\" > \"Insurance\"")
+                return out
+            continue
+        n = _FILL_AFTER_OCC_RE.match(rest)
+        if n:
+            out["occ"] = 999999 if len(n.group(1)) > 6 else int(n.group(1))
+            out["explicit"] = True
+            if out["occ"] < 1:
+                out["err"] = "'#0' isn't an input number — count from #1 (the first input after the text)"
+                return out
+            break
+        out["err"] = ("label has unexpected text after a quoted part — chain texts with > "
+                      "(after \"Deductions\" > \"Insurance\"), end with #2 to pick the 2nd box, "
+                      "and leave double quotes out of the text itself")
+        return out
+    out["name"] = "after " + " > ".join(f'"{a}"' for a in anchors)
+    out["anchors"] = anchors
+    return out
 
 
 # Conditions shared by `if` and `waitfor` (lib\Workflow.ahk WfEvalCond).
@@ -2237,11 +2318,12 @@ def _instructions_text(solo: list[str], families: list[str]) -> str:
         "VoiceKit builds and runs AutoHotkey v2 automations (v1 syntax does not load).",
         "",
         "Pre-included: run_ahk_snippet code gets lib\\_Common.ahk, lib\\Browser.ahk (with "
-        "lib\\UIA.ahk and lib\\Clip.ahk), lib\\ExplorerSel.ahk and Out(value). Hotkey-module "
+        "lib\\UIA.ahk and lib\\Clip.ahk), lib\\ExplorerSel.ahk and Out(value); signatures: "
+        "read_reference('uia'), ('browser'). Hotkey-module "
         "bodies (isolate=True) and create_launch_macro(ahk_body=...) macros #Include "
-        "lib\\_Common.ahk; an isolate=False module runs inside VoiceKit.ahk beside "
-        "lib\\_Common.ahk, lib\\Theme.ahk and every other module. A hand-written macro "
-        "includes what its source says (read_macro_source).",
+        "lib\\_Common.ahk; an isolate=False module runs inside VoiceKit.ahk (its "
+        "_Common.ahk, Theme.ahk, every module). A hand-written macro "
+        "includes what its source says.",
         "",
         "Names you can't assign at the top level: AutoHotkey v2 keeps functions and "
         "variables in ONE case-insensitive namespace, so `log := 1` fails to load (Log is a "
@@ -2252,7 +2334,7 @@ def _instructions_text(solo: list[str], families: list[str]) -> str:
         "VoiceKit functions: " + ", ".join(solo) + ".",
         "VoiceKit prefix families (every name starting with): " + ", ".join(families) + ".",
         "",
-        "Quotes: v2 escapes a double quote inside \"...\" as `\" (backtick-quote); v1's "
+        "Quotes: v2 escapes a double quote inside \"...\" as `\"; v1's "
         "doubled \"\" does not load. Or use single quotes: 'say \"hi\"'.",
         "",
         "Changing an automation: read it first (read_macro_source, read_hotkey_module, "
@@ -2273,19 +2355,20 @@ def _instructions_text(solo: list[str], families: list[str]) -> str:
         "",
         "Files selected in File Explorer: a workflow uses {{selected_file}} (exactly one) or "
         "{{selected_files}} (all); in a command line (capture, run) they arrive quoted. A "
-        "capture step runs a command line hidden and saves its output as {{name}}. A launch "
+        "capture step saves a hidden command line's output as {{name}}. A launch "
         "macro: `#Include \"%A_ScriptDir%\\..\\lib\\ExplorerSel.ahk\"` then "
         "`files := A_Args.Length ? A_Args : ExplorerSelectedFiles()`. Either way "
         "run_automation(args=[...]) passes a fixture in their place: a sample under "
-        "%TEMP%, never a client document. There is no generic dry-run.",
+        "%TEMP%, never a client document.",
         "",
         "Programs: run_process(exe, args) — no shell, no AHK quoting — returns stdout, "
         f"stderr, exit code. No call waits over {max_wait_s()} s; a timeout or cancel ends "
         "its process tree. Longer: background=True, then read_job / stop_job.",
-        "Quiet tests: run_automation(..., test=True) logs MsgBox/TrayTip instead of showing "
-        "them (Gui windows still show); a macro returns values with VkResult(value).",
-        "list_processes shows command lines and tags VoiceKit's own (its server is a "
-        "python.exe too) — don't rely on ProcessExist(\"python.exe\").",
+        "Quiet: run_automation(test=True) hides MsgBox/TrayTip (not Guis); VkResult(v) "
+        "returns data; dry_run=True logs keys/clicks/UIA/menus unsent — not Run, file/"
+        "clipboard writes, window cmds, Post/SendMessage, own COM; both take isolated modules.",
+        "list_processes tags VoiceKit's own (its server is a python.exe too) — don't rely "
+        "on ProcessExist(\"python.exe\").",
         "",
         "Tool-name prefixes (mcp__voicekit__, mcp__remote-devices__voicekit__) come from your "
         "client or a bridge and can change on a reconnect; the names after them don't — "
@@ -3763,6 +3846,66 @@ def _expand_step_paths(s):
     return tuple(out) if isinstance(s, tuple) else out
 
 
+def _ahk_caseless(s: str) -> str:
+    """AutoHotkey's `=` folds A-Z only (StringCaseSense Off)."""
+    return re.sub(r"[A-Z]", lambda m: m.group(0).lower(), s)
+
+
+def module_step_target(name: str) -> dict:
+    """The hotkey module a `module` step names -> {kind, phrase, module, body}.
+    Mirrors lib\\Workflow.ahk WfModuleResolve exactly (test_module_step_target_
+    matches_the_engine runs both on one bridge map): passes in precedence
+    order — the phrase exactly (trimmed, caseless), then ignoring a leading
+    "open " on either side, then the module's file base ("Send Number" /
+    "SendNumber") — first bridge-map entry in file order within a pass.
+    kind: "ok" (an isolated module with a body), "unknown", "companion" (a
+    keyboard shortcut FOR another automation) or "inprocess" (runs inside
+    VoiceKit.ahk, so nothing can wait for it)."""
+    want = str(name or "").strip(" \t")
+    out = {"kind": "unknown", "phrase": want, "module": "", "body": ""}
+    if not want:
+        return out
+
+    def no_open(s):
+        return re.sub(r"(?i)^open\s+", "", s.strip(" \t"), flags=re.ASCII)
+
+    def file_base(f):
+        return re.sub(r"(?i)^hotkeys\\|\.ahk$", "", f)
+
+    want_base = to_base(clean_phrase(want))
+    entries = get_bridge_map()["entries"]
+    passes = (
+        lambda e: _ahk_caseless(e["phrase"]) == _ahk_caseless(want),
+        lambda e: _ahk_caseless(no_open(e["phrase"])) == _ahk_caseless(no_open(want)),
+        lambda e: bool(want_base) and _ahk_caseless(file_base(e["file"])) == _ahk_caseless(want_base),
+    )
+    hit = next((e for match in passes for e in entries if match(e)), None)
+    if hit is None:
+        return out
+    out["phrase"] = hit["phrase"]
+    if re.search(r"(?i)\.hotkey\.ahk$", hit["file"]):
+        out["kind"] = "companion"
+        return out
+    out["module"] = file_base(hit["file"])
+    body = REPO_ROOT / _body_rel(out["module"])
+    out["body"] = str(body)
+    out["kind"] = "ok" if body.is_file() else "inprocess"
+    return out
+
+
+def _module_step_refusal(m: dict, name: str) -> str:
+    """Why a module step can't run `name` (WfModuleRefusal, in MCP terms)."""
+    if m["kind"] == "unknown":
+        return (f"no hotkey module answers to '{str(name).strip()}' — list_automations shows each "
+                f"module's voice_phrase (hotkey_modules).")
+    if m["kind"] == "companion":
+        return (f"'{m['phrase']}' is a companion hotkey (a keyboard shortcut for another "
+                f"automation), not a hotkey module — a module step runs hotkey modules only.")
+    return (f"module '{m['phrase']}' runs inside VoiceKit (isolate=False), so a workflow can't "
+            f"wait for it to finish. Recreate it with create_hotkey_module(..., isolate=True) — "
+            f"same name: the key and its Voice Access pairing are kept.")
+
+
 def create_workflow(name: str, steps: list) -> dict:
     phrase, base = _require_name(name)
     if not steps:
@@ -3851,6 +3994,21 @@ def create_workflow(name: str, steps: list) -> dict:
             if c and not (CAPTURE_SECS_RE.match(c) and float(c) > 0):
                 raise VoiceKitError(f"Step {i + 1}: a 'capture' timeout must be a positive "
                                     f"number of seconds, or blank for 30 (got '{c}').")
+        # module|module|seconds| — an ISOLATED module that exists now (the
+        # engine would only find out mid-run), and a wait the engine won't
+        # quietly read as 60. Stored as its bridge-map phrase, which is what
+        # the Studio's dropdown shows and saves.
+        if t == "module":
+            if not a:
+                raise VoiceKitError(f"Step {i + 1}: a 'module' step needs the hotkey module to "
+                                    f"run — its voice phrase or name, as list_automations shows it.")
+            if b and not (CAPTURE_SECS_RE.match(b) and 0 < float(b) <= MODULE_MAX_SECS):
+                raise VoiceKitError(f"Step {i + 1}: a 'module' wait must be a positive number of "
+                                    f"seconds up to {MODULE_MAX_SECS}, or blank for 60 (got '{b}').")
+            m = module_step_target(a)
+            if m["kind"] != "ok":
+                raise VoiceKitError(f"Step {i + 1}: {_module_step_refusal(m, a)}")
+            steps[i] = ("module", m["phrase"], b, "")
         # fill|window|label|value — a window and a label to find the box by;
         # the value must be GIVEN ("" clears the box, so a forgotten value
         # must not silently become a clear) and be one line (SendText turns a
@@ -3938,11 +4096,22 @@ def create_workflow(name: str, steps: list) -> dict:
         make_shortcut(str(link), str(macro))
     loop_link = make_loop_shortcut(base, disp)   # companion 'loop <disp>' entry (repeats until stopped)
     log(f"workflow | {phrase} | workflows\\{base}.steps.txt")
-    return {"type": "workflow", "phrase": disp, "steps_file": str(steps_file),
-            "stub": str(macro), "shortcut": str(link), "loop_shortcut": loop_link,
-            "step_count": len(steps), "voice_phrase": f"open {disp}",
-            "loop_voice_phrase": f"open loop {disp}", "replaced": replacing,
-            "note": NO_RELOAD_NOTE + " Run it by saying \"open " + disp + "\"."}
+    out = {"type": "workflow", "phrase": disp, "steps_file": str(steps_file),
+           "stub": str(macro), "shortcut": str(link), "loop_shortcut": loop_link,
+           "step_count": len(steps), "voice_phrase": f"open {disp}",
+           "loop_voice_phrase": f"open loop {disp}", "replaced": replacing}
+    note = NO_RELOAD_NOTE + " Run it by saying \"open " + disp + "\"."
+    # A replace touches only the steps file and the stub: the companion hotkey
+    # (and its hand-made Voice Access pairing) and the Start Menu shortcuts
+    # stay. Say which key survived, the way list_automations shows
+    # it ("hotkey", omitted when there is none), so nobody has to list to check.
+    combo = _companion_combos().get(base.lower())
+    if combo:
+        out["hotkey"] = combo
+        note += (f" Its companion hotkey {combo} was kept." if replacing
+                 else f" It answers to the companion hotkey {combo}.")
+    out["note"] = note
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -4035,17 +4204,332 @@ REFERENCES = {
 }
 
 
+# Library references: a function list GENERATED from the library's source on
+# every read (_library_reference), so it can never drift from what the file
+# defines. Only the preamble is written here — the rules that hold for every
+# function, which the source spreads over its long header. Never a hand-kept
+# function list (2026-10-12 feedback: UIA.ahk's functions were discoverable
+# only by reading the source, a snippet call every session).
+LIBRARY_REFERENCES = {
+    "uia": (
+        "lib/UIA.ahk",
+        "Every lib\\UIA.ahk function — signature exactly as defined (with the "
+        "optional &why out-params), a '->' line saying what it returns (the empty "
+        "/ failure value too) and the comment above it, in file order, "
+        "generated from the source on each read. Pre-included in run_ahk_snippet.",
+        "Rules that hold for everything below:\n"
+        "- Never point it at your own process: UIA against a window of the calling "
+        "script deadlocks (no timeout, nothing to catch). UiaFromWindow / UiaFromPoint "
+        "/ UiaFocused refuse one and return \"\". Use it from a hotkey body, a macro or "
+        "run_ahk_snippet — never inside VoiceKit.ahk.\n"
+        "- Nothing throws: a miss is \"\" / 0 / false / an empty array. Every find "
+        "takes a trailing optional &why — \"\" on success, else why it came back empty "
+        "(no match after N ms, window gone, the search failed: <error>). Pass it "
+        "whenever an empty answer would surprise you.\n"
+        "- Elements are ComValue wrappers (VT_UNKNOWN), released automatically. Two "
+        "finds of one control give two wrappers: compare with UiaSameElement, never =.\n"
+        "- UiaRect returns an OBJECT {x, y, w, h}, or \"\" when the element has no "
+        "rectangle (offscreen or virtualized) — check IsObject() before member access.\n"
+        "- Search from the WINDOW (UiaFind*, UiaFindCond, UiaFindAllCond). A FindFirst "
+        "/ FindAll started from a SUB-element can return an element OUTSIDE it in "
+        "Chrome — plausible and wrong; UiaFindFirst / UiaFindElements check and fall "
+        "back to walking (UiaFindFirstWalk). Never ComCall(5/6) raw from a sub-element.\n"
+        "- Web pages virtualize: only content near the viewport is in the tree, so a "
+        "miss may need scrolling (UiaScrollIntoView) or a direct URL.\n"
+        "- A dump or find that depends on page state: UiaTreeFingerprint before and "
+        "after tells \"the page changed\" from \"my find is wrong\" — it is \"\" when "
+        "the walk ran out of time (stats.timeHit: not comparable), and with "
+        "stats.budgetHit covers only the nodes visited.",
+    ),
+    "browser": (
+        "lib/Browser.ahk",
+        "Every lib\\Browser.ahk function (keyboard-driven browser helpers: "
+        "verify the domain before typing, grab page text, type-and-read-back) "
+        "with its signature and return value, "
+        "generated from the source on each read. Pre-included in run_ahk_snippet.",
+        "Rules that hold for everything below:\n"
+        "- It #Includes lib\\UIA.ahk and lib\\Clip.ahk itself, and has UIA.ahk's "
+        "out-of-process rule: a body, a macro or run_ahk_snippet, never VoiceKit.ahk.\n"
+        "- These helpers ACTIVATE the window and send real keystrokes (^l, ^a, ^c, "
+        "Esc, Enter): while one runs the browser owns the keyboard.\n"
+        "- Anything that copies restores the clipboard (lib\\Clip.ahk ClipCapture).\n"
+        "- Failure is \"\" / false, never an exception. After a false from "
+        "BrowserTypeVerified, never press Enter blind.",
+    ),
+}
+
+_DEF_RE = re.compile(r"^([A-Za-z_]\w*)\(")
+_BANNER_RE = re.compile(r"^-{3,}\s*(.*?)\s*-*$")
+
+
+_DEF_MAX_SIG_LINES = 20     # a parameter list may wrap over this many lines
+
+
+def _ahk_strip_comment(text: str) -> str:
+    """`text` without its trailing ';' comment — a ';' at the start or after
+    whitespace, outside quotes (AutoHotkey's rule; '`' escapes inside a
+    quoted string)."""
+    quote, j = "", 0
+    while j < len(text):
+        ch = text[j]
+        if quote:
+            if ch == "`":
+                j += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == ";" and (j == 0 or text[j - 1] in " \t"):
+            return text[:j].rstrip()
+        j += 1
+    return text
+
+
+def _ahk_def_at(lines: list, i: int):
+    """(name, params, arrow_body, last_line) when lines[i] starts a top-level
+    function definition — a name at column 0, a balanced parameter list
+    (which may wrap onto following lines), then '{' (on that line or the
+    next, a trailing ';' comment allowed) or '=>' — else None. arrow_body is
+    the expression of a fat-arrow one-liner ("" for a braced function);
+    last_line is the index of the line holding the definition's '{' or '=>'.
+    Inside a quoted default value '`' escapes the next character, as in
+    AutoHotkey, so `q := "`"("` doesn't unbalance the scan."""
+    m = _DEF_RE.match(lines[i])
+    if not m:
+        return None
+    depth, quote, k = 0, "", i
+    j = m.end() - 1
+    line = lines[i]
+    while True:                                # the matching ')' — quotes respected
+        if j >= len(line):
+            if quote or k - i >= _DEF_MAX_SIG_LINES or k + 1 >= len(lines):
+                return None
+            k += 1                             # the list wraps: join the next line
+            line += "\n" + lines[k]
+            continue
+        ch = line[j]
+        if quote:
+            if ch == "`":
+                j += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == ";" and line[j - 1] in " \t\n":
+            nl = line.find("\n", j)            # a comment inside a wrapped list
+            j = len(line) if nl < 0 else nl
+            continue
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    params = line[m.end():j]
+    if "\n" in params:                         # a wrapped list reads as one line
+        params = " ".join(_ahk_strip_comment(p).strip() for p in params.split("\n"))
+        params = re.sub(r"\s+,", ",", re.sub(r"\(\s+", "(", params)).strip()
+    rest = _ahk_strip_comment(line[j + 1:]).strip()
+    if rest.startswith("=>"):
+        return m.group(1), params, rest[2:].strip(), k
+    if rest.startswith("{"):                   # '{' alone, or a one-line body
+        return m.group(1), params, "", k
+    if rest == "" and k + 1 < len(lines) and _ahk_strip_comment(lines[k + 1]).strip() == "{":
+        return m.group(1), params, "", k + 1
+    return None                                # a top-level CALL, not a definition
+
+
+def _ahk_brace_delta(line: str) -> int:
+    """'{' minus '}' on one code line, ignoring quoted strings and the
+    trailing comment — enough to know when a function body ends."""
+    code, quote, n, j = _ahk_strip_comment(line), "", 0, 0
+    while j < len(code):
+        ch = code[j]
+        if quote:
+            if ch == "`":
+                j += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "{":
+            n += 1
+        elif ch == "}":
+            n -= 1
+        j += 1
+    return n
+
+
+def _comment_text(block: list) -> str:
+    """A ';' comment block as plain text: the ';' gone, common indent removed."""
+    body = [ln.lstrip()[1:].rstrip() for ln in block]
+    ind = min((len(b) - len(b.lstrip()) for b in body if b.strip()), default=0)
+    return "\n".join(b[ind:] for b in body).strip("\n")
+
+
+def _returns_sentence(doc: str) -> str:
+    """The text of a function doc's 'Returns ...' sentence, without the word
+    'Returns': it starts on the first line that begins 'Returns ' and runs to
+    the first line ending in '.', a blank line or the end of the doc, joined
+    onto one line. "" when the doc has no such line. lib\\UIA.ahk and
+    lib\\Browser.ahk give every public function one (the conformance test
+    test_library_functions_state_what_they_return enforces it)."""
+    out = []
+    for ln in doc.split("\n"):
+        t = ln.strip()
+        if not out:
+            if t.startswith("Returns "):
+                out.append(t[len("Returns "):])
+                if t.endswith("."):
+                    break
+            continue
+        if not t:
+            break
+        out.append(t)
+        if t.endswith("."):
+            break
+    return " ".join(out)
+
+
+def _library_reference(rel: str, preamble: str) -> tuple:
+    """(text, function_count) for a library file: every top-level function
+    definition in file order — its signature exactly as written, a
+    '-> <what it returns>' line taken from the doc's 'Returns ...' sentence
+    (_returns_sentence), then the whole comment block directly above it —
+    with section banners ('; ---- x ----') as headings and loose comment
+    blocks between functions kept as notes. The file's '; ====' header is
+    left out (the preamble says the rules)."""
+    path = REPO_ROOT / rel
+    lines = _lf(_read_text_any(path)).split("\n")
+    out = [f"lib\\{Path(rel).name} — generated from the source when read, so it "
+           f"matches this install exactly.", "", preamble, ""]
+    count, block = 0, []
+
+    def flush_loose(blk):
+        # A comment block NOT directly above a definition: a banner (heading)
+        # and/or a note. The file header is skipped, and so is the body of a
+        # COM vtable-slot table (its banner says "vtable"): that is how the
+        # file calls ComCall, not how a caller uses it — its first banner
+        # still heads the functions that follow.
+        if not blk or any(re.match(r"^;\s*={5,}", b) for b in blk):
+            return
+        first = _BANNER_RE.match(blk[0].lstrip()[1:].strip())
+        if first and "vtable" in first.group(1).lower():
+            # (Outside the f-string: a backslash in one is a syntax error
+            # before Python 3.12.)
+            title = re.sub(r"\s*\([^)]*vtable[^)]*\)", "", first.group(1))
+            out.extend(["", f"== {title} =="])
+            return
+        emit_block(blk, as_doc=False)
+
+    def emit_block(blk, as_doc):
+        # Banner lines become headings, in place; the rest is text — a note
+        # (loose block) goes out as is, a function's doc is returned for the
+        # caller to indent under its signature.
+        text_lines, docs = [], []
+
+        def text_done():
+            if text_lines:
+                t = _comment_text(text_lines)
+                text_lines.clear()
+                if t and as_doc:
+                    docs.append(t)
+                elif t:
+                    out.extend([t, ""])
+        for b in blk:
+            bm = _BANNER_RE.match(b.lstrip()[1:].strip())
+            if bm:
+                text_done()
+                out.extend(["", f"== {bm.group(1) or 'section'} =="])
+            else:
+                text_lines.append(b)
+        text_done()
+        return "\n\n".join(docs)
+
+    body, skip_to = 0, -1                      # brace depth inside a function body
+    for i, line in enumerate(lines):
+        if i <= skip_to:                       # the rest of a wrapped signature
+            continue
+        d = _ahk_def_at(lines, i) if line[:1].strip() and line[:1] not in ";}" else None
+        if body > 0 and not d:
+            # Inside a body: a column-0 comment there is the function's own
+            # note, not a doc or a loose note. A column-0 '}' always closes
+            # (house style), so a miscounted brace can't swallow the file.
+            body = 0 if line.startswith("}") else body + _ahk_brace_delta(line)
+            continue
+        body = 0
+        if line.startswith(";"):               # top-level comments are at column 0
+            block.append(line)
+            continue
+        if d:
+            name, params, arrow, last = d
+            skip_to = last
+            if not arrow:
+                body = sum(_ahk_brace_delta(lines[x]) for x in range(i, last + 1))
+            doc = emit_block(block, as_doc=True) if block else ""
+            block = []
+            sig = f"{name}({params})" + (f" => {arrow}" if arrow else "")
+            count += 1
+            if arrow and not params.strip():
+                # A constant: its group's comment reads as a lead-in, then
+                # one compact line per value.
+                if doc:
+                    out.extend([doc, ""] if out[-1] == "" else ["", doc, ""])
+                out.append(sig)
+            else:
+                if out[-1] != "":
+                    out.append("")
+                out.append(sig)
+                ret = _returns_sentence(doc) if doc else ""
+                if ret:
+                    out.append("    -> " + ret)
+                if doc:
+                    out.extend("    " + ln if ln else "" for ln in doc.split("\n"))
+            continue
+        if block:                              # a blank or code line ends a loose block
+            flush_loose(block)
+            block = []
+    flush_loose(block)
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip() + "\n"
+    return text, count
+
+
+def _reference_names() -> list:
+    return sorted(set(REFERENCES) | set(LIBRARY_REFERENCES))
+
+
 def read_reference(name: str = "") -> dict:
-    """A worked example to copy, or the catalogue when asked for nothing."""
+    """A worked example to copy, a library's generated function reference, or
+    the catalogue when asked for nothing."""
     if not (name or "").strip():
-        return {"references": [{"name": k, "description": v[1]}
-                               for k, v in REFERENCES.items()],
-                "note": "Call again with a name to get the code."}
+        cat = [{"name": k, "kind": "example", "description": v[1]}
+               for k, v in REFERENCES.items()]
+        cat += [{"name": k, "kind": "library", "description": v[1]}
+                for k, v in LIBRARY_REFERENCES.items()]
+        return {"references": cat,
+                "note": "Call again with a name to get the code (an example) or the "
+                        "function reference (a library)."}
     key = name.strip().lower()
+    if key in LIBRARY_REFERENCES:
+        rel, desc, preamble = LIBRARY_REFERENCES[key]
+        path = REPO_ROOT / rel
+        if not path.exists():
+            raise VoiceKitError(f"The '{key}' reference is missing from this install ({rel}).")
+        text, count = _library_reference(rel, preamble)
+        return {"name": key, "kind": "library", "description": desc, "file": str(path),
+                "functions": count, "code": text,
+                "note": ("Generated from the library source just now. Under each "
+                         "signature, '->' is what it returns (the empty / failure "
+                         "value and any &out-param included). Signatures are "
+                         "exactly as defined: ':=' marks an optional parameter, '&' a "
+                         "ByRef out-param (pass &var, e.g. UiaFindAll(hwnd, \"OK\", 3000, "
+                         "0, &why)). Pre-included in run_ahk_snippet; a body "
+                         "#Includes it from ..\\..\\lib\\.")}
     if key not in REFERENCES:
         raise VoiceKitError(
             f"No reference called '{name}'. Available: "
-            f"{', '.join(sorted(REFERENCES))} (call with no name for the catalogue).")
+            f"{', '.join(_reference_names())} (call with no name for the catalogue).")
     rel, desc = REFERENCES[key]
     path = REPO_ROOT / rel
     if not path.exists():
@@ -4367,16 +4851,38 @@ def inspect_focus() -> dict:
     return out
 
 
+DUMP_MAX_DEPTH = 100     # cap on dump_uia_tree's max_depth (was 25 until
+                         # 2026-10-12: a tax-software page's inputs sat deeper,
+                         # and the depth cap silently became "nothing there").
+                         # The node budget, time cap and max_lines bound the walk.
+
+
 def dump_uia_tree(window: str | None = None, max_depth: int = 8,
                   name_filter: str | None = None, max_lines: int = 300) -> dict:
     """A window's UIA tree as an indented text outline — 'what am I looking at'.
 
     Read-only, same probe as inspect_focus. `window` is an AutoHotkey WinTitle
     (empty = the active window); the probe matches titles as substrings. The
-    walk is bounded (depth, output lines, visited-node budget), so a browser's
-    enormous tree costs a capped report, never a stall.
+    walk is bounded (depth, output lines, visited-node budget, a time cap), so
+    a browser's enormous tree costs a capped report, never a stall — and a
+    report that was cut short SAYS so (`note`), above all when a name_filter
+    matched nothing: an incomplete walk is not "nothing there".
+
+    `nodes` / `cut_at_depth` / `budget_hit` / `fingerprint` describe the walk
+    (lib\\UIA.ahk UiaDumpTree's stats). The fingerprint covers every visited
+    node and ignores name_filter and max_lines, so two calls on the same
+    window at the same max_depth agree unless the content changed — even
+    when the window title didn't. Only a walk that ended on its own is
+    comparable: a time-cut walk (time_hit) has NO fingerprint (where a slow
+    provider stops varies call to call), and a budget-cut one covers only
+    the first nodes — the note says which.
+
+    Cost: the walk doesn't stop at max_lines (that is what makes the counts
+    and the fingerprint whole), so an unfiltered dump of a big page walks
+    to the node budget or the time cap — seconds, not milliseconds. Lower
+    max_depth for a quick look.
     """
-    max_depth = max(1, min(_as_int(max_depth, 8), 25))
+    max_depth = max(1, min(_as_int(max_depth, 8), DUMP_MAX_DEPTH))
     max_lines = max(1, min(_as_int(max_lines, 300), 2000))
     txt = _run_uia_probe(
         ["tree", window or "", max_depth, max_lines, name_filter or ""])
@@ -4388,10 +4894,75 @@ def dump_uia_tree(window: str | None = None, max_depth: int = 8,
            "window_class": rec.get("window_class", ""),
            "window_exe": rec.get("window_exe", ""),
            "lines": _as_int(rec.get("lines"), 0),
+           "nodes": _as_int(rec.get("visited"), 0),
+           "cut_at_depth": _as_int(rec.get("cut_at_depth"), 0),
+           "budget_hit": rec.get("budget_hit") == "1",
+           "fingerprint": rec.get("fingerprint", ""),
            "tree": tree.rstrip("\n")}
-    if out["lines"] >= max_lines:
-        out["note"] = ("Output hit the max_lines cap — raise max_lines, lower "
-                       "max_depth, or set name_filter to narrow it.")
+    if rec.get("time_hit") == "1":
+        out["time_hit"] = True
+        out["fingerprint"] = ""     # not reproducible — see the note
+    note = _dump_note(out, max_depth, max_lines, name_filter,
+                      lines_hit=rec.get("lines_hit") == "1")
+    if note:
+        out["note"] = note
+    return out
+
+
+def _dump_note(out: dict, max_depth: int, max_lines: int, name_filter: str | None,
+               lines_hit: bool = False) -> str:
+    """The plain-words verdict on how complete a dump_uia_tree walk was.
+
+    Empty when nothing was cut. The reason this exists (2026-10-12): a dump
+    capped at depth 25 showed a form's inputs as empty groups and a filtered
+    dump came back with zero lines and no warning, which read as "the field
+    isn't there"."""
+    parts = []
+    cut, nodes = out.get("cut_at_depth", 0), out.get("nodes", 0)
+    incomplete = bool(cut or out.get("budget_hit") or out.get("time_hit"))
+    if name_filter and out.get("lines", 0) == 0:
+        if incomplete:
+            parts.append(f"name_filter {name_filter!r} matched nothing — but the walk was "
+                         f"INCOMPLETE, so that does not mean it isn't there:")
+        else:
+            parts.append(f"name_filter {name_filter!r} matched nothing in the complete walk "
+                         f"({nodes} nodes) — it isn't in the tree right now (web pages "
+                         f"virtualize: scroll it into view, then dump again).")
+    if cut:
+        parts.append(f"{cut} subtree{'s were' if cut != 1 else ' was'} cut off at "
+                     f"max_depth={max_depth} — the match may be deeper; raise max_depth"
+                     + (f" (up to {DUMP_MAX_DEPTH})." if max_depth < DUMP_MAX_DEPTH else
+                        "; at the cap, search in a snippet (UiaFindAll / UiaFindEdit) "
+                        "instead."))
+    if out.get("budget_hit"):
+        parts.append(f"The walk stopped at its node budget ({nodes} nodes) — later parts "
+                     f"of the tree were not visited; lower max_depth to spend it higher "
+                     f"up, or search in a snippet (UiaFindAll) instead.")
+    if out.get("time_hit"):
+        parts.append(f"The walk stopped at its time limit after {nodes} nodes — the "
+                     f"window answers slowly; the rest of the tree was not visited. No "
+                     f"fingerprint: where a slow walk stops varies from call to call, so "
+                     f"it could not be compared; lower max_depth so the walk completes.")
+    elif out.get("budget_hit") and out.get("fingerprint"):
+        parts.append(f"The fingerprint covers only those first {nodes} nodes — a change "
+                     f"further on won't show in it.")
+    if lines_hit or out.get("lines", 0) >= max_lines:
+        parts.append("Output hit the max_lines cap — raise max_lines, lower "
+                     "max_depth, or set name_filter to narrow it.")
+    return " ".join(parts)
+
+
+def _companion_combos(entries: list | None = None) -> dict:
+    """{parent base, lowercased: combo} for every companion hotkey in the
+    bridge map — the one fold list_automations and create_workflow's
+    "hotkey" both read, so the two can't disagree about an automation's key."""
+    if entries is None:
+        entries = get_bridge_map()["entries"]
+    out = {}
+    for e in entries:
+        parent = _companion_parent(e["file"])
+        if parent:
+            out[parent.lower()] = e["combo"]
     return out
 
 
@@ -4402,14 +4973,11 @@ def list_automations() -> dict:
     (+ expansion), and VoiceKit's own tools. An automation the user gave a
     companion hotkey (the home window's Hotkey button) carries it as
     "hotkey" on its own entry — the companion module isn't listed twice."""
-    combos = {e["file"]: e for e in get_bridge_map()["entries"]}
+    entries = get_bridge_map()["entries"]
+    combos = {e["file"]: e for e in entries}
     # Companion hotkeys fold into their automation's entry (mirrors the
     # home window) instead of listing as modules of their own.
-    companion_combo = {}
-    for file, e in combos.items():
-        parent = _companion_parent(file)
-        if parent:
-            companion_combo[parent.lower()] = e["combo"]
+    companion_combo = _companion_combos(entries)
 
     def _with_hotkey(entry: dict) -> dict:
         combo = companion_combo.get(entry["base"].lower())
@@ -4577,7 +5145,8 @@ def _workflow_file_args(args: list[str]) -> list[str]:
 
 
 # Fields where the engine resolves {{Name}} (lib\Workflow.ahk WfStepSubstText):
-# "a" = paramA, "b" = paramB (read_workflow's keys).
+# "a" = paramA, "b" = paramB (read_workflow's keys). A `module` step has none:
+# which program a run starts is fixed when the workflow is written.
 _SUBST_FIELDS = {**{t: ("a",) for t in ("text", "keys", "run", "waitwin", "move", "close", "drag")},
                  **{t: ("a", "b") for t in ("focus", "click", "dblclick", "rclick", "hover",
                                              "if", "waitfor")},
@@ -4607,7 +5176,7 @@ def _workflow_uses_selected_file(base: str) -> bool:
 
 
 def run_automation(name: str, wait_seconds: int = 0, args: list | None = None,
-                   test: bool = False) -> dict:
+                   test: bool = False, dry_run: bool = False) -> dict:
     """Trigger any spoken automation (workflow, launch macro, AI action, or
     VoiceKit tool) by launching its macro — the same thing Voice Access does
     when the user says 'open <name>', including the working directory (the
@@ -4650,11 +5219,29 @@ def run_automation(name: str, wait_seconds: int = 0, args: list | None = None,
     keystrokes, clicks, emails) really happen. Refused for Workflow Studio,
     VoiceKit's own tools, 'loop <name>', a workflow that asks for input, and
     a macro with a dialog-mode #Warn line. The pattern: a fixture under
-    %TEMP% passed in args, test=True, and VkResult for what to check."""
+    %TEMP% passed in args, test=True, and VkResult for what to check.
+
+    dry_run=True (implies test=True) — the same quiet run under
+    lib\\DryRunShim.ahk: keystrokes, clicks, mouse moves and control writes
+    (Send*, Click, MouseClick/Drag/Move, ControlSend/SendText/Click/SetText/
+    Focus/SetChecked/ChooseIndex/ChooseString, EditPaste) and lib\\UIA.ahk's
+    UiaSetValue / UiaInvoke / UiaFocus are LOGGED instead of performed and
+    come back in order as `actions` (a paste records the clipboard it would
+    have pasted). For a workflow their typed text is withheld like its
+    popups (lengths only). NOT covered: what the script Run()s, its file
+    and clipboard writes, window commands, and COM / DllCall it makes
+    itself — VkDryRun() is true in the script so it can skip those.
+
+    test / dry_run also take the name of an ISOLATED hotkey module: its body
+    (hotkeys\\bodies\\<Base>.body.ahk) runs directly under the shim in its
+    own folder. Refused for a module that runs inside VoiceKit (isolate=
+    False), for a body that is already running, and without test/dry_run
+    (press_hotkey triggers a module for real)."""
     phrase, base = _require_name(name)
     argv = _run_args(args)
     arg_tokens = _input_tokens(argv)        # remembered past the call (_remember_tokens)
-    test = bool(test)
+    dry_run = bool(dry_run)
+    test = bool(test) or dry_run
     macro = _macro_file(base)
     if macro.exists():
         if test and base.lower() == "workflowstudio":
@@ -4692,7 +5279,7 @@ def run_automation(name: str, wait_seconds: int = 0, args: list | None = None,
         # script using relative paths behaves the same here as by voice.
         if test:
             r = _test_run(macro, argv, wait_seconds, is_workflow, space_out(base),
-                          tokens=arg_tokens)
+                          tokens=arg_tokens, dry_run=dry_run)
         else:
             r = _launch_and_report([AHK_EXE, str(macro), *argv], space_out(base), str(macro),
                                    wait_seconds, cwd=str(macro.parent), tokens=arg_tokens)
@@ -4712,6 +5299,10 @@ def run_automation(name: str, wait_seconds: int = 0, args: list | None = None,
                 r["ok"] = False
                 r["note"] = test_note
         return r
+    # An isolated hotkey module, by name: its body under the test shims.
+    mod_base = _run_module_target(name, base)
+    if mod_base:
+        return _run_module_test(mod_base, argv, wait_seconds, test, dry_run, arg_tokens)
     # 'loop <name>': the workflow's loop companion (same target as its
     # 'loop <name>.lnk' — lib\LoopRunner.ahk resolves the steps file itself).
     if phrase.lower().startswith("loop ") and phrase[5:].strip():
@@ -5000,15 +5591,68 @@ def _refuse_untestable(macro: Path, base: str, is_workflow: bool) -> None:
 _WITHHELD_TEXT = ("(withheld — the workflow engine's popup text can carry filled-in values; "
                   "`run` says what happened, with values as written)")
 
+# What a dry run does NOT stop — said in every dry-run reply, even one that
+# logged no action (a script whose only effects are these got no warning).
+_DRY_NOT_COVERED = ("Not covered (these really happen, if the script does them): what it "
+                    "Run()s, file and clipboard writes, window commands (WinActivate, "
+                    "WinClose...), PostMessage/SendMessage, and its own COM/DllCall.")
+
+# A workflow's module step runs a body under the same shim and test log; an
+# uncaught error THERE is the body's, not the run's (TestShim's record names
+# its script), and its text — like everything a workflow's run shows — may
+# hold a filled-in value: only its type and line come back.
+_WITHHELD_ERROR = ("(withheld — in a workflow run an error's text can carry filled-in "
+                   "values; `run` says which step failed)")
+
+# Dry runs (2026-10-12): lib\DryRunShim.ahk writes one {"kind":"input",...}
+# record per keystroke / click / control write / UIA action it intercepted.
+ACTION_CAP_RECORDS = 200          # dry-run actions returned per run
+TEST_LOG_CAP_RECORDS = 5000         # test-log records parsed per run (dialogs + actions)
+# A workflow's typed text, control text and clipboard are its filled-in
+# values — withheld exactly like its popups. Only these fields survive, and
+# keys/text become their lengths: a whitelist, so a field added to the shim
+# later stays withheld until someone decides otherwise.
+_WORKFLOW_ACTION_FIELDS = ("fn", "button", "count", "x", "y", "x2", "y2", "coordmode",
+                           "relative", "updown", "process", "type", "index", "setting",
+                           "clipboard_len")
+_WITHHELD_ACTIONS = ("A workflow's typed text, control text and clipboard are withheld (they "
+                     "are filled-in values) — keys_len / text_len / clipboard_len give their "
+                     "lengths; `run` says which step did what, with values as written.")
+
+
+def _dry_action(rec: dict, is_workflow: bool) -> dict:
+    """One dry-run record as an `actions` entry: fn first, no `kind`, text
+    capped — or, for a workflow, only the whitelisted fields, with keys and
+    text as their lengths."""
+    out: dict = {"fn": str(rec.get("fn", ""))}
+    for k, v in rec.items():
+        if k in ("kind", "fn"):
+            continue
+        if is_workflow:
+            if k in ("keys", "text"):
+                out[f"{k}_len"] = len(str(v))
+                continue
+            if k not in _WORKFLOW_ACTION_FIELDS:
+                continue
+        out[k] = v if isinstance(v, (int, float)) else str(v)[:DIALOG_TEXT_CAP]
+    return out
+
 
 def _test_run(macro: Path, argv: list[str], wait_seconds, is_workflow: bool,
-              launched: str, tokens: tuple = ()) -> dict:
+              launched: str, tokens: tuple = (), dry_run: bool = False) -> dict:
     """run_automation(test=True): the macro under lib\\TestShim.ahk, bounded
-    and killed on timeout (see the section comment)."""
-    shim = REPO_ROOT / "lib" / "TestShim.ahk"
-    if not shim.is_file():
-        raise VoiceKitError(f"Test mode needs {shim}, which is missing — reinstall VoiceKit "
-                            f"(Install-VoiceKit.cmd) to restore it.")
+    and killed on timeout (see the section comment). dry_run=True loads
+    lib\\DryRunShim.ahk instead — it #Includes TestShim itself, because
+    AutoHotkey takes only ONE /include switch (measured 2026-10-12: two exit
+    2 with no output and run nothing)."""
+    shims = [REPO_ROOT / "lib" / "TestShim.ahk"]
+    if dry_run:
+        shims.append(REPO_ROOT / "lib" / "DryRunShim.ahk")
+    for shim in shims:
+        if not shim.is_file():
+            raise VoiceKitError(f"{'Dry-run' if dry_run else 'Test'} mode needs {shim}, which is "
+                                f"missing — reinstall VoiceKit (Install-VoiceKit.cmd) to restore it.")
+    shim = shims[-1]
     asked = _as_int(wait_seconds, 0)
     if asked > 0:
         wait, capped = _cap_wait(asked, "wait_seconds", 0, "test a shorter piece, or run it "
@@ -5029,6 +5673,7 @@ def _test_run(macro: Path, argv: list[str], wait_seconds, is_workflow: bool,
         shutil.rmtree(folder, ignore_errors=True)
         raise VoiceKitError(f"Couldn't start AutoHotkey for the test run: {e}") from None
     res: dict = {"launched": launched, "file": str(macro), "test": True,
+                 **({"dry_run": True} if dry_run else {}),
                  "finished": r["exit_code"] is not None, "exit_code": r["exit_code"],
                  "timed_out": r["timed_out"], "killed": r["killed"],
                  "duration_s": r["duration_s"]}
@@ -5053,19 +5698,62 @@ def _test_run(macro: Path, argv: list[str], wait_seconds, is_workflow: bool,
         res["load_errors"] = _explain_ahk_error(load_errors, script=macro)
     if warnings:
         res["warnings"] = warnings
-    records, total = _read_json_lines(log_p, DIALOG_CAP_RECORDS + 1)
+    # EVERY line is read, not the first TEST_LOG_CAP_RECORDS: the uncaught
+    # error's record is written LAST (TestShim, just before it ends the
+    # process), so a long dry run (thousands of Send records) would lose it,
+    # and the action count would be understated. Past the caps a line is
+    # only counted — parsed only when it could be that error record.
+    try:
+        log_text = log_p.read_bytes().decode("utf-8-sig", "replace")
+    except OSError:
+        log_text = ""
     shutil.rmtree(folder, ignore_errors=True)
-    dialogs, uncaught = [], None
-    for rec in records:
+    dialogs, uncaught, actions, module_errors = [], None, [], []
+    n_dialogs = n_actions = parsed = 0
+    for line in log_text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if parsed >= TEST_LOG_CAP_RECORDS or (
+                len(actions) >= ACTION_CAP_RECORDS and '"kind":"input"' in line):
+            if '"kind":"input"' in line:
+                n_actions += 1
+                continue
+            if '"kind":"error"' not in line:
+                n_dialogs += 1
+                continue
+        parsed += 1
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
         if not isinstance(rec, dict):
             continue
         kind = str(rec.get("kind", ""))
-        if kind == "error":
-            uncaught = {k: rec[k] for k in ("type", "message", "extra", "file", "line", "what",
-                                             "stack") if rec.get(k) not in (None, "")}
-            if "line" in uncaught:
-                uncaught["line"] = _as_int(uncaught["line"])
+        if kind == "input":
+            n_actions += 1
+            if len(actions) < ACTION_CAP_RECORDS:
+                actions.append(_dry_action(rec, is_workflow))
             continue
+        if kind == "error":
+            err = {k: rec[k] for k in ("type", "message", "extra", "file", "line", "what",
+                                       "stack") if rec.get(k) not in (None, "")}
+            if "line" in err:
+                err["line"] = _as_int(err["line"])
+            if is_workflow:
+                for k in ("message", "extra", "stack"):
+                    if k in err:
+                        err[k] = _WITHHELD_ERROR
+            script = str(rec.get("script", ""))
+            if script and not _same_path(script, macro):
+                # A module step's body (it shares the log): its error failed
+                # that step, not the run's own script.
+                err["script"] = Path(script).name
+                module_errors.append(err)
+            else:
+                uncaught = err
+            continue
+        n_dialogs += 1
         if len(dialogs) >= DIALOG_CAP_RECORDS:
             continue
         d = {"kind": kind, "title": str(rec.get("title", "")),
@@ -5081,10 +5769,19 @@ def _test_run(macro: Path, argv: list[str], wait_seconds, is_workflow: bool,
             d.pop("default", None)
         dialogs.append(d)
     res["dialogs"] = dialogs
-    if total > DIALOG_CAP_RECORDS + 1:
-        res["dialogs_truncated"] = f"{total} records in all — the first {len(dialogs)} are shown."
+    if n_dialogs > len(dialogs):
+        res["dialogs_truncated"] = f"{n_dialogs} records in all — the first {len(dialogs)} are shown."
+    if dry_run:
+        res["actions"] = actions
+        if n_actions > len(actions):
+            res["actions_truncated"] = (f"{n_actions} actions in all — the first "
+                                        f"{len(actions)} are shown.")
+        if is_workflow and actions:
+            res["actions_withheld"] = _WITHHELD_ACTIONS
     if uncaught:
         res["uncaught_error"] = uncaught
+    if module_errors:
+        res["module_errors"] = module_errors[:DIALOG_CAP_RECORDS]
     res["ok"] = (r["exit_code"] == 0 and not uncaught and not load_errors
                  and not r["timed_out"] and not r["cancelled"])
     notes = []
@@ -5106,14 +5803,121 @@ def _test_run(macro: Path, argv: list[str], wait_seconds, is_workflow: bool,
         notes.append(f"Exited with code {r['exit_code']}.")
     else:
         notes.append("Finished cleanly.")
+    if module_errors:
+        notes.append(f"A module step's body hit an uncaught error ({len(module_errors)}; "
+                     f"module_errors gives its script, type and line) — that step failed, "
+                     f"and `run` says which.")
     if dialogs:
         notes.append(f"{len(dialogs)} dialog(s)/notification(s) suppressed — `dialogs` lists "
                      f"them with what each returned to the macro.")
+    if dry_run:
+        notes.append((f"Dry run: {n_actions} keyboard/mouse/control/UIA action(s) logged instead "
+                      f"of sent (`actions`) — nothing was typed or clicked. A step that checks "
+                      f"an action's effect (a read-back, a wait for a window) sees the screen "
+                      f"unchanged." if n_actions else
+                      "Dry run: it made no keyboard/mouse/control/UIA action at all.")
+                     + " " + _DRY_NOT_COVERED)
     if r["left_running"]:
         notes.append(f"It left {len(r['left_running'])} process(es) running (left_running) — "
                      f"something it Run() on purpose, which test mode doesn't stop.")
     res["note"] = " ".join(notes)
     return res
+
+
+# ---------------------------------------------------------------------------
+# Test / dry runs of an isolated hotkey module (2026-10-12)
+#
+# From a session that shipped a paste sequence untested end to end: a body
+# could only be run by pressing its key — for real, into a live client
+# return. run_automation(test=True / dry_run=True) now takes a module's name
+# and runs its BODY directly under the shims, in the body's folder, with the
+# same result / dialog / actions channels as a macro. Only an isolated
+# module: an isolate=False one is code inside VoiceKit.ahk, with no script of
+# its own to run.
+# ---------------------------------------------------------------------------
+def _run_module_target(name: str, base: str) -> str:
+    """The module base run_automation should run for `name`, or "" when it
+    names no hotkey module. Resolved like read_hotkey_module (the module's
+    own name) and resolve_bridge (its voice phrase) — but never a bare key
+    letter, which would let a typo run some module, nor a companion hotkey
+    (that one's name is its automation's, a macro found earlier)."""
+    if base.lower() not in RESERVED_MODULE_BASES and _module_file(base).exists():
+        return base
+    if len(name.strip()) <= 1:
+        return ""
+    try:
+        hit = resolve_bridge(name)
+    except VoiceKitError:
+        return ""
+    m = re.match(r"(?i)^hotkeys\\([^\\]+)\.ahk$", hit["module"])
+    if not m or _companion_parent(hit["module"]):
+        return ""
+    found = m.group(1)
+    if found.lower() in RESERVED_MODULE_BASES or not _module_file(found).exists():
+        return ""
+    return found
+
+
+def _body_mutex_held(base: str) -> bool:
+    """Whether a run of the body holds BodySingleInstance's mutex
+    (lib\\_Common.ahk: "Local\\VoiceKitBody_" + the base with every
+    character outside [A-Za-z0-9_-] removed — AutoHotkey's \\w is ASCII)."""
+    if os.name != "nt":
+        return False
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenMutexW.restype = wintypes.HANDLE
+    k.OpenMutexW.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
+    k.CloseHandle.argtypes = (wintypes.HANDLE,)
+    name = "Local\\VoiceKitBody_" + re.sub(r"[^\w\-]", "", base, flags=re.ASCII)
+    h = k.OpenMutexW(_SYNCHRONIZE, False, name)
+    if not h:
+        # ERROR_ACCESS_DENIED: it exists, held by a process we may not open
+        # (an elevated body) — that is still "running".
+        return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+    k.CloseHandle(h)
+    return True
+
+
+def _run_module_test(base: str, argv: list[str], wait_seconds, test: bool, dry_run: bool,
+                     tokens: tuple) -> dict:
+    """run_automation(<module name>, test=True | dry_run=True): the isolated
+    module's body under the shims (see the section comment)."""
+    disp = space_out(base)
+    if not test:
+        raise VoiceKitError(
+            f"'{disp}' is a hotkey module, not a spoken automation — press_hotkey('{disp}') "
+            f"triggers it for real. To try its body without the user's desktop seeing "
+            f"dialogs, pass test=True; to also log its keystrokes and clicks instead of "
+            f"sending them, dry_run=True.")
+    body = REPO_ROOT / _body_rel(base)
+    if not body.exists():
+        raise VoiceKitError(
+            f"'{disp}' runs inside the resident VoiceKit (isolate=False), so there is no "
+            f"script of its own to test-run — only an isolated module's body "
+            f"(hotkeys\\bodies\\<Base>.body.ahk) can be. press_hotkey triggers it for real; "
+            f"recreating it with isolate=True (create_hotkey_module, same name — the key and "
+            f"its Voice Access pairing are kept) makes it testable.")
+    # The body's own guards would end the test instance at once and read as a
+    # clean pass: BodySingleInstance exits 0 when the mutex is taken, and
+    # #SingleInstance Ignore leaves quietly (Force would kill the user's run).
+    if _body_mutex_held(base) or any(p["base"].lower() == base.lower()
+                                     for p in _body_processes()):
+        raise VoiceKitError(
+            f"'{disp}' is running right now (list_running shows it). A test run of the same "
+            f"body would exit at once on its single-instance guard and look like a pass. "
+            f"Wait for it to finish, or stop_module('{disp}') first.")
+    argv = [expand_user_paths(a) for a in argv]
+    _refuse_untestable(body, base, False)
+    r = _test_run(body, argv, wait_seconds, False, disp, tokens=tokens, dry_run=dry_run)
+    r["module"] = True
+    key = _module_bridge_key(base)
+    if key:
+        r["hotkey"] = f"Ctrl+Alt+Shift+{key}"
+    if argv:
+        r["args"] = argv
+    return r
 
 
 # ---------------------------------------------------------------------------

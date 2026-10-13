@@ -23,7 +23,7 @@ names each one, so a new tool can't ship undocumented.
 | `create_hotkey_module` | A hotkey module on a `Ctrl+Alt+Shift+<key>` (auto-allocated, or pick one with `key=`); by default an isolated body in `hotkeys\bodies\` that runs in its own process. On an existing name it **replaces in place** and keeps the registered key. Returns the one-time Voice Access pairing steps. |
 | `read_hotkey_module`, `edit_hotkey_module`, `update_hotkey_module` | Read a module's current code (the body, for an isolated module), splice one exact-match change, or replace the file in full (verbatim — what `read` returns is what `update` writes). Every write is load-checked and rolled back on failure, the overwritten text is banked for undo (`previous=True`), and the module's assigned key — with its hand-made Voice Access pairing — is always kept. |
 | `create_snippet` | A hotstring in `hotkeys\Snippets.ahk` (e.g. `/addr` → your address). |
-| `create_workflow` | The recorder's output, **authored** instead of recorded: `workflows\<Name>.steps.txt` + generated stub + shortcut + `loop <name>` companion. Replacing an existing workflow is rolled back to the previous version if the new one fails its check. |
+| `create_workflow` | The recorder's output, **authored** instead of recorded: `workflows\<Name>.steps.txt` + generated stub + shortcut + `loop <name>` companion. Replacing an existing workflow is rolled back to the previous version if the new one fails its check; a replace keeps the companion hotkey and returns it as `hotkey`. |
 | `delete_automation` | Remove an automation and all its artifacts (companion hotkey, sheets, backups included). VoiceKit's own tools, Split Pages and `Snippets` are protected. |
 
 **Inspect (read-only)**
@@ -34,8 +34,8 @@ names each one, so a new tool can't ship undocumented.
 | `read_workflow`, `get_bridge_map` | A workflow's steps; the hotkey registry with free and reserved keys. |
 | `read_workflow_sheet` | A workflow's inputs sheet and results overflow as columns/rows, plus `last_run` — how collected values come back after a batch. |
 | `read_log` | The tail of `activity` (created.log), `errors` (errors.log — uncaught errors from any VoiceKit script) or `runs` (workflow-runs.log), optionally filtered. |
-| `read_reference` | Worked example code to copy (currently `web-scrape`, a complete scraper body). |
-| `inspect_focus`, `dump_uia_tree` | What has keyboard focus, and a window's UI Automation tree as an outline — the real on-screen names to use in a workflow or a module's `UiaFind`. Out-of-process probes; nothing is clicked. |
+| `read_reference` | Worked example code to copy (`web-scrape`, a complete scraper body), or a library's function reference (`uia`, `browser`) — every signature and its comment, generated from the source on each read. |
+| `inspect_focus`, `dump_uia_tree` | What has keyboard focus, and a window's UI Automation tree as an outline — the real on-screen names to use in a workflow or a module's `UiaFind`. The dump says when its walk was cut (`cut_at_depth`, `budget_hit`, a plain-words `note`) and carries a `fingerprint` that changes when the page does, even under the same title. Out-of-process probes; nothing is clicked. |
 | `list_running`, `read_module_status` | Which module bodies are executing now (pid, start time, latest status line); one module's status line joined to whether its process is actually alive. |
 | `list_processes` | Every running process (or those whose image name contains `name`): pid, parent pid, image, start time, command line, and a `voicekit` tag on VoiceKit's own — this MCP server, other server instances, the master, module bodies, macros, loops, snippets, `run_process` runs and background jobs. `python.exe` includes this server itself, so check your own program by pid or job id. |
 | `server_info` | Which VoiceKit server you are talking to: version, install root, Python, pid and start time, whether its code changed since it started, every other VoiceKit `server.py` process running, and each client config that registers VoiceKit (command + args, never `env`); `connected_client` (the MCP client of this session) and `same_client_duplicates` (registrations ONE client loads twice — the real problem; one per client is normal). The first call when tools show up twice or one seems missing. |
@@ -46,7 +46,7 @@ names each one, so a new tool can't ship undocumented.
 
 | Tool | Does |
 |------|------|
-| `run_automation` | **Trigger** any spoken automation now — the MCP equivalent of "open \<name\>". `loop <name>` starts a workflow's loop companion. Optional `wait_seconds` to wait and report the outcome (read from the run record, never guessed from an exit code). Optional `args` are the script's command-line arguments (an argv list, no shell); for a workflow they must be existing files and stand in for the File Explorer selection, so a selected-file workflow can be tested on a fixture. Runs in the macro's folder, like the voice shortcut. Any run it waits on returns `result` — the values the macro passed to `VkResult(value)` — and its `stdout` / `stderr` (the launched macro's alone: a program it starts inherits the variables, but `VkResult`/`VkTestMode` ignore them there). **`test=True`** is a quiet test run: MsgBox / TrayTip / InputBox / ToolTip / file pickers are returned in `dialogs` instead of shown — MsgBox answers its default button (what Enter would), InputBox, FileSelect and DirSelect are **cancelled**, ToolTip returns a real but invisible window; the macro's own `OnError` handlers run, an error none of them handles comes back as `uncaught_error` with no dialog (exit 3; its `OnExit` callbacks are skipped), `VkTestMode()` is true in the macro, and a timeout kills the run and every process it started. Quiet, not sandboxed: Gui windows still appear and real side effects still happen. |
+| `run_automation` | **Trigger** any spoken automation now — the MCP equivalent of "open \<name\>". `loop <name>` starts a workflow's loop companion. Optional `wait_seconds` to wait and report the outcome (read from the run record, never guessed from an exit code). Optional `args` are the script's command-line arguments (an argv list, no shell); for a workflow they must be existing files and stand in for the File Explorer selection, so a selected-file workflow can be tested on a fixture. Runs in the macro's folder, like the voice shortcut. Any run it waits on returns `result` — the values the macro passed to `VkResult(value)` — and its `stdout` / `stderr` (the launched macro's alone: a program it starts inherits the variables, but `VkResult`/`VkTestMode` ignore them there). **`test=True`** is a quiet test run: MsgBox / TrayTip / InputBox / ToolTip / file pickers are returned in `dialogs` instead of shown — MsgBox answers its default button (what Enter would), InputBox, FileSelect and DirSelect are **cancelled**, ToolTip returns a real but invisible window; the macro's own `OnError` handlers run, an error none of them handles comes back as `uncaught_error` with no dialog (exit 3; its `OnExit` callbacks are skipped), `VkTestMode()` is true in the macro, and a timeout kills the run and every process it started. Quiet, not sandboxed: Gui windows still appear and real side effects still happen. **`dry_run=True`** (implies `test=True`) also replaces the input built-ins (`lib\DryRunShim.ahk`): keystrokes, clicks, mouse moves, control writes and `lib\UIA.ahk`'s `UiaSetValue` / `UiaInvoke` / `UiaFocus` are logged instead of performed and returned in order as `actions` (a workflow's typed text as lengths only); menus (`MenuSelect`) likewise; not covered (every dry-run reply says so): what the script `Run()`s, file and clipboard writes, window commands, `PostMessage`/`SendMessage`, its own COM/`DllCall` — `VkDryRun()` lets it skip those. With `test`/`dry_run`, `name` may also be an **isolated hotkey module**: its body runs directly under the shim (refused while that body is running). |
 | `run_workflow_batch` | **Run a workflow once per row of inputs**, no dialogs. Pass `rows` (one object per run, keys = the workflow's ask labels) **or `source`** — a CSV or an Excel range (see below); the loop runs headlessly with the floating Stop bar still up, and `collect` steps save each pass's values to the workflow's sheet. `dry_run=True` previews the mapped rows and launches nothing. Refused while another loop is running. |
 | `press_hotkey` | **Trigger** a hotkey module (or a companion hotkey) by synthesizing its registered combo — bridge-map entries only, never arbitrary keys; needs the resident VoiceKit running. |
 | `run_ahk_snippet` | Run one-off AutoHotkey v2 code in a throwaway process (`_Common.ahk` + `Browser.ahk` + `UIA.ahk` + `ExplorerSel.ahk` pre-included, `Out(value)` to report) — for probes and experiments. Uncaught errors come back as text instead of a hidden dialog. A timeout (or a cancelled call) ends the snippet **and every process it started** (`killed` lists them; a COM server it drove, e.g. `ComObject("Excel.Application")`, is started by Windows outside its tree — after a timeout `possibly_left_running` names it). A masked path inside a quoted string is expanded locally; `unmask=['<file#..>']` shows just those tokens in clear (audited). |
@@ -295,8 +295,10 @@ Claude calls `create_workflow` with typed steps; you then say **"open morning se
 { "type": "ask",     "label": "Customer name", "suggestion": "Acme" }
 { "type": "text",    "text": "Dear {{Customer name}}," }
 { "type": "fill",    "window": "ahk_exe chrome.exe", "element": "Invoice total", "value": "{{Box 1}}" }
+{ "type": "fill",    "window": "ahk_exe chrome.exe", "element": "after \"Deductions\" > \"Insurance\"", "value": "{{Insurance}}" }
 { "type": "set",     "label": "Greeting", "value": "Hi {{Customer name}}" }
 { "type": "capture", "label": "Invoice Data", "command": "python invoice.py {{selected_file}}", "seconds": 120 }
+{ "type": "module",  "module": "send number", "seconds": 120 }
 { "type": "keys",    "keys": "^s" }
 { "type": "click",   "window": "Untitled - Notepad", "element": "File" }
 { "type": "hover",   "window": "Untitled - Notepad", "element": "Format" }
@@ -307,7 +309,7 @@ Claude calls `create_workflow` with typed steps; you then say **"open morning se
 ```
 
 Step types: `run`, `focus`, `waitwin`, `wait`, `waitfor`, `text`, `fill`, `ask`,
-`collect`, `set`, `capture`, `keys`, `click`, `dblclick`, `rclick`, `hover`,
+`collect`, `set`, `capture`, `module`, `keys`, `click`, `dblclick`, `rclick`, `hover`,
 `drag`, `move`, `close`, and `if` / `else` / `endif`. Prefer `waitfor` to a fixed
 `wait`: it continues the moment the thing is true and fails saying what never
 happened. Every ask label, collect label and set name can be reused later as
@@ -328,13 +330,35 @@ default 30) and Stop Looping kill the whole process tree. A workflow with a
 `capture` step runs programs: share it like a script. Draft With AI never
 emits one.
 
+`module` runs an isolated hotkey module (named as `list_automations` shows it;
+stored as its bridge-map phrase) and WAITS for it to exit — pressing a module's
+key only starts it. Exit code 0 carries on; anything else stops the run, so a
+body says it failed with `ExitApp(1)`, and an uncaught error ends a body this
+step started with exit 3 instead of a dialog. `seconds` (default 60, at most
+3600) and Stop Looping end its whole process tree. Refused for an
+`isolate=False` module (it runs inside VoiceKit; nothing can wait on it) and,
+at run time, while the same body is already running. The run record says only
+`Module '<phrase>' failed (exit code N)` / `didn't finish within N s`; the
+body's error text and last `BodyStatus` line reach the local popup only. Under
+`run_automation(test=True / dry_run=True)` the body runs as a test run under the
+same shim (`VkTestMode()` is true in it; an uncaught error there comes back as
+`module_errors`, its text withheld). A body that stops on a stop request
+(`ExitApp()` after `BodyStopRequested`) fails the step — it didn't finish.
+Draft With AI never emits one.
+
 `fill` puts a value into an input box found by its label (its accessible name
 — a web form's field label; `dump_uia_tree` shows it), clicks it for real,
 refuses to type unless the keyboard focus landed there, types the value and
 reads it back. A box that reformats still passes (`1234.5` matches `1,234.50`)
 but a different value never does. `"Amount#2"` is the second input with that
 label (without `#N` the first is filled and the run log says so; `##` is a
-literal `#`). A password box is filled, not read back. The value is the one
+literal `#`). When the boxes share one name, the label can be the text before
+the box instead: `after "Insurance"` is the first input after the element
+saying Insurance, `after "Deductions" > "Insurance"` looks for Insurance
+within Deductions (a section: when its element contains its content, the
+search stays inside it and a miss fails by name rather than filling the next
+section's box; a bare heading only orders it, and the run log says so), and
+`#N` after the last quote picks the Nth input after it. A password box is filled, not read back. The value is the one
 paramC that takes `{{Name}}`; `""` clears the box; a failure reason never
 contains it.
 

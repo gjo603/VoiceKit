@@ -70,12 +70,12 @@ recSuppress := false    ; true while the recorder itself is typing (an ask step'
 typeIds    := ["focus", "run", "waitwin", "wait"
              , "waitfor", "waitfor", "waitfor", "waitfor", "waitfor"
              , "text", "fill", "ask", "keys", "click", "dblclick", "rclick", "hover", "drag", "move", "close"
-             , "collect", "collect", "set", "capture"
+             , "collect", "collect", "set", "capture", "module"
              , "if", "if", "if", "if", "if", "if", "else", "endif"]
 typeConds  := ["", "", "", ""
              , "elementexists", "elementnotexists", "winnotexists", "textvisible", "clipboardchanged"
              , "", "", "", "", "", "", "", "", "", "", ""
-             , "", "elem", "", ""
+             , "", "elem", "", "", ""
              , "winexists", "winnotexists", "elementexists", "elementnotexists"
              , "textvisible", "textnotvisible", "", ""]
 typeLabels := ["Focus window (launch it if needed)"
@@ -102,6 +102,7 @@ typeLabels := ["Focus window (launch it if needed)"
              , "Collect what's in a named box (saves it to the workflow's sheet)"
              , "Set a value (reuse it anywhere later as {{name}})"
              , "Run a command and save its output"
+             , "Run a hotkey module and wait for it to finish"
              , "— If a window IS open …"
              , "— If a window is NOT open …"
              , "— If something IS on screen …"
@@ -439,6 +440,7 @@ StepDialog(existing := "") {
     dt := d.AddDropDownList("xm w480", typeLabels)
     laA := d.AddText("xm y+12 w480", "")
     edA := d.AddEdit("xm w480")
+    ddMod := d.AddDropDownList("xp yp w480")   ; module steps: the isolated modules, in edA's place
     laB := d.AddText("xm y+10 w480", "")
     edB := d.AddEdit("xm w480")
     laT := d.AddText("xm y+10 w480", "")        ; timeout — "Wait until …" rows only
@@ -457,7 +459,7 @@ StepDialog(existing := "") {
     ; types where no field is substituted.
     ShowVarHint(t) {
         global steps
-        if (t = "else" || t = "endif" || t = "ask" || t = "wait") {
+        if (t = "else" || t = "endif" || t = "ask" || t = "wait" || t = "module") {
             laVars.Text := ""
             return
         }
@@ -486,6 +488,7 @@ StepDialog(existing := "") {
         ShowVarHint(t)
         laT.Visible := edT.Visible := false      ; only the "Wait until" rows use it
         edT.Move(, , 120)                        ; fill widens it for its value
+        ddMod.Visible := false                   ; only the module step uses it
         ; else / endif are block markers — no fields at all.
         if (t = "else" || t = "endif") {
             laA.Visible := edA.Visible := laB.Visible := edB.Visible := false
@@ -516,13 +519,28 @@ StepDialog(existing := "") {
             btnSpot.Visible := laC.Visible := false
             return
         }
+        ; module: which isolated hotkey module (a dropdown of them — the phrase
+        ; is what's saved) and the most seconds to wait for it (paramB, shown
+        ; in the timeout box).
+        if (t = "module") {
+            laA.Text := ddMod.Value
+                ? "Hotkey module to run — the workflow waits until it finishes, and stops if it fails:"
+                : "No isolated hotkey modules yet — make one with New Automation (code it / AI-draft it)."
+            laA.Visible := ddMod.Visible := true
+            edA.Visible := laB.Visible := edB.Visible := false
+            laT.Text := "Give up after this many seconds (blank = 60):"
+            laT.Visible := edT.Visible := true
+            btnGrab.Visible := btnPick.Visible := btnBrowse.Visible := false
+            btnSpot.Visible := laC.Visible := false
+            return
+        }
         ; fill: window, the box's label (Pick element fills it — point at the
         ; BOX, not the text beside it), and the value, which rides in paramC
         ; and so uses the third box, widened.
         if (t = "fill") {
             laA.Text := "Window:"
             laA.Visible := edA.Visible := true
-            laB.Text := "The box's label, exactly as shown — Amount#2 = the 2nd box with that label (## = a real #):"
+            laB.Text := "Box label as shown (Amount#2 = 2nd box, ## = #) — or after `"Total`" = the box after that text:"
             laB.Visible := edB.Visible := true
             laT.Text := "Value to put in it — can use {{name}} (blank clears the box):"
             laT.Visible := edT.Visible := true
@@ -765,6 +783,28 @@ StepDialog(existing := "") {
             d.Destroy()
             return
         }
+        ; module: a module the engine can run (isolated, registered) and an
+        ; optional wait in seconds (paramB; blank = the engine's 60).
+        if (t = "module") {
+            a := Trim(ddMod.Text)
+            if (a = "") {
+                MsgBox("Pick the hotkey module to run.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            m := WfModuleResolve(a)
+            if (m.kind != "ok") {
+                MsgBox(WfModuleRefusal(m, a), "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            secs := Trim(edT.Value)
+            if (secs != "" && (!IsNumber(secs) || Number(secs) <= 0 || Number(secs) > 3600)) {
+                MsgBox("The wait must be a number of seconds up to 3600, e.g. 120 — or blank for 60.", "Add Step", "Owner" d.Hwnd)
+                return
+            }
+            result := ["module", a, secs, ""]
+            d.Destroy()
+            return
+        }
         ; fill: window + label required; the value (paramC) is kept exactly as
         ; typed — spaces included — and may be blank (clears the box). A line
         ; break is refused, as the engine would at run time.
@@ -910,6 +950,28 @@ StepDialog(existing := "") {
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
 
+    ; The module dropdown: every isolated module, plus the one an edited step
+    ; already names (even if it has gone since — it is kept, not swapped).
+    modNames := []
+    try {
+        for c in WfModuleChoices()
+            modNames.Push(c.phrase)
+    }
+    modIdx := modNames.Length ? 1 : 0
+    if (IsObject(existing) && existing[1] = "module" && Trim(existing[2]) != "") {
+        modIdx := 0
+        for nm in modNames
+            if (!modIdx && nm = Trim(existing[2]))
+                modIdx := A_Index
+        if !modIdx {
+            modNames.InsertAt(1, Trim(existing[2]))
+            modIdx := 1
+        }
+    }
+    ddMod.Add(modNames)
+    if modIdx
+        ddMod.Choose(modIdx)       ; by index: Choose("text") picks the first PREFIX match
+
     if IsObject(existing) {
         idx := 1
         exCond := (existing.Length >= 4) ? existing[4] : ""
@@ -937,6 +999,8 @@ StepDialog(existing := "") {
             edT.Value := WfWaitParts((existing.Length >= 4) ? existing[4] : "").secs
         if (existing[1] = "capture" || existing[1] = "fill")   ; paramC whole: the timeout / the value
             edT.Value := (existing.Length >= 4) ? existing[4] : ""
+        if (existing[1] = "module")             ; paramA is in the dropdown already; paramB = seconds
+            edT.Value := existing[3]
         SpotCaption()                           ; show a pointer step's saved spot
     } else {
         dt.Choose(1)

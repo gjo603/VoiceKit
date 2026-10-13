@@ -88,7 +88,9 @@ OnError(_VkTestOnError, -1)
 _VkTestHook()
 
 _VkTestOnError(err, mode) {
-    rec := Map("kind", "error", "type", Type(err), "mode", mode)
+    ; "script": a workflow's module step runs a body under this shim with the
+    ; SAME log, and the reply must tell the body's error from the run's own.
+    rec := Map("kind", "error", "type", Type(err), "mode", mode, "script", A_ScriptFullPath)
     if (err is Error) {
         try rec["message"] := err.Message
         try rec["extra"] := err.Extra

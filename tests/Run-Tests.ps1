@@ -148,6 +148,7 @@ if (-not $gitOk -or $tracked.Count -eq 0) {
 }
 foreach ($rel in $tracked) { $loadTargets += Join-Path $root ($rel -replace '/', '\') }
 foreach ($rel in @('VoiceKitLauncher.ahk', 'lib\LoopRunner.ahk', 'lib\Watchdog.ahk', 'lib\TestShim.ahk',
+                   'lib\DryRunShim.ahk',
                    'mcp\uia_probe.ahk', 'templates\ai-template.ahk', 'templates\launch-template.ahk')) {
     $loadTargets += Join-Path $root $rel
 }

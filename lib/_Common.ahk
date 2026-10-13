@@ -363,11 +363,114 @@ LogUncaughtError(err, mode) {
     if VkTestMode()
         return 0
     ErrorLogAppend(ErrorLogLine(err))
+    if VkModuleScoped()
+        VkModuleErrorNote(ErrorLogLine(err))
     return 0            ; observe only — dialogs and later handlers proceed
+}
+
+; ---- a body run by a workflow's module step (2026-10-12) ----------------
+;  The engine's `module` step (lib\Workflow.ahk WfModuleRun) waits for an
+;  isolated body and reads its EXIT CODE: 0 = it worked. An uncaught error
+;  must therefore END the body with a nonzero code, not leave AutoHotkey's
+;  modal error dialog holding it open until the step times out. The engine
+;  names the body in %VOICEKIT_MODULE_SCRIPT% (scoped like VkRunScoped —
+;  Run() hands the environment to every child) and a note file in
+;  %VOICEKIT_MODULE_ERROR%; only that script is affected. A voice or
+;  hotkey press of the same body sets neither, and behaves as it always did.
+;
+;  The body's own OnError handlers still decide first: this only NOTES the
+;  error and arms a WH_CBT hook; if no later handler returns nonzero,
+;  AutoHotkey creates its error dialog (a #32770) and the hook ends the
+;  process before it shows, with exit code 3 (measured 2026-10-12: exit 3,
+;  nothing on screen; a later handler returning 1 -> the hook stays quiet,
+;  exit 0). ExitApp from a handler is no good — an OnExit callback can veto
+;  it and the dialog appears anyway (lib\TestShim.ahk, measured 2026-10-01).
+;  A handler that shows its OWN MsgBox / InputBox while it decides is a
+;  #32770 too, created while the error is pending — so the hook tells
+;  them apart by the dialog's module (CREATESTRUCT.hInstance, measured on
+;  2.0.x: AutoHotkey's error dialog 0, a MsgBox user32's, an InputBox the
+;  exe's) and lets a MsgBox / InputBox through. (An OnError callback added
+;  mid-chain is NOT called for that error — measured — so "arm last" can't
+;  be done by registering one.)
+;
+;  The two variables are read ONCE, at load, and then removed from this
+;  process's environment: Run() hands the environment to every child, and a
+;  long-lived one (a reloaded master, the Voice Kit window) would otherwise
+;  carry this run's scope to a later key press of the same body.
+VkModuleEnv() {
+    static env := ""
+    if !IsObject(env) {
+        env := {script: EnvGet("VOICEKIT_MODULE_SCRIPT"), error: EnvGet("VOICEKIT_MODULE_ERROR")}
+        if (env.script != "" || env.error != "") {
+            EnvSet("VOICEKIT_MODULE_SCRIPT")
+            EnvSet("VOICEKIT_MODULE_ERROR")
+        }
+    }
+    return env
+}
+VkModuleEnv()       ; at load, before the script can Run() anything
+
+VkModuleScoped() {
+    want := VkModuleEnv().script
+    return want != "" && VkLongPath(want) = VkLongPath(A_ScriptFullPath)
+}
+
+; Note the error for the engine (its LOCAL popup only) and arm the hook.
+VkModuleErrorNote(line) {
+    try {
+        f := VkModuleEnv().error
+        if (f != "") {
+            h := FileOpen(f, "w", "UTF-8")
+            h.Write(line)
+            h.Close()
+        }
+    }
+    VkModulePending(true)
+    SetTimer(VkModuleUnpend, -1)    ; a later handler took it: the run goes on
+    VkModuleHook()
+}
+
+VkModuleUnpend() => VkModulePending(false)
+
+; An uncaught error is between its OnError chain and its dialog.
+VkModulePending(set := "") {
+    static held := false
+    if (set != "")
+        held := set
+    return held
+}
+
+; A WH_CBT hook on this thread, installed on the first scoped error.
+VkModuleHook() {
+    static hook := 0
+    if !hook
+        try hook := DllCall("SetWindowsHookExW", "Int", 5, "Ptr", CallbackCreate(VkModuleCbt, "F", 3),
+            "Ptr", 0, "UInt", DllCall("GetCurrentThreadId", "UInt"), "Ptr")
+    return hook
+}
+
+; HCBT_CREATEWND (3) of a #32770 while an error is pending: AutoHotkey's
+; error dialog being created. End the body before it exists — unless it is
+; a MessageBox (user32's) or an InputBox (the exe's) that a handler of the
+; body's own is showing (see above).
+VkModuleCbt(nCode, wParam, lParam) {
+    if (nCode = 3 && VkModulePending()) {
+        cls := Buffer(64, 0)
+        DllCall("GetClassNameW", "Ptr", wParam, "Ptr", cls, "Int", 32)
+        if (StrGet(cls) = "#32770") {
+            hInst := -1
+            try hInst := NumGet(NumGet(lParam, 0, "Ptr"), A_PtrSize, "Ptr")   ; CREATESTRUCT.hInstance
+            if (hInst != DllCall("GetModuleHandle", "Str", "user32", "Ptr")
+                && hInst != DllCall("GetModuleHandle", "Ptr", 0, "Ptr"))
+                DllCall("kernel32\ExitProcess", "UInt", 3)
+        }
+    }
+    return DllCall("CallNextHookEx", "Ptr", 0, "Int", nCode, "Ptr", wParam, "Ptr", lParam, "Ptr")
 }
 ; Top-level on purpose: it registers during the include, so every host —
 ; macros, bodies, the Studio, the master — gets the log line with no code
-; of its own. (This is _Common.ahk's one piece of auto-execute code.)
+; of its own. (With VkModuleEnv() above, _Common.ahk's only auto-execute
+; code.)
 OnError(LogUncaughtError)
 
 ; Launch an .ahk through the AutoHotkey interpreter explicitly, instead
@@ -527,6 +630,14 @@ VkDeleteProtected(base) {
 ;        can skip a real side effect (sending the email, moving the
 ;        file) when it is being tested.
 ;
+;    VkDryRun()        true when lib\DryRunShim.ahk is loaded -- by
+;        run_automation(dry_run=True), which implies test mode too.
+;        Keystrokes, clicks and UIA actions are already logged instead
+;        of sent; what the shim can't intercept (Run, file writes,
+;        clipboard writes, the script's own COM / DllCall) a script
+;        skips itself when this is true. Scoped by construction: only
+;        the process loaded with the shim has it, never a child.
+;
 ;  Both act ONLY in the script the run launched: %VOICEKIT_RUN_SCRIPT%
 ;  holds its full path and must name A_ScriptFullPath (VkRunScoped).
 ;  AutoHotkey's Run() hands the environment to every child, so without
@@ -537,6 +648,14 @@ VkDeleteProtected(base) {
 ;  test and skipped its real work (found in review, 2026-10-01).
 ; ============================================================
 VkTestMode() => EnvGet("VOICEKIT_TEST") = "1" && VkRunScoped()
+
+; The shim's hook, looked up by name: undefined in every normal run, where
+; the dynamic reference throws "Variable not found" (caught -- measured, no
+; #Warn VarUnset warning). lib\UIA.ahk's UiaDryRun does the same lookup.
+VkDryRun() {
+    try return %"_VkDryRunNote"% is Func
+    return false
+}
 
 ; Are the run variables for THIS script? (see above)
 VkRunScoped() {
@@ -1399,11 +1518,17 @@ BodyStopFile(base, root := "") {
 
 ; True once per request: the flag is CONSUMED on sight, so one request
 ; stops one run and a stale flag can't kill the next press.
+;
+; In a body a workflow's module step started (VkModuleScoped), a consumed
+; request also leaves "<note file>.stopped" for the engine: the body then
+; ends with ExitApp() — exit 0 — and the step must not read that as done.
 BodyStopRequested(base, root := "") {
     f := BodyStopFile(base, root)
     if !FileExist(f)
         return false
     try FileDelete(f)
+    if VkModuleScoped() && (note := VkModuleEnv().error) != ""
+        try FileAppend("", note ".stopped")
     return true
 }
 
@@ -1422,7 +1547,7 @@ BodySingleInstance(base) {
     static hMutex := 0
     if hMutex                          ; this process already holds it
         return true
-    name := "Local\VoiceKitBody_" RegExReplace(base, "[^\w\-]")
+    name := BodyMutexName(base)
     hMutex := DllCall("CreateMutexW", "ptr", 0, "int", 0, "wstr", name, "ptr")
     if (A_LastError = 183) {           ; ERROR_ALREADY_EXISTS — another run won
         try DllCall("CloseHandle", "ptr", hMutex)
@@ -1431,6 +1556,23 @@ BodySingleInstance(base) {
     if !hMutex
         hMutex := 0                    ; CreateMutex failed outright — never let
     return true                        ; the guard stop legitimate work
+}
+
+; The mutex a running body holds (voicekit_writer._body_mutex_held builds
+; the same name: AutoHotkey's \w is ASCII).
+BodyMutexName(base) => "Local\VoiceKitBody_" RegExReplace(base, "[^\w\-]")
+
+; Is a run of <base>'s body holding its mutex right now? ACCESS_DENIED (5)
+; counts as held: the mutex exists but belongs to a process we may not open
+; (an elevated body) — still running. Same rule as voicekit_writer
+; _body_mutex_held.
+BodyMutexHeld(base) {
+    h := DllCall("OpenMutexW", "UInt", 0x00100000, "Int", 0, "WStr", BodyMutexName(base), "Ptr")  ; SYNCHRONIZE
+    if h {
+        DllCall("CloseHandle", "Ptr", h)
+        return true
+    }
+    return A_LastError = 5
 }
 
 ; ============================================================

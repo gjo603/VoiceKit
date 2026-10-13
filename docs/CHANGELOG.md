@@ -8,6 +8,197 @@ names).
 
 ---
 
+### 2026-10-12 — ProConnect-session feedback (UIA diagnosis, relative fill, module step, dry run)
+
+An agent automated a tax-preparation web app (Intuit ProConnect) in Chrome
+through VoiceKit's MCP and ranked nine items by the time each cost. Its top
+two — a tree dump that silently stopped at depth 25, and finds that came back
+empty with no way to tell why — were UIA diagnosis gaps. All nine are built,
+on branch `feedback-quiet-harness`; what was left out follows the items.
+
+- **#1, #2, #3, #9 UIA diagnosis (`lib\UIA.ahk`, `mcp\uia_probe.ahk`,
+  `dump_uia_tree`).** Every find (`UiaFromWindow`, `UiaFindFirst`,
+  `UiaFindElements`, `UiaFindCond`, `UiaFindAllCond` and their wrappers)
+  takes a trailing optional `&why`: no window / closed window / own process /
+  no UIA root (with the HRESULT) / no condition / the search threw (its error,
+  never swallowed) / no match — the retrying ones with `after N ms (K
+  attempts)`. A search from a sub-element is checked to stay inside it
+  (`UiaIsWithin`); a provider answer from outside (Chrome returned the same
+  wrong box for three different start points) falls back to walking the
+  start element's own subtree (`UiaFindFirstWalk`), and `UiaFindElements`
+  drops strays — both say so in `why`. `UiaDumpTree` gains `&stats`
+  (visited, cut-at-depth, budget/time/line caps, a CRC-32 `fingerprint` over
+  every visited node that ignores the filter, so a changed page shows under
+  an unchanged title) and `UiaTreeFingerprint`; `dump_uia_tree`'s depth cap
+  is 100 (was 25), it returns `nodes` / `cut_at_depth` / `budget_hit` /
+  `fingerprint`, and its note says plainly when subtrees were cut — above all
+  when a `name_filter` matched nothing in an incomplete walk. Details:
+  `docs\architecture\uia-and-browser.md`.
+- **#4 `fill` by the text before the box: `after "Insurance"`.** Every input
+  on the ProConnect screen was named "expanded detail input", so no label
+  could pick one and Send Number became a code module. A fill label (paramB)
+  starting `after "` is now the RELATIVE form: `after "Insurance"` is the
+  first input after the element saying Insurance, `after "Deductions" >
+  "Insurance"` finds Insurance WITHIN Deductions (a section), and `#N` after
+  the last quote picks the Nth input after it. `>` is a real bound when the
+  section's element contains its content (`WfFillSectionEnd`: its subtree
+  holds an input or a named element other than its own text — a group named
+  after its heading): the next text and the box are searched only inside
+  it, and a miss fails `No "Insurance" inside "Deductions"` / `Only K inputs
+  come after … inside …` instead of filling the next section's box (the
+  first cut only ordered the search, so that is exactly what it did). A
+  bare heading (nothing inside, or only its own text node) keeps the
+  ordered search and the run log says so. Same syntax, no Python change. A param-format change, so the
+  five-way lockstep: `WfFillLabel` → `WfFillAfterLabel` (mirrored by
+  `fill_label` → `_fill_after_label`; the shared `FILL_LABELS` table now
+  carries the anchors), `WfFillAfterFind` in the engine, `WfDesc`, the
+  Studio's fill hint, `DraftSystemPrompt` (with an example; `ParseDraft`
+  already defers to `WfFillLabel`), the MCP `WorkflowStep` description, and
+  `create_workflow`'s guard (named `Step N:` parse errors: unquoted text, an
+  unclosed quote, an empty text, a dangling `>`, stray text, `#0`). The
+  lookup is ONE `FindAll(TrueCondition)` from the window root (never a
+  search from a sub-element — #3), budget-bounded; exact name first, else
+  the first name containing the text; in a browser it starts after the page's
+  Document, because the tab strip carries the page title and the first input
+  after a TAB is the address bar. After "found it" it is the label fill's own
+  `WfFillUia` (enabled check, real click, focus gate, readback, privacy).
+  Existing labels are untouched — only one starting `after "` changes
+  meaning. `engine-fill-selftest` (target: two sections of same-named boxes,
+  plus a window of child-Gui container sections for `>` = within)
+  + `engine-capture-selftest` (`ParseDraft`) + conformance (table, guard,
+  `STEPS`). Details: "Filling a box by its label" in
+  `docs\architecture\workflow-engine.md`.
+- **#5 A workflow can wait for a hotkey module: the `module` step.** Pressing
+  a module's key only STARTS it, so a workflow could never hold off until
+  the module had worked — the whole Send Number sequence had to move into the
+  module. `module|<module phrase>|<seconds>|` runs an ISOLATED module's body
+  (`hotkeys\bodies\<Base>.body.ahk`, through the interpreter like the
+  launcher, plus `/ErrorStdOut`) and waits: exit code 0 carries on, anything
+  else stops the run; seconds default 60 (at most 3600), and a timeout or
+  Stop ends the whole tree (`WfKillTree`, as `capture` does). Refused, with a
+  message, for an in-process module (nothing to wait on), a companion
+  shortcut, an unknown name, and a body already holding its
+  `BodySingleInstance` mutex (`BodyMutexHeld` — the new instance would exit 0
+  at once and read as success). The record says only `Module '<phrase>'
+  failed (exit code N)` / `didn't finish within N s`; the body's error text
+  and its last `BodyStatus` line (written during this run) go to the local
+  popup only. The body side: an uncaught error in a body THIS step started
+  ends it with exit 3 instead of a modal dialog — `LogUncaughtError` notes it
+  (errors.log as usual, plus a note file for the popup) and arms a WH_CBT
+  hook that ends the process as AutoHotkey creates its error dialog, so the
+  body's own OnError handlers still decide first. Scoped like `VkRunScoped`
+  (`VOICEKIT_MODULE_SCRIPT` must name the script — `VkModuleScoped`), so a
+  voice press is untouched. Measured: a load error with `/ErrorStdOut` and no
+  stdout = exit 2, no dialog (without it: a dialog); `/ErrorStdOut` does NOT
+  stop a runtime error dialog; the hook = exit 3, nothing on screen; a later
+  handler returning 1 = no kill, exit 0 — and a handler's own MsgBox /
+  InputBox is told apart from the error dialog by its module
+  (`CREATESTRUCT.hInstance`), so showing one no longer reads as a crash.
+  The scope variables are dropped from the body's environment at load, so
+  nothing it starts inherits them; a body that stops on a stop request
+  (`ExitApp()` = exit 0) fails the step ("was stopped before it finished").
+  Under a test / dry run of the workflow the body runs under the same shim
+  AS a test run (`VkTestMode()` true, out of `errors.log`, its uncaught
+  error reported as `module_errors` with the text withheld), so a dry run
+  never types through a module. Name lookup (`WfModuleResolve`, mirrored by
+  `module_step_target`): exact phrase, then ignoring a leading "open ", then
+  the module's file base; `create_workflow` stores the bridge-map phrase. A
+  new step type, so the five-way lockstep: engine (`WfModuleRun`, `WfDesc`;
+  never substituted), Studio (a dropdown of the isolated modules +
+  the timeout box), writer (`STEP_TYPES`, guard), server (`module` field,
+  `to_abc`), NewAutomation (refused by name — a drafter can't know module
+  names). Body authors: end with `ExitApp(1)` when it failed. Two traps found
+  on the way: `lib\Workflow.ahk` loads without `_Common.ahk` in the probes
+  (so it reaches `_Common` helpers through `WfCommonFn`), and `{base: ...}`
+  in an object literal sets the prototype ("Invalid base."). New
+  `tests\engine-module-selftest.ahk` (a sandbox bridge map + throwaway bodies:
+  success, ExitApp(1), uncaught error, a handled error, a load error, timeout
+  and Stop killing the tree, the refusals, a dry-run host) +
+  `engine-capture-selftest` (`ParseDraft` refuses it) + conformance
+  (`STEPS`, `test_module_step_target_matches_the_engine`,
+  `test_create_workflow_module_step_guards`, the schema test). Details: "Running a
+  hotkey module and waiting for it" in `docs\architecture\workflow-engine.md`.
+- **#6 A dry run: `run_automation(dry_run=True)`.** The body's paste sequence
+  shipped untested because running it meant typing into a live client
+  return. `lib\DryRunShim.ahk` (loaded with `/include`; it `#Include`s
+  TestShim, since AutoHotkey takes only ONE `/include` — measured) replaces
+  `Send*`, `Click`, `MouseClick`/`Drag`/`Move`, `ControlSend`/`SendText`/
+  `Click`/`SetText`/`Focus`/`SetChecked`/`ChooseIndex`/`ChooseString`/
+  `AddItem`/`DeleteItem`/`SetEnabled`/`Show`/`Hide`/`Move`/`SetStyle`/
+  `SetExStyle`/`ShowDropDown`/`HideDropDown`, `EditPaste` and `MenuSelect`:
+  each logs one `input` record and sends nothing, returns what
+  the real one returns, and the `Control*` ones still throw the real
+  `TargetError` for a missing control; a paste records the clipboard it
+  would paste. `lib\UIA.ahk`'s `UiaSetValue` / `UiaInvoke` / `UiaFocus` ask
+  `UiaDryRun` (a by-name lookup of the shim's hook, inert and silent in a
+  normal run — measured) and log instead of acting; `VkDryRun()` in
+  `_Common.ahk` lets a script skip what can't be intercepted (`Run`, file
+  and clipboard writes, window commands, `PostMessage`/`SendMessage`, its
+  own COM/`DllCall` — every dry-run reply says so). The reply
+  carries `actions` in order (a workflow's typed text as lengths only, like
+  its popups). `test=True` / `dry_run=True` also take an **isolated hotkey
+  module's name** and run its body directly under the shim, refusing a
+  body that is already running (its `BodySingleInstance` mutex would end
+  the test at once and read as a pass), an isolate=False module, and a
+  plain run of a module name. `tests\dryrun-selftest.ahk` (new) +
+  three `test_run_automation_dry_run_*` conformance tests. Details: "Dry
+  runs" in `docs\architecture\mcp.md`.
+- **#7 `create_workflow` says what a replace kept.** The result carries
+  `"hotkey"` (the companion combo, e.g. `Ctrl+Alt+Shift+V`) whenever the
+  workflow has one — read through `_companion_combos`, the same fold
+  `list_automations` uses, so the two can't disagree; absent when there is
+  none, as in the listing — and the note says it was kept. `replaced` was
+  already there. The docstring now states that a replace changes only the
+  steps and stub. `test_create_workflow_replace_reports_the_kept_companion_hotkey`.
+- **#8 `read_reference('uia')` / `('browser')`: the function list, generated.**
+  A library reference is built from `lib\UIA.ahk` / `lib\Browser.ahk` on every
+  read (`_library_reference`): each top-level definition's signature exactly
+  as written (`&why?` / `&stats?` included, constants with their values) and
+  the comment block above it, in file order, section banners as headings,
+  under a short preamble of the rules that hold for all of them. Nothing is
+  hand-listed, so it cannot drift; the catalogue marks entries `example` or
+  `library`, and the session instructions and the UIA-discussing tool
+  descriptions point at it. Public UIA functions whose comment didn't say
+  what they return got a one-line "Returns …" (comment-only edits).
+  `test_library_references_are_generated_from_the_source` parses the library
+  independently and checks every signature is there.
+- **Not done, and known limits** (deliberate unless marked open — the open
+  ones are in `docs\backlog.md`):
+  - **Nothing here was run against live Chrome.** The scope check (#3) and the
+    relative fill (#4) are proven on Win32 targets plus an injected
+    out-of-scope hit. If Chrome's elements for a child window and its content
+    ever don't compare equal, a correct hit would be rejected and found again
+    by the walk — right answer, slower (open: confirm on the real site).
+  - `UiaFindElements` checks a 32-hit sample before checking every hit, so a
+    stray in the unsampled middle of a long answer can survive (documented in
+    `lib\UIA.ahk`). Unfiltered dumps are slower than before: they walk to the
+    node/time cap like filtered ones, with two more reads per node for the
+    fingerprint.
+  - A relative fill's `>` chain sets where counting STARTS, not where a
+    section ends — `#3` can run into the next section; a plain label can no
+    longer begin with `after "`; there is no MSAA fallback for the relative
+    form. Each lookup reads every element's name up to the 6,000-node budget.
+  - The `module` step: deleting a module a workflow still names isn't blocked
+    (the run fails with "No hotkey module answers…"); a body whose own
+    OnError handler shows a plain MsgBox while handling is ended with exit 3;
+    a body that pops a `#Warn` load dialog blocks until the step's timeout.
+    The Studio's module dropdown passed its load check but its layout has not
+    been looked at on screen (open).
+  - The dry run is not a sandbox: a script's own `Run`, file writes,
+    clipboard WRITES, window commands, `PostMessage`/`SendMessage` and its own
+    COM/`DllCall` calls happen for real (every reply says so; `VkDryRun()` lets
+    a script skip them); `UiaScrollIntoView` stays live; a workflow dry run
+    stops at the first step that checks an effect (a fill's readback, a
+    `collect`, a wait after a click), because nothing on screen changed. The
+    paste preview (clipboard, first 200 characters) is returned unmasked for
+    macros and modules, like their dialog text.
+  - The session instructions stand at 3,994 of the 4,000 characters
+    `test_instructions_names_exist` allows — new text there must replace old.
+- **`CLAUDE.md` leaves the repository.** It is a local development aid: now
+  gitignored and untracked (the rules stay on disk for whoever develops
+  here; the design notes it indexes are `docs\architecture\`). The build's
+  dev-only drop list keeps it as a backstop.
+
 ### 2026-10-01 — quiet-harness feedback: run programs, an honest cap, quiet test runs — BUILT
 
 An agent drove VoiceKit's MCP through a remote bridge (per-call limit 60 s)
@@ -111,7 +302,8 @@ identity").
   - Confirm-on-the-desktop before unmasking a client folder — considered;
     the user chose scoped tokens + an opt-in setting instead.
   - A generic dry-run flag (still none — VoiceKit can't know what "dry"
-    means for a raw script).
+    means for a raw script). Superseded 2026-10-12: `dry_run=True` doesn't
+    ask the script, it replaces the input built-ins (see above).
 - **Review fixes (same branch, before merge)** — each a confirmed finding:
   - `stop_module`'s `grace_s` was clamped at 60, so one call could outlast the
     bridge: it goes through `_cap_wait` now, with the time the call spends

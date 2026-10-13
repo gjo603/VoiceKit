@@ -25,6 +25,11 @@ lv.OnEvent("ItemSelect", OnSel)
 ; above shifts in tree order.
 g.AddText("w300", "Secret Field")
 pw := g.AddEdit("w300 Password", "")
+; Scoped-search fixtures, OUTSIDE the list (and last, for the same reason):
+; a Text sharing a list row's name, and a button only the window has. A
+; search started at the list must never come back with either.
+g.AddText("w300", "Lv Row 3")
+g.AddButton("w200", "Outside Only Zz")
 g.Show()
 
 ; A named function with an explicit `global`, NOT `(*) => clicks += 1`:
@@ -42,10 +47,10 @@ OnSel(ctrl, item, sel) {
 }
 
 StateLines() {
-    global clicks, ed, btn, selected, pw
+    global clicks, ed, btn, selected, pw, lv
     return "clicks=" clicks "`nedit=" ed.Value
         . "`nedithwnd=" ed.Hwnd "`nbtnhwnd=" btn.Hwnd
-        . "`npwhwnd=" pw.Hwnd
+        . "`npwhwnd=" pw.Hwnd "`nlvhwnd=" lv.Hwnd
         . "`nselected=" selected "`n"
 }
 TargetServe("uia-selftest", StateLines, g)

@@ -52,6 +52,11 @@
 ;  the first step that EXECUTES something, so a shared workflow
 ;  deserves the trust you'd give a script — see WfCapture.
 ;
+;  The `module` step runs an isolated hotkey module and WAITS for it:
+;      module|<module phrase>|<seconds, blank = 60>|
+;  Exit code 0 carries on; anything else (ExitApp(1), an uncaught
+;  error, a timeout) stops the run. See WfModuleRun.
+;
 ;  The `fill` step puts a value into an input box found by its
 ;  label, then reads it back:
 ;      fill|<window>|<label>[#N]|<value>
@@ -59,7 +64,10 @@
 ;  focus actually landed there, and fails if the box doesn't hold
 ;  the value afterwards — a failure reason never contains the value
 ;  (it may be client data). "Amount#2" is the 2nd input labelled
-;  Amount; "##" is a literal "#". See WfFill.
+;  Amount; "##" is a literal "#". When every box shares one name, the
+;  label can name the TEXT before the box instead:
+;      after "Insurance"   /   after "Deductions" > "Insurance"#2
+;  See WfFill and WfFillAfterFind.
 ;
 ;  The `waitfor` step waits for something to HAPPEN rather than
 ;  for a guessed number of milliseconds:
@@ -547,6 +555,21 @@ RunWorkflowSteps(steps, askVals := "", collected := "", varsOut := "") {
             i += 1
             continue
         }
+        if (t = "module") {             ; run an isolated hotkey module and wait for it
+            r := WfModuleRun(sr[2], WfModuleSecs(sr[3]))
+            if !r.ok {
+                if (r.aborted || WfAborted()) {     ; Stop ended it — quiet, like any stop
+                    WfRunFinish("stopped")
+                    return false
+                }
+                ; r.reason names only the module and its exit code / timeout;
+                ; the body's own words (its error, its last status line) may
+                ; name a client, so they go to the local popup alone.
+                return WfRunFail(i, n, s, sr, r.reason, r.detail)
+            }
+            i += 1
+            continue
+        }
         if (t = "fill") {               ; put a value in a box by its label, read it back
             ; The as-written window and label name the box in the reason (like
             ; `run` below): the reason travels (record -> MCP), and a filled-in
@@ -939,6 +962,278 @@ WfCaptureTail(path, maxLines := 10) {
     return ""
 }
 
+; ============================================================
+;  The module step — module|<module>|<seconds>|   (2026-10-12)
+;
+;  Pressing a hotkey module's key only STARTS it, so a workflow
+;  could never hold off until the module had done its job — the
+;  whole sequence had to move into the module instead. This step
+;  runs an ISOLATED module's body (hotkeys\bodies\<Base>.body.ahk)
+;  and waits for it to exit:
+;
+;  - paramA names the module as list_automations / bridge-map.txt
+;    show it (WfModuleResolve). Not substituted: which program a
+;    run starts is fixed when the workflow is written, never
+;    chosen by a batch row.
+;  - A module that runs inside VoiceKit.ahk (isolate=False) has no
+;    process of its own to wait on — refused, saying so. So is a
+;    body already running: its BodySingleInstance mutex would make
+;    the new instance exit 0 at once, which reads as success.
+;  - Started the way the generated launcher starts it (the
+;    interpreter + the body path), plus /ErrorStdOut, so a body
+;    that doesn't LOAD exits 2 instead of showing a load-error
+;    dialog nobody answers (measured: plain -> dialog; with the
+;    switch -> exit 2, nothing on screen, even with no stdout).
+;  - Exit code 0 = it worked; anything else stops the run. A body
+;    says it failed with ExitApp(1). A body that ends on a stop
+;    request (BodyStopRequested -> ExitApp(), exit 0) did NOT finish:
+;    it leaves "<note>.stopped" and the step fails. An uncaught error ends it with
+;    exit 3 instead of a modal dialog — only for a body THIS step
+;    started (VOICEKIT_MODULE_SCRIPT, see lib\_Common.ahk
+;    VkModuleScoped); a voice press of the same body is untouched.
+;  - paramB is the most seconds to wait (blank = 60, at most 3600);
+;    a timeout or Stop ends the body's whole process tree.
+;  - Under a test / dry run of the workflow (lib\TestShim.ahk /
+;    DryRunShim.ahk loaded in THIS process) the body runs under the
+;    same shim, so a dry run never types through a module — and as a
+;    test run of its own (VOICEKIT_RUN_SCRIPT = the body), so
+;    VkTestMode() is true there and its errors stay out of errors.log.
+;  - The reason the run records says only "Module '<phrase>' failed
+;    (exit code N)" / "didn't finish within N s": the body's error
+;    text and its last BodyStatus line can name a client, so they
+;    go to the local popup (WfRunFail's detail) and nowhere else.
+; ============================================================
+
+; Tests point this at a sandbox holding bridge-map.txt + hotkeys\ (and a
+; lib\ copy for the bodies' #Include) — never the user's own files.
+global wfModuleRoot := ""
+
+WfModuleRootDir() {
+    global wfModuleRoot
+    return (wfModuleRoot != "") ? wfModuleRoot : WfRootDir()
+}
+
+; A lib\_Common.ahk function, looked up by name. The engine is also loaded
+; WITHOUT _Common.ahk (the conformance probes, several suites), where a
+; direct call to an undefined function is a load-time #Warn dialog; a
+; dynamic reference just throws, caught here (measured for VkDryRun). Every
+; host that RUNS a workflow includes _Common.ahk first.
+WfCommonFn(name) {
+    try {
+        f := %name%
+        if (f is Func)
+            return f
+    }
+    throw Error("lib\_Common.ahk isn't loaded (" name " is missing).")
+}
+
+; A module step's wait: a positive number of seconds (at most an hour),
+; else 60. mcp\voicekit_writer.py refuses what this would quietly default.
+WfModuleSecs(b) {
+    b := Trim(b)
+    return (b != "" && IsNumber(b) && Number(b) > 0) ? Min(Number(b), 3600) : 60
+}
+
+; The bridge-map entry a module step names -> {kind, phrase, module, body}.
+; kind: "ok", "unknown", "companion" (a keyboard shortcut FOR another
+; automation, not a module) or "inprocess" (runs inside VoiceKit.ahk).
+; Matched in precedence order — the phrase exactly (trimmed, caseless),
+; then the phrase ignoring a leading "open " on either side, then the
+; module's file base ("Send Number" / "SendNumber") — first entry in file
+; order within a pass. voicekit_writer.module_step_target mirrors this
+; (test_module_step_target_matches_the_engine runs both on one map).
+WfModuleResolve(name, root := "") {
+    if (root = "")
+        root := WfModuleRootDir()
+    want := Trim(name)
+    out := {kind: "unknown", phrase: want, module: "", body: ""}
+    if (want = "")
+        return out
+    noOpen(s) => RegExReplace(Trim(s), "i)^open\s+")
+    wantBase := StrReplace(WfCommonFn("CleanPhrase")(want), " ")
+    entries := WfCommonFn("BridgeMapEntries")(root)
+    Find() {
+        for pass in [1, 2, 3]
+            for e in entries {
+                if (pass = 1 && e.phrase = want)                     ; = is caseless
+                    || (pass = 2 && noOpen(e.phrase) = noOpen(want))
+                    || (pass = 3 && wantBase != "" && WfModuleFileBase(e.file) = wantBase)
+                    return e
+            }
+        return ""
+    }
+    if !IsObject(hit := Find())
+        return out
+    out.phrase := hit.phrase
+    if RegExMatch(hit.file, "i)\.hotkey\.ahk$") {
+        out.kind := "companion"
+        return out
+    }
+    out.module := WfModuleFileBase(hit.file)
+    out.body := root "\" WfCommonFn("HotkeyBodyRel")(out.module)
+    out.kind := FileExist(out.body) ? "ok" : "inprocess"
+    return out
+}
+
+; "hotkeys\SendNumber.ahk" -> "SendNumber" (a bridge-map FILE field).
+WfModuleFileBase(file) => RegExReplace(file, "i)^hotkeys\\|\.ahk$")
+
+; Why a module step can't use `name` ("" when it can).
+WfModuleRefusal(m, name) {
+    switch m.kind {
+        case "unknown":
+            return "No hotkey module answers to `"" Trim(name) "`" — the Voice Kit window "
+                . "(or list_automations) shows each module's phrase."
+        case "companion":
+            return "`"" m.phrase "`" is a keyboard shortcut for another automation, not a hotkey "
+                . "module — a module step runs hotkey modules only."
+        case "inprocess":
+            return "Module '" m.phrase "' runs inside VoiceKit (it isn't isolated), so a workflow "
+                . "can't wait for it to finish. Recreate it as an isolated module to use it here."
+    }
+    return ""
+}
+
+; Run the module's body and wait. -> {ok, reason, detail, aborted, code}.
+; Never throws.
+WfModuleRun(name, secs := 60) {
+    static seq := 0
+    r := {ok: false, reason: "", detail: "", aborted: false, code: ""}
+    root := WfModuleRootDir()
+    try {
+        m := WfModuleResolve(name, root)
+        busy := (m.kind = "ok") && WfCommonFn("BodyMutexHeld")(m.module)
+        ; A test / dry run of this workflow runs the body under the same shim.
+        shim := WfCommonFn("VkDryRun")() ? "DryRunShim.ahk"
+            : (WfCommonFn("VkTestMode")() ? "TestShim.ahk" : "")
+    } catch as e {
+        r.reason := "A module step can't run here: " e.Message
+        return r
+    }
+    if (m.kind != "ok") {
+        r.reason := WfModuleRefusal(m, name)
+        return r
+    }
+    if busy {
+        r.reason := "Module '" m.phrase "' is already running — wait for it to finish (or stop "
+            . "it) before running it from a workflow."
+        return r
+    }
+    inc := (shim != "") ? '/include "' A_LineFile '\..\' shim '" ' : ""
+    seq += 1
+    errF := A_Temp "\vk-module-" DllCall("GetCurrentProcessId", "uint") "-" A_TickCount "-" seq ".err"
+    env := ["VOICEKIT_MODULE_SCRIPT", "VOICEKIT_MODULE_ERROR", "VOICEKIT_RUN_SCRIPT",
+        "VOICEKIT_TEST", "VOICEKIT_RESULT_FILE"]
+    saved := Map()
+    for k in env
+        saved[k] := EnvGet(k)
+    pid := 0, why := "", deadline := A_TickCount + Round(secs * 1000)
+    started := A_Now
+
+    Watch() {           ; on a timer WHILE RunWait waits (as in WfCapture)
+        if (why != "" || !pid)
+            return
+        if WfAborted()
+            why := "abort"
+        else if (A_TickCount >= deadline)
+            why := "timeout"
+        else
+            return
+        WfKillTree(pid)
+    }
+
+    try {
+        EnvSet("VOICEKIT_MODULE_SCRIPT", m.body)
+        EnvSet("VOICEKIT_MODULE_ERROR", errF)
+        if (shim != "") {
+            ; Under a shim the body IS a test run: VkTestMode() true in it
+            ; (a body that skips its real side effect when tested skips it
+            ; here too), its uncaught error stays out of the user's
+            ; errors.log and lands in the shared test log, tagged with its
+            ; own script. Its VkResult values aren't the run's.
+            EnvSet("VOICEKIT_RUN_SCRIPT", m.body)
+            EnvSet("VOICEKIT_TEST", "1")
+            EnvSet("VOICEKIT_RESULT_FILE")
+        }
+        SetTimer(Watch, 100)
+        try
+            code := RunWait('"' A_AhkPath '" /ErrorStdOut ' inc '"' m.body '"', root, , &pid)
+        catch {
+            r.reason := "Couldn't start module '" m.phrase "'."
+            return r
+        }
+        SetTimer(Watch, 0)
+        if (why = "abort") {
+            r.aborted := true
+            r.reason := "Stopped while module '" m.phrase "' was running."
+            return r
+        }
+        if (why = "timeout") {
+            r.reason := "Module '" m.phrase "' didn't finish within " secs " s and was stopped."
+            r.detail := WfModuleDetail(m.module, root, started, "")
+            return r
+        }
+        r.code := code
+        if (code != 0) {
+            r.reason := "Module '" m.phrase "' failed (exit code " code ")."
+            r.detail := WfModuleDetail(m.module, root, started, errF, code)
+            return r
+        }
+        ; A cooperative stop (stop_module / the Stop flag) ends a body with
+        ; ExitApp() = exit 0 — but it did NOT finish its job. BodyStopRequested
+        ; leaves this marker in a body a module step started.
+        if FileExist(errF ".stopped") {
+            r.reason := "Module '" m.phrase "' was stopped before it finished."
+            return r
+        }
+        r.ok := true
+        return r
+    } catch {
+        r.reason := "Module '" m.phrase "' couldn't be run."
+        return r
+    } finally {
+        SetTimer(Watch, 0)
+        for k, v in saved
+            (v = "") ? EnvSet(k) : EnvSet(k, v)       ; EnvSet(k) alone removes it
+        WfDeleteSoon(errF)
+        WfDeleteSoon(errF ".stopped")
+    }
+}
+
+; The LOCAL popup's extra lines for a failed module: what it said last
+; (BodyStatus, only if written during this run) and, after an uncaught
+; error, the error's text. Never recorded — either may name a client.
+WfModuleDetail(base, root, started, errF, code := "") {
+    out := ""
+    try {
+        st := WfCommonFn("BodyStatusRead")(base, root)
+        if (IsObject(st) && st.when >= started)
+            out .= "Its last status:  " st.text
+    }
+    try {
+        if (errF != "" && FileExist(errF))
+            out .= (out = "" ? "" : "`n") "Its error:  " Trim(FileRead(errF, "UTF-8"), " `t`r`n")
+        else if (code = 2)
+            out .= (out = "" ? "" : "`n") "Exit code 2 usually means its script doesn't load — "
+                . "open it in an editor, or check it with the Voice Kit window."
+    }
+    return out
+}
+
+; The isolated modules a module step can run, as {phrase, module} in
+; bridge-map order — the Studio's dropdown.
+WfModuleChoices(root := "") {
+    if (root = "")
+        root := WfModuleRootDir()
+    out := []
+    for e in WfCommonFn("BridgeMapEntries")(root) {
+        base := WfModuleFileBase(e.file)
+        if !RegExMatch(e.file, "i)\.hotkey\.ahk$") && FileExist(root "\" WfCommonFn("HotkeyBodyRel")(base))
+            out.Push({phrase: e.phrase, module: base})
+    }
+    return out
+}
+
 ; Replace every {{Name}} in `text` with its value. An UNKNOWN name is left
 ; exactly as written, on purpose: no workflow saved before this existed can
 ; change behaviour, and a mistyped name shows up on screen instead of
@@ -1011,9 +1306,11 @@ WfSelectionQuoted(name) {
 ; sense. Done out here so WfRunStep needs no knowledge of values at all.
 ;
 ; Deliberately NOT substituted: `wait` milliseconds, recorded coordinates and
-; condition types (paramC — with ONE exception, below), `move` positions, and
-; an `ask` step's label or suggestion — asks are gathered before step 1, so
-; nothing would be resolvable there anyway.
+; condition types (paramC — with ONE exception, below), `move` positions, a
+; `module` step's module and seconds (which program a run starts is fixed
+; when the workflow is written — never picked by a batch row), and an `ask`
+; step's label or suggestion — asks are gathered before step 1, so nothing
+; would be resolvable there anyway.
 ;
 ; The exception: a `fill` step's paramC is the VALUE to put in the box, and a
 ; value is exactly what {{Name}} is for (a batch row's column, an ask answer).
@@ -1631,6 +1928,8 @@ WfUiaFieldValue(hwnd, name) {
 ;     "Amount#2" = the 2nd input labelled Amount in tree order;
 ;     "##" writes a literal "#". Several matches and no #N: the FIRST
 ;     is filled and the run log says so. 3 s budget, abort-aware.
+;     OR by the text before it — `after "Insurance"` (WfFillAfterFind):
+;     the label then never has to match the box's own name.
 ;  2. Refuses a DISABLED box, before anything is typed.
 ;  3. CLICKS it for real (UiaClickEl: scroll-into-view rescue, fail
 ;     loudly with no rectangle). Only when there is nowhere to click
@@ -1666,13 +1965,18 @@ WfUiaFieldValue(hwnd, name) {
 ; ordinary control is MSAA-only). Never set in production.
 global wfFillUiaOff := false
 
-; A fill label -> {name, occ, explicit, err}. "Amount#2" -> Amount, 2nd
-; input. "##" is a literal "#" ("Line ##4" is the label "Line #4"), and a
+; A fill label -> {name, occ, explicit, err, anchors}. "Amount#2" -> Amount,
+; 2nd input. "##" is a literal "#" ("Line ##4" is the label "Line #4"), and a
 ; single "#" not followed by digits at the end is literal too ("Box #A").
-; Spaces before the "#N" are dropped with the rest of the trim.
+; Spaces before the "#N" are dropped with the rest of the trim. anchors is []
+; for a label — see WfFillAfterLabel for the `after "..."` form.
 ; Mirrored by mcp\voicekit_writer.fill_label (same table in both tests).
 WfFillLabel(raw) {
     s := Trim(raw)
+    ; [ \t\n\r\f], not \s: Python's \s also takes a vertical tab, and the
+    ; writer's mirror (_fill_after_label) must parse exactly this.
+    if RegExMatch(s, "i)^after[ \t\n\r\f]*`"")
+        return WfFillAfterLabel(s)
     occ := 1, explicit := false
     ; An ODD run of # before the trailing digits: the last one is the
     ; separator, the rest are ## pairs. An even run is all pairs — literal.
@@ -1687,7 +1991,73 @@ WfFillLabel(raw) {
         err := "This fill step has no label — give the input's label as it appears on screen."
     else if (explicit && occ < 1)
         err := "`"#0`" isn't an input number — count from #1 (the first input with that label)."
-    return {name: name, occ: occ, explicit: explicit, err: err}
+    return {name: name, occ: occ, explicit: explicit, err: err, anchors: []}
+}
+
+; The RELATIVE form (2026-10-12): the box is found by the text BEFORE it, for
+; a page whose boxes all carry one accessible name (a tax app named every
+; input "expanded detail input"):
+;     after "Insurance"                   the first input after that text
+;     after "Deductions" > "Insurance"    "Insurance" after "Deductions"
+;     after "Insurance"#2                 the 2nd input after it
+; Each text is in double quotes (so it can hold > or # freely — no ##
+; escaping inside quotes) and can't contain a double quote. name is the
+; canonical spelling, anchors the texts; on an error name is the trimmed
+; input and anchors is []. The error texts never repeat the label (a
+; {{Name}} filled in could be client data).
+WfFillAfterLabel(s) {
+    out := {name: s, occ: 1, explicit: false, err: "", anchors: []}
+    RegExMatch(s, "i)^after[ \t\n\r\f]*", &m)
+    rest := SubStr(s, m.Len + 1)            ; starts at the first quote
+    anchors := []
+    loop {
+        if !RegExMatch(rest, "^`"([^`"]*)`"[ \t\n\r\f]*", &q) {
+            out.err := (SubStr(rest, 1, 1) = "`"")
+                ? "A quote in this fill label is never closed — write after `"Insurance`" "
+                . "(a double quote can't be part of the text itself)."
+                : "`"after`" needs its text in double quotes — after `"Insurance`", or "
+                . "after `"Deductions`" > `"Insurance`"."
+            return out
+        }
+        a := Trim(q[1])
+        if (a = "") {
+            out.err := "An after `"`" in this fill label is empty — put the text that comes "
+                . "just before the box between the quotes."
+            return out
+        }
+        anchors.Push(a)
+        rest := SubStr(rest, q.Len + 1)
+        if (rest = "")
+            break
+        if (SubStr(rest, 1, 1) = ">") {
+            rest := LTrim(SubStr(rest, 2))
+            if (rest = "") {
+                out.err := "This fill label ends with `">`" — follow it with the next quoted "
+                    . "text: after `"Deductions`" > `"Insurance`"."
+                return out
+            }
+            continue
+        }
+        if RegExMatch(rest, "^#(\d+)\z", &n) {         ; \z: PCRE's $ also passes a final CR/LF
+            out.occ := StrLen(n[1]) > 6 ? 999999 : Integer(n[1])
+            out.explicit := true
+            if (out.occ < 1) {
+                out.err := "`"#0`" isn't an input number — count from #1 (the first input "
+                    . "after the text)."
+                return out
+            }
+            break
+        }
+        out.err := "Unexpected text after a quoted part of this fill label — chain texts with > "
+            . "(after `"Deductions`" > `"Insurance`"), end with #2 to pick the 2nd box, and "
+            . "leave double quotes out of the text itself."
+        return out
+    }
+    name := "after"
+    for i, a in anchors
+        name .= (i = 1 ? " " : " > ") "`"" a "`""
+    out.name := name, out.anchors := anchors
+    return out
 }
 
 ; Put `value` into the input labelled `label` in window `win` and check it
@@ -1696,10 +2066,15 @@ WfFillLabel(raw) {
 ; shownWin / shownLabel: the step AS WRITTEN, used to name the box in any
 ; message (a {{Name}} filled in could carry client data).
 WfFill(win, label, value, shownWin := "", shownLabel := "") {
+    global wfFillAfterBudgetMs
     r := {err: "", detail: "", notes: []}
     lab := WfFillLabel(label)
     shown := WfFillLabel(shownLabel != "" ? shownLabel : label)
+    ; How every message names the box: `input labelled "Amount" #2`, or for
+    ; the relative form `input after "Deductions" > "Insurance" #2`.
     q := "`"" shown.name "`"" (shown.explicit ? " #" shown.occ : "")
+    box := shown.anchors.Length ? "input " shown.name (shown.explicit ? " #" shown.occ : "")
+        : "input labelled " q
     shownWin := (shownWin != "") ? shownWin : win
     if (lab.err != "") {
         r.err := lab.err
@@ -1707,7 +2082,7 @@ WfFill(win, label, value, shownWin := "", shownLabel := "") {
     }
     ; SendText turns a line break into Enter — which submits a web form.
     if RegExMatch(value, "[\r\n]") {
-        r.err := "The value for the input labelled " q " has a line break in it. A fill types "
+        r.err := "The value for the " box " has a line break in it. A fill types "
             . "one line (a line break would press Enter, which can submit the form) — use a "
             . "Type text step for multi-line text."
         return r
@@ -1724,6 +2099,15 @@ WfFill(win, label, value, shownWin := "", shownLabel := "") {
     if !(hwnd := WinExist(win))
         return (r.err := "Window not found: " shownWin, r)
 
+    if lab.anchors.Length {             ; after "..." — found by the text before it
+        f := WfFillAfterFind(hwnd, lab, shown, shownWin, box
+            , wfFillAfterBudgetMs > 0 ? wfFillAfterBudgetMs : 3000)
+        for note in f.notes
+            r.notes.Push(note)
+        if !f.found
+            return (r.err := WfAborted() ? "Stopped." : f.reason, r)
+        return WfFillUia(f.el, value, box, r)
+    }
     f := WfFillFind(hwnd, lab.name, lab.occ)
     if !f.found {
         if WfAborted()
@@ -1744,29 +2128,30 @@ WfFill(win, label, value, shownWin := "", shownLabel := "") {
     if (f.count > 1 && !lab.explicit)
         r.notes.Push(f.count " inputs are labelled `"" shown.name "`" — filled the FIRST. Write `""
             . shown.name "#2`" (and so on) in the label to pick another.")
-    return (f.kind = "uia") ? WfFillUia(f.el, value, q, r) : WfFillAcc(f.node, value, q, r)
+    return (f.kind = "uia") ? WfFillUia(f.el, value, box, r) : WfFillAcc(f.node, value, box, r)
 }
 
-; The UIA half of WfFill, from "found it" on.
-WfFillUia(el, value, q, r) {
+; The UIA half of WfFill, from "found it" on. box names the input in every
+; message (`input labelled "Amount"`) — never the value.
+WfFillUia(el, value, box, r) {
     if !UiaEnabled(el)
-        return (r.err := "The input labelled " q " is disabled — nothing was typed.", r)
+        return (r.err := "The " box " is disabled — nothing was typed.", r)
     pw := UiaIsPassword(el)
     if UiaClickEl(el, WfClickJitter(), "Left", 1, &why) {
         gate := WfFillFocusGate(el)
         if !gate.ok
-            return WfFillGateFail(q, gate.desc, r)
+            return WfFillGateFail(box, gate.desc, r)
         WfFillType(value)
     } else if UiaSetValue(el, value) {
         ; Nowhere to click (virtualized / collapsed) but the box takes a value
         ; directly: set it, and let the readback decide whether that counted.
-        r.notes.Push("the input labelled " q " had nowhere to click, so its value was set "
+        r.notes.Push("the " box " had nowhere to click, so its value was set "
             . "directly through UI Automation — no keystrokes reached the app")
         Sleep(200)
     } else
-        return (r.err := "Couldn't click the input labelled " q ": " why, r)
+        return (r.err := "Couldn't click the " box ": " why, r)
     if pw {
-        r.notes.Push("the input labelled " q " is a password box — filled, not verified (a password box can't be read back)")
+        r.notes.Push("the " box " is a password box — filled, not verified (a password box can't be read back)")
         Sleep(150)
         return r
     }
@@ -1785,15 +2170,15 @@ WfFillUia(el, value, q, r) {
         readable := copied || value = ""
         return text
     }
-    return WfFillVerify(ReadUia, value, q, r)
+    return WfFillVerify(ReadUia, value, box, r)
 }
 
 ; The MSAA half of WfFill: a desktop input only MSAA exposes. Same rules —
 ; enabled, a real click, the focus gate, the readback.
-WfFillAcc(node, value, q, r) {
+WfFillAcc(node, value, box, r) {
     st := AccState(node.acc, node.child)
     if (st & ACC_STATE_UNAVAILABLE())
-        return (r.err := "The input labelled " q " is disabled — nothing was typed.", r)
+        return (r.err := "The " box " is disabled — nothing was typed.", r)
     p := WfClickPoint(node.loc)
     prev := A_CoordModeMouse
     CoordMode("Mouse", "Screen")
@@ -1802,12 +2187,12 @@ WfFillAcc(node, value, q, r) {
     deadline := A_TickCount + 1000
     while !WfFillAccFocused(node) {
         if (A_TickCount >= deadline || WfAborted())
-            return WfFillGateFail(q, "(another control — MSAA doesn't name it)", r)
+            return WfFillGateFail(box, "(another control — MSAA doesn't name it)", r)
         Sleep(100)
     }
     WfFillType(value)
     if (st & ACC_STATE_PROTECTED()) {
-        r.notes.Push("the input labelled " q " is a password box — filled, not verified (a password box can't be read back)")
+        r.notes.Push("the " box " is a password box — filled, not verified (a password box can't be read back)")
         Sleep(150)
         return r
     }
@@ -1815,12 +2200,12 @@ WfFillAcc(node, value, q, r) {
         readable := true
         return AccValue(node.acc, node.child)
     }
-    return WfFillVerify(ReadAcc, value, q, r)
+    return WfFillVerify(ReadAcc, value, box, r)
 }
 
-WfFillGateFail(q, focusDesc, r) {
+WfFillGateFail(box, focusDesc, r) {
     r.err := WfAborted() ? "Stopped."
-        : "Clicked the input labelled " q ", but the keyboard focus went somewhere else — "
+        : "Clicked the " box ", but the keyboard focus went somewhere else — "
         . "nothing was typed, so nothing landed in the wrong box. (A pop-up or the page itself "
         . "moved the focus; a Press keys {Esc} step before this one clears a pop-up.)"
     r.detail := "The keyboard focus was on:  " focusDesc
@@ -1840,7 +2225,7 @@ WfFillType(value) {
 
 ; Read the box back (readFn(&readable) -> text) and compare. Retried for up
 ; to a second: a box that reformats as you type settles a moment later.
-WfFillVerify(readFn, value, q, r) {
+WfFillVerify(readFn, value, box, r) {
     deadline := A_TickCount + 1000
     loop {
         got := readFn.Call(&readable)
@@ -1855,9 +2240,9 @@ WfFillVerify(readFn, value, q, r) {
     if WfAborted()
         return (r.err := "Stopped.", r)
     if !readable
-        return (r.err := "Typed into the input labelled " q " but couldn't read it back to "
+        return (r.err := "Typed into the " box " but couldn't read it back to "
             . "check it — use a Type text step if this box can't be verified.", r)
-    r.err := "Value in the input labelled " q " did not match after typing — the app rejected, "
+    r.err := "Value in the " box " did not match after typing — the app rejected, "
         . "cut short or changed it. (The values are left out of this message on purpose.)"
     r.detail := "Typed:  " value "`nThe box holds:  " got
     return r
@@ -1976,6 +2361,272 @@ WfFillUiaInputs(hwnd, name) {
             out.Push(e)
     }
     return {inputs: out, sawName: saw}
+}
+
+; ---- the relative form: `after "Deductions" > "Insurance"#2` -------------
+;  For a page whose inputs all share one accessible name (measured: every box
+;  on a tax app's screen was "expanded detail input"), so no label can tell
+;  them apart — but the text BEFORE each box can. Deterministic, in UIA tree
+;  (document) order:
+;   - ONE FindAll(TrueCondition) from the WINDOW ROOT, never a search started
+;     from a sub-element (lib\UIA.ahk's header: Chrome can answer those with an
+;     element from outside the start), read up to the node budget.
+;   - In a browser (WfIsBrowserWindow) the scan covers ONLY the first
+;     Document — the page — and its subtree: the tab strip and address bar
+;     come first in the tree and carry the page's title (the first input
+;     after a TAB is the address bar, and what is typed there goes to the
+;     search provider), and browser UI after the page (a side panel's search
+;     box) must not be counted either. Tree order is pre-order, so the
+;     page's subtree is one contiguous run after the Document; its end is
+;     found by a binary search over UiaIsWithin (WfFillSubtreeEnd). No Document
+;     yet (a tab still building, a discarded one) = not found, retried like
+;     any miss — never a fallback to the whole window.
+;     The root (the window, named by its title) never counts.
+;   - Each anchor is the first element after the previous one whose Name
+;     EQUALS its text (trimmed, case-insensitive); only when none does, the
+;     first whose Name CONTAINS it. A note says when several matched or the
+;     contains rule was used — never the matched element's own text (page
+;     text can be client data). Matches nested inside the first one (a web
+;     heading's own text node, a group named after its heading) aren't
+;     counted as "several".
+;   - `>` means WITHIN (2026-10-12, feedback #4: "the input after Insurance,
+;     within section X"). An anchor followed by another is a SECTION; when
+;     its element is a CONTAINER — its subtree holds an input, or a named
+;     element whose name isn't part of its own (WfFillSectionEnd) — the
+;     next anchor and the input are searched ONLY inside that subtree (its
+;     tree-order end, like the page's), and a miss there FAILS naming the
+;     section ('No "Insurance" inside "Deductions"', "Only K inputs come
+;     after ... inside ...") instead of reaching the next section's box.
+;     A bare heading (nothing inside it, or only its own text — a browser
+;     heading's text is a child node) can't bound anything: the next anchor
+;     is looked for AFTER it, as before, and the run log says the search was
+;     ordered, not bounded. Bounds nest: a bare heading inside a container
+;     section still stops at the container's end.
+;   - The input is then the Nth input after the last anchor (inside the
+;     innermost container section, if any): Edit, ComboBox, Spinner — the
+;     same kinds as a label fill, a combo's inner Edit counted once (as the
+;     combo, which comes first in the tree).
+;  UIA only (Win32 controls are in the UIA tree too); no MSAA fallback.
+;  Everything after "found it" is the label fill's own WfFillUia.
+
+; Self-tests only: lowers the node budget a relative find reads, to prove the
+; "stopped at N elements" message (0 = UIA_NODE_BUDGET()).
+global wfFillNodeBudget := 0
+; Self-tests only: a Win32 test window is never a browser and has no
+; Document, so these let a test drive the browser rule — "" = detect
+; (WfIsBrowserWindow), true/false = treat the window as one or not; and the
+; control type that counts as the page (0 = UIA_TYPE_DOCUMENT()).
+global wfFillAsBrowser := ""
+global wfFillPageType := 0
+; Self-tests only: shortens the 3 s retry a relative find gives a page that
+; builds late (0 = 3000 ms), so a suite proving its many refusals stays
+; inside the runner's time limit.
+global wfFillAfterBudgetMs := 0
+
+; The last index in all[i..last] (a pre-order FindAll; last 0 = the end)
+; that lies inside all[i]: the subtree is one contiguous run, so a binary
+; search over UiaIsWithin finds its end in log2(n) parent walks. The page's
+; end (a browser's Document) and a container section's end.
+WfFillSubtreeEnd(all, i, last := 0) {
+    lo := i, hi := last ? last : all.Length
+    if UiaIsWithin(all[hi], all[i])
+        return hi
+    while (hi - lo > 1) {
+        mid := (lo + hi) // 2
+        if UiaIsWithin(all[mid], all[i])
+            lo := mid
+        else
+            hi := mid
+    }
+    return lo
+}
+
+; Is the anchor at all[i] a SECTION that contains its content? Returns the
+; tree-order end of its subtree (capped at last), or 0 for a bare heading.
+; A container holds an input, or a named element whose name isn't part of
+; its own — so a browser heading, whose only child is its own text node
+; (or a link saying the same), stays a heading. nameAt(j) is the caller's
+; cached lower-cased trimmed name.
+WfFillSectionEnd(all, i, last, nameAt) {
+    if (i >= last || !UiaIsWithin(all[i + 1], all[i]))
+        return 0                                ; pre-order: no child = nothing inside
+    e := WfFillSubtreeEnd(all, i, last)
+    own := nameAt(i)
+    loop e - i {
+        j := i + A_Index
+        ct := UiaControlType(all[j])
+        if (ct = UIA_TYPE_EDIT() || ct = UIA_TYPE_COMBOBOX() || ct = UIA_TYPE_SPINNER())
+            return e
+        s := nameAt(j)
+        if (s != "" && !InStr(own, s, true))
+            return e
+    }
+    return 0
+}
+
+; How many of the matches at idx (ascending indices into all) are NOT nested
+; inside the first — a web heading's own text node, a group named after its
+; heading, say the same thing once.
+WfFillDistinct(all, idx) {
+    n := 1
+    loop idx.Length - 1
+        if !UiaIsWithin(all[idx[A_Index + 1]], all[idx[1]])
+            n += 1
+    return n
+}
+
+; {found, el, reason, notes}: retried for 3 s like a label fill (a page builds
+; late), abort-aware. reason names the anchors as WRITTEN (shown).
+WfFillAfterFind(hwnd, lab, shown, shownWin, box, budgetMs := 3000) {
+    deadline := A_TickCount + budgetMs
+    loop {
+        res := WfFillAfterOnce(hwnd, lab, shown, shownWin, box)
+        if (res.found || res.final || A_TickCount >= deadline || WfAborted())
+            return res
+        if !WfSleep(150)
+            return res
+    }
+}
+
+WfFillAfterOnce(hwnd, lab, shown, shownWin, box) {
+    global wfFillUiaOff, wfFillNodeBudget, wfFillAsBrowser, wfFillPageType
+    res := {found: false, final: false, el: "", reason: "", notes: []}
+    ; The k-th anchor as written ("part k" if a {{Name}} changed the shape).
+    Said(k) => (shown.anchors.Length = lab.anchors.Length) ? "`"" shown.anchors[k] "`"" : "part " k " of the label"
+    if (wfFillUiaOff || !UiaAvailable()) {
+        res.final := true
+        res.reason := "Finding the " box " needs UI Automation, which isn't available here."
+        return res
+    }
+    if !(root := UiaFromWindow(hwnd, &why)) {
+        res.reason := "Couldn't search  " shownWin "  for the " box ": " why
+        return res
+    }
+    budget := (wfFillNodeBudget > 0) ? wfFillNodeBudget : UIA_NODE_BUDGET()
+    all := UiaFindAllRaw(root, UiaTrueCondition(), UIA_SCOPE_SUBTREE(), budget + 1, &err)
+    if (err != "") {
+        res.reason := "Couldn't search  " shownWin "  for the " box ": the search failed (" err ")."
+        return res
+    }
+    cut := all.Length > budget
+    if cut
+        all.Length := budget
+    cutNote := cut ? " (The search stopped at this window's first " budget " elements, so it may "
+        . "simply be further on — anchor on a text nearer the box.)"
+        : " Web pages only build what's near the screen: scroll to it, or add a Wait-until step first."
+    n := all.Length
+    pos := 1                                    ; candidates lie in (pos, n] (the root never counts)
+    browser := (wfFillAsBrowser != "") ? wfFillAsBrowser : WfIsBrowserWindow(hwnd)
+    if browser {
+        pageType := wfFillPageType ? wfFillPageType : UIA_TYPE_DOCUMENT()
+        doc := 0
+        loop n - 1
+            if (UiaControlType(all[A_Index + 1]) = pageType) {
+                doc := A_Index + 1
+                break
+            }
+        if !doc {
+            ; Never the whole window instead: its first box is the address bar.
+            res.reason := "Couldn't find the page in  " shownWin "  (no page document in its UI "
+                . "Automation tree yet) — couldn't find the " box "; the browser's own boxes, like "
+                . "the address bar, are never searched."
+                . (cut ? cutNote : " Wait until the page has loaded (a Wait-until step), then try again.")
+            return res
+        }
+        pos := doc, n := WfFillSubtreeEnd(all, doc)
+    }
+    names := Map()
+    NameAt(i) {
+        if !names.Has(i)
+            names[i] := StrLower(Trim(UiaName(all[i])))
+        return names[i]
+    }
+    within := 0                                 ; the anchor whose subtree bounds the search (0 = none)
+    for k, text in lab.anchors {
+        if (k > 1) {
+            ; `>` = within: the previous anchor is a section. A container
+            ; bounds everything after it to its subtree; a bare heading
+            ; only orders (and the log says so).
+            if (secEnd := WfFillSectionEnd(all, pos, n, NameAt))
+                n := secEnd, within := k - 1
+            else
+                res.notes.Push(Said(k - 1) " has nothing inside it in the UI Automation tree (a "
+                    . "heading, not a section around its content), so " Said(k) " was looked for "
+                    . "AFTER it, not inside it — the search for the " box " is ordered, not bounded "
+                    . "by that section's end.")
+        }
+        want := StrLower(text)
+        exactIdx := [], partIdx := []
+        loop n - pos {
+            i := pos + A_Index
+            s := NameAt(i)
+            if (s = "")
+                continue
+            if (s == want)
+                exactIdx.Push(i)
+            else if InStr(s, want, true)
+                partIdx.Push(i)
+        }
+        after := (k > 1) ? (within = k - 1 ? " inside " : " after ") Said(k - 1) : ""
+        if exactIdx.Length {
+            pos := exactIdx[1]
+            if ((m := WfFillDistinct(all, exactIdx)) > 1)
+                res.notes.Push(m " elements say " Said(k) after " — used the first, for the " box ".")
+        } else if partIdx.Length {
+            pos := partIdx[1]
+            m := WfFillDistinct(all, partIdx)
+            res.notes.Push("nothing says exactly " Said(k) after " — used the first element whose "
+                . "name contains it" (m > 1 ? " (" m " do)" : "") ", for the " box ".")
+        } else {
+            res.reason := (k = 1)
+                ? "Nothing in  " shownWin "  says " Said(k) " (exactly, or as part of its name) — "
+                    . "couldn't find the " box "." cutNote
+                : (within = k - 1)
+                ? "No " Said(k) " inside " Said(k - 1) " in  " shownWin "  — couldn't find the " box
+                    . ". " Said(k - 1) " holds its own content, so the search stays inside it "
+                    . "(it never reaches the next section's boxes)." cutNote
+                : "No " Said(k) " after " Said(k - 1) (within ? " inside " Said(within) : "")
+                    . " in  " shownWin "  — couldn't find the " box "." cutNote
+            return res
+        }
+    }
+    inside := within ? " inside " Said(within) : ""
+    got := 0, prevEdit := ""
+    loop n - pos {
+        e := all[pos + A_Index]
+        ct := UiaControlType(e)
+        if (ct = UIA_TYPE_EDIT()) {
+            p := UiaParent(e)
+            pt := p ? UiaControlType(p) : 0
+            if (pt = UIA_TYPE_COMBOBOX() || pt = UIA_TYPE_SPINNER())
+                continue                        ; a combo's / spinner's own box, already counted
+            prevEdit := e
+        } else if (ct = UIA_TYPE_SPINNER()) {
+            ; A Win32 up-down is its edit's BUDDY: a Spinner right after that
+            ; edit, beside it. Counted with the edit, not as a second input
+            ; (an #N would otherwise land on the arrows, and a click there
+            ; changes the value).
+            buddy := prevEdit, prevEdit := ""
+            if (buddy != "" && UiaSameElement(all[pos + A_Index - 1], buddy)
+                && UiaSameElement(UiaParent(buddy), UiaParent(e)))
+                continue
+        } else if (ct = UIA_TYPE_COMBOBOX()) {
+            prevEdit := ""
+        } else {
+            continue
+        }
+        got += 1
+        if (got = lab.occ) {
+            res.found := true, res.el := e
+            return res
+        }
+    }
+    last := Said(lab.anchors.Length)
+    res.reason := (got = 0)
+        ? "Found " last " in  " shownWin ", but no input box comes after it" inside "." cutNote
+        : "Only " got " input" (got = 1 ? " comes" : "s come") " after " last inside " in  " shownWin
+            . "  — #" lab.occ " asks for input number " lab.occ "." (cut ? cutNote : "")
+    return res
 }
 
 ; Does the box hold what was typed? Deterministic, and never accepts a
@@ -2434,7 +3085,10 @@ WfDesc(s) {
         case "capture":  return "Run  " b "  and save its output as  {{" a "}}"
             . (Trim(c) != "" ? "    (up to " Trim(c) "s)" : "")
         case "keys":     return "Press keys  " a
-        case "fill":     return "Fill  `"" b "`"  with  `"" c "`"    in  " a
+        case "module":   return "Run hotkey module  `"" a "`"  and wait for it to finish"
+            . "    (up to " (Trim(b) != "" ? Trim(b) : "60") "s)"
+        case "fill":     return "Fill  " (RegExMatch(Trim(b), "i)^after\s*`"") ? "the box " Trim(b) : "`"" b "`"")
+                             . "  with  `"" c "`"    in  " a
         case "click":    return "Click  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a
         case "dblclick": return "Double-click  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a
         case "rclick":   return "Right-click  " (b != "" ? "`"" b "`"" : "at (" c ")") "    in  " a

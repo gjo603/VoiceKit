@@ -4,6 +4,9 @@
 > history and design notes live here). "Above"/"below" may point into a sibling
 > file — `CLAUDE.md`'s architecture index says which file holds which section,
 > and "the traps section" / "the lockstep list" are in `CLAUDE.md` itself.
+> `CLAUDE.md` is a LOCAL file (gitignored since 2026-10-12, not in a clone or
+> an install): where it is missing, the code comments and these files are the
+> record — the lockstep lists are enforced by `mcp\test_conformance.py`.
 
 How the resident master stays up: the reload preflight and quarantine, the boot launcher, runtime error capture, the watchdog and safe mode, and health reporting.
 

@@ -45,7 +45,8 @@ Voice Access and auto-start). Then they say *open voice kit*.
 
 The build packages **git-tracked files plus your uncommitted edits to them**, then
 drops dev-only files (`build\`, `CLAUDE.md`, `docs\`, `tests\`, `.gitignore`,
-`.gitattributes`) and the legacy `Setup.bat` (it does a fragile in-place install;
+`.gitattributes`; `CLAUDE.md` is a local development file, untracked since
+2026-10-12, and stays listed only as a backstop) and the legacy `Setup.bat` (it does a fragile in-place install;
 the package uses `Install-VoiceKit.cmd`). The per-user files (`bridge-map.txt`,
 `hotkeys\_index.ahk`, `hotkeys\Snippets.ahk`) are gitignored and never ship —
 only their committed `*.default` versions do, and VoiceKit makes the live copies on

@@ -289,6 +289,14 @@ FileAppend("#Requires AutoHotkey v2.0`n#SingleInstance Off`n#NoTrayIcon`n"
     . "o .= '``n' (IsObject(s) ? 'FILL|' s[1][3] '|' s[1][4] : 'ERR|' e)`n"
     . "s := ParseDraft('[{`"type`":`"fill`",`"a`":`"w`",`"c`":`"x`"}]', &e)`n"
     . "o .= '``n' (IsObject(s) ? 'ACCEPTED' : 'REFUSED|' e)`n"
+    ; the relative label (after "<text>") survives intact; a broken one is refused
+    . "s := ParseDraft('[{`"type`":`"fill`",`"a`":`"w`",`"b`":`"after \`"Deductions\`" > \`"Insurance\`"#2`",`"c`":`"v`"}]', &e)`n"
+    . "o .= '``n' (IsObject(s) ? 'FILL|' s[1][3] : 'ERR|' e)`n"
+    . "s := ParseDraft('[{`"type`":`"fill`",`"a`":`"w`",`"b`":`"after \`"Deductions\`" >`",`"c`":`"v`"}]', &e)`n"
+    . "o .= '``n' (IsObject(s) ? 'ACCEPTED' : 'REFUSED|' e)`n"
+    ; module (2026-10-12): the drafter can't know module names -- refused by name
+    . "s := ParseDraft('[{`"type`":`"module`",`"a`":`"send number`",`"b`":`"60`"}]', &e)`n"
+    . "o .= '``n' (IsObject(s) ? 'ACCEPTED' : 'REFUSED|' e)`n"
     . 'FileAppend(o, "' dOut '", "UTF-8")' "`nExitApp`n", dScript, "UTF-8")
 Run('"' A_AhkPath '" /ErrorStdOut "' dScript '"', , "Hide", &dpid)
 if ProcessWaitClose(dpid, 20)           ; bounded: a runtime error dialog must not wedge the suite
@@ -305,6 +313,12 @@ Check("...a fill keeps its label and its VALUE (paramC) exactly",
     dl.Length >= 3 && dl[3] == "FILL|Amount#2| {{Inv}} 1,234.50", dres)
 Check("...and a fill with no box label is refused", dl.Length >= 4 && InStr(dl[4], "REFUSED|") = 1
     && InStr(dl[4], "fill"), dres)
+Check("...a relative fill label (after `"...`") is kept exactly",
+    dl.Length >= 5 && dl[5] == 'FILL|after "Deductions" > "Insurance"#2', dres)
+Check("...and a broken one is refused with the label's own message", dl.Length >= 6
+    && InStr(dl[6], "REFUSED|") = 1 && InStr(dl[6], 'ends with ">"'), dres)
+Check("Draft With AI: a module step is refused, by name", dl.Length >= 7
+    && InStr(dl[7], "REFUSED|") = 1 && InStr(dl[7], "module") && InStr(dl[7], "Workflow Studio"), dres)
 
 wfRunQuiet := false
 SetWorkingDir(A_ScriptDir)

@@ -38,6 +38,7 @@
 #Include "%A_LineFile%\..\Clip.ahk"
 
 ; Send at level 1, restoring the caller's level. See header.
+; Returns nothing.
 BrowserSend(keys) {
     prev := A_SendLevel
     SendLevel(1)
@@ -45,6 +46,8 @@ BrowserSend(keys) {
     finally SendLevel(prev)
 }
 
+; SendText at level 1, restoring the caller's level (see BrowserSend).
+; Returns nothing.
 BrowserSendText(text) {
     prev := A_SendLevel
     SendLevel(1)
@@ -55,6 +58,8 @@ BrowserSendText(text) {
 ; Bring the browser window forward; false if it can't be. Every
 ; keystroke helper starts here — sending into whatever happens to be
 ; active is exactly the incident this lib exists to prevent.
+; Returns true when the window is active, false when it doesn't exist or
+; didn't activate within 2 s.
 BrowserActivate(hwnd) {
     if !WinExist("ahk_id " hwnd)
         return false
@@ -68,6 +73,8 @@ BrowserActivate(hwnd) {
 ; is built around: ^l leaves keyboard focus in the omnibox, so grab the
 ; PAGE first when you need both — or use BrowserGrabPage, which
 ; recovers on its own.
+; Returns the URL text, or "" when the window can't be activated or the copy
+; got nothing.
 BrowserUrl(hwnd, timeoutMs := 2000) {
     if !BrowserActivate(hwnd)
         return ""
@@ -83,6 +90,8 @@ BrowserUrl(hwnd, timeoutMs := 2000) {
 
 ; True when a grab is suspicious: empty, too short, or shaped like a
 ; bare URL — the signature of ^a^c fired while focus sat in the omnibox.
+; Returns true when the grab is suspicious, false for text that looks like a
+; real page.
 BrowserLooksLikeUrlOnly(text, minChars := 400) {
     t := Trim(text, " `t`r`n")
     return t = "" || StrLen(t) < minChars || RegExMatch(t, "^https?://\S+$") != 0
@@ -92,6 +101,8 @@ BrowserLooksLikeUrlOnly(text, minChars := 400) {
 ; looks like a stranded-omnibox result (see above), Esc back to the
 ; page and try once more, then return whatever the second attempt got —
 ; a genuinely short page stays reportable. Clipboard restored.
+; Returns the copied text (possibly short), or "" when the window can't be
+; activated or nothing was copied.
 BrowserGrabPage(hwnd, minChars := 400, timeoutMs := 3000) {
     if !BrowserActivate(hwnd)
         return ""
@@ -120,6 +131,8 @@ BrowserGrabPage(hwnd, minChars := 400, timeoutMs := 3000) {
 ; (The self-test's pretend browser swaps in an error URL instead, which a
 ; real browser doesn't.) When it matters, follow this with a check for
 ; landmark text only the real page carries — UiaTextPresent(hwnd, ...).
+; Returns true once the omnibox shows `fragment`; false for an empty fragment,
+; a window that won't activate, or a timeout.
 BrowserEnsureDomain(hwnd, fragment, timeoutMs := 15000) {
     fragment := Trim(fragment)
     if (fragment = "")
@@ -169,6 +182,9 @@ BrowserEnsureDomain(hwnd, fragment, timeoutMs := 15000) {
 ; had focus — the one the text really landed in — and reported success.
 ; One short re-read allows for controls that publish their value a beat
 ; after the keystrokes.
+; Returns true only when the field reads back exactly `text`; false when the
+; field isn't found, the window won't activate, the click has nowhere to land,
+; or the readback differs.
 BrowserTypeVerified(hwnd, elementName, text, timeoutMs := 3000) {
     el := UiaFindEdit(hwnd, elementName, timeoutMs)
     if (el = "")

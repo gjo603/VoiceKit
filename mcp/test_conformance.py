@@ -102,11 +102,18 @@ STEPS = [
     # timeout seconds — and the blank-timeout form (the engine's 30 s).
     ("capture", "Invoice Data", r'python "C:\x y\invoice.py" {{selected_files}} | findstr 100%', "90"),
     ("capture", "Stamp", "echo %DATE%", ""),
+    # module: a hotkey module's phrase (a | and % in it must survive) + the
+    # wait in paramB, and the blank-wait form (the engine's 60 s).
+    ("module", "send | number 100%", "120", ""),
+    ("module", "open toggle timer", "", ""),
     # fill: window | label (with an occurrence suffix and a literal ##) |
     # VALUE in paramC — the one paramC the engine substitutes — plus the
     # empty value that clears a box.
     ("fill", "ahk_exe chrome.exe", "Amount | Line ##1#2", "{{Amount}} 1,234.50 | 100%"),
     ("fill", "ahk_exe chrome.exe", "Memo", ""),
+    # the relative label (2026-10-12): quotes, a > chain, a | and % inside an
+    # anchor, and an occurrence - all must survive the round trip.
+    ("fill", "ahk_exe chrome.exe", 'after "Deductions | 100%" > "Insurance"#2', "{{Ins}}"),
     # waitfor: condType alone, condType + seconds, and the windowless clipboard
     # wait — paramC carries both halves and must survive the round trip.
     ("waitfor", "ahk_exe notepad.exe", "Save | As...", "elementexists"),
@@ -261,6 +268,8 @@ def test_uia_probe_tree_reads_a_real_window():
             'g := Gui("+AlwaysOnTop", "VKConformanceUia_ZZ")\n'
             'g.AddText("w220", "Probe Label Zz")\n'
             'g.AddButton("w220", "Probe Button Zz")\n'
+            # A row two levels down (window > list > row): what max_depth=1 cuts.
+            'g.AddListView("w220 h60", ["Col"]).Add(, "Deep Row Zz")\n'
             'g.Show("x0 y0 NoActivate")\n'          # do not steal the user's focus
             'SetTimer(() => ExitApp(0), -60000)\n',
             encoding="utf-8")
@@ -272,10 +281,38 @@ def test_uia_probe_tree_reads_a_real_window():
             assert got["lines"] >= 3, got
             assert "note" not in got, got            # nowhere near the cap
 
+            # The walk's own numbers come back (2026-10-12): nothing was cut
+            # in a three-control window, and the fingerprint is 8 hex digits.
+            assert got["nodes"] >= 3 and got["cut_at_depth"] == 0, got
+            assert got["budget_hit"] is False, got
+            assert re.fullmatch(r"[0-9a-f]{8}", got["fingerprint"]), got
+
             # The filter narrows the report but keeps the walk (and the indent).
             filt = vk.dump_uia_tree("VKConformanceUia_ZZ", name_filter="Probe Button")
             assert 'Button "Probe Button Zz"' in filt["tree"], filt["tree"]
             assert "Probe Label Zz" not in filt["tree"], filt["tree"]
+            # ...so the fingerprint ignores the filter (same depth, same page).
+            same = vk.dump_uia_tree("VKConformanceUia_ZZ", max_depth=8,
+                                    name_filter="Probe Button")
+            assert same["fingerprint"] == vk.dump_uia_tree(
+                "VKConformanceUia_ZZ", max_depth=8)["fingerprint"], same
+
+            # A filter that matches nothing in a COMPLETE walk says so...
+            none = vk.dump_uia_tree("VKConformanceUia_ZZ", name_filter="NoSuchNameZzQ")
+            assert none["lines"] == 0 and "complete walk" in none["note"], none
+            # ...and a walk cut by max_depth says THAT, not "nothing there".
+            shallow = vk.dump_uia_tree("VKConformanceUia_ZZ", max_depth=1,
+                                       name_filter="Deep Row Zz")
+            assert shallow["lines"] == 0 and shallow["cut_at_depth"] >= 1, shallow
+            assert "INCOMPLETE" in shallow["note"], shallow["note"]
+            assert "cut off at max_depth=1" in shallow["note"], shallow["note"]
+            found = vk.dump_uia_tree("VKConformanceUia_ZZ", max_depth=6,
+                                     name_filter="Deep Row Zz")
+            assert found["lines"] >= 1 and "note" not in found, found
+            # A deeper walk of a tree shallower than both depths visits the
+            # same nodes, so it agrees — the fingerprint tracks content only.
+            deep = vk.dump_uia_tree("VKConformanceUia_ZZ", max_depth=60)
+            assert deep["fingerprint"] == got["fingerprint"], (deep, got)
 
             # A window that doesn't exist is an error, not an empty dump.
             try:
@@ -287,6 +324,73 @@ def test_uia_probe_tree_reads_a_real_window():
             p.terminate()
             p.wait(timeout=10)      # the temp dir can't be removed while the
                                     # target still holds its script file
+
+
+def test_dump_uia_tree_says_when_the_walk_was_cut():
+    """2026-10-12 feedback: a dump capped at depth 25 showed a form's inputs
+    as empty groups, and a name_filter for a field's label came back with zero
+    lines and NO warning — nearly concluded "it isn't there". The writer
+    parses the probe's walk stats and turns them into a plain-words note. A
+    fake probe report drives every branch (a live page deep enough to cut
+    isn't something a test can conjure)."""
+    sent = []
+
+    def fake(header: str, tree: str = ""):
+        def run(args, timeout=30):
+            sent.append(args)
+            return header + "\n\n" + tree
+        return run
+
+    orig = vk._run_uia_probe
+    try:
+        base = ("window_title=Return\nwindow_class=Chrome_WidgetWin_1\n"
+                "window_exe=chrome.exe\nmax_depth={d}\nvisited={v}\ncut_at_depth={c}\n"
+                "budget_hit={b}\ntime_hit={t}\nlines_hit=0\nfingerprint=1a2b3c4d\nlines={n}")
+        # A filtered dump that matched nothing because the walk was cut.
+        vk._run_uia_probe = fake(base.format(d=25, v=4100, c=37, b=0, t=0, n=0))
+        r = vk.dump_uia_tree("ahk_exe chrome.exe", max_depth=25, name_filter="insurance")
+        assert (r["nodes"], r["cut_at_depth"], r["budget_hit"], r["fingerprint"]) == \
+            (4100, 37, False, "1a2b3c4d"), r
+        assert "INCOMPLETE" in r["note"] and "37 subtrees were cut off at max_depth=25" \
+            in r["note"] and "raise max_depth" in r["note"], r["note"]
+        assert "time_hit" not in r, r
+        # The cap is 100 now, not 25 — and above it, clamps to 100.
+        vk.dump_uia_tree("x", max_depth=80)
+        vk.dump_uia_tree("x", max_depth=500)
+        assert [a[2] for a in sent[-2:]] == [80, vk.DUMP_MAX_DEPTH] and vk.DUMP_MAX_DEPTH == 100, sent
+        # At the cap, the advice changes (it can't be raised further).
+        vk._run_uia_probe = fake(base.format(d=100, v=900, c=1, b=0, t=0, n=0))
+        r = vk.dump_uia_tree("x", max_depth=100, name_filter="zz")
+        assert "1 subtree was cut off at max_depth=100" in r["note"] and "snippet" in r["note"], r
+        # The node budget and the time cap are named too.
+        vk._run_uia_probe = fake(base.format(d=40, v=6000, c=0, b=1, t=0, n=0))
+        r = vk.dump_uia_tree("x", max_depth=40, name_filter="zz")
+        assert r["budget_hit"] is True and "node budget (6000 nodes)" in r["note"], r
+        # A cut walk's fingerprint is not a page-change detector: a budget
+        # cut covers only the first nodes (said), a time cut is not
+        # reproducible at all (withheld, even from a probe that sent one).
+        assert r["fingerprint"] == "1a2b3c4d" and "covers only those first 6000 nodes" \
+            in r["note"], r
+        vk._run_uia_probe = fake(base.format(d=40, v=2500, c=0, b=0, t=1, n=0))
+        r = vk.dump_uia_tree("x", max_depth=40)
+        assert r.get("time_hit") is True and "time limit after 2500 nodes" in r["note"], r
+        assert r["fingerprint"] == "" and "No fingerprint" in r["note"], r
+        # A complete walk that matched nothing says it really isn't there.
+        vk._run_uia_probe = fake(base.format(d=8, v=120, c=0, b=0, t=0, n=0))
+        r = vk.dump_uia_tree("x", name_filter="zz")
+        assert "complete walk (120 nodes)" in r["note"] and "INCOMPLETE" not in r["note"], r
+        # A complete walk with matches needs no note at all.
+        vk._run_uia_probe = fake(base.format(d=8, v=120, c=0, b=0, t=0, n=1), 'Edit "zz"')
+        r = vk.dump_uia_tree("x", name_filter="zz")
+        assert "note" not in r and r["tree"] == 'Edit "zz"', r
+        # An older probe (no stats lines) still parses: zeros, no note.
+        vk._run_uia_probe = fake("window_title=T\nlines=1", 'Button "b"')
+        r = vk.dump_uia_tree("x")
+        assert (r["nodes"], r["cut_at_depth"], r["budget_hit"], r["fingerprint"]) == \
+            (0, 0, False, ""), r
+        assert "note" not in r, r
+    finally:
+        vk._run_uia_probe = orig
 
 
 def test_uia_probe_focus_report_parses():
@@ -515,7 +619,18 @@ def _run_common_probe(d: Path, body: str, *args: str) -> None:
 # One table for both implementations of the fill label rule (the AHK suite
 # tests\engine-fill-selftest.ahk checks the same rows against the engine).
 FILL_LABELS = ["Amount", "Amount#2", "Amount #2", "Line ##4", "Line ###4", "Box #A",
-               "A##B", "  Name  ", "#3", "Amount#0", "Tax # 12", "x#1234567", "##", "a#b#3"]
+               "A##B", "  Name  ", "#3", "Amount#0", "Tax # 12", "x#1234567", "##", "a#b#3",
+               # the relative form (WfFillAfterLabel / _fill_after_label)
+               'after "Insurance"', 'AFTER"Insurance"', '  after  " Insurance "  ',
+               'after "Deductions" > "Insurance"', 'after "Deductions">"Insurance" #2',
+               'after "Line #4 > x"#3', 'after "a"#0', 'after "a"#1234567', 'after Insurance',
+               'after "Insurance', 'after ""', 'after "  "', 'after "a" >', 'after "a" > ',
+               'after "a" "b"', 'after "a" > b', 'after "say "hi""', 'after "a"#x', 'after "a"##2',
+               'afterwards "x"', 'After', 'after "a" > "" > "b"',
+               # whitespace / line-end parity (review 2026-10-12): a vertical
+               # tab is not whitespace to PCRE, and #N must END the label
+               'after\v"a"', 'after "a"\v', 'after "a"#2\r\n', 'after "a"#2\r',
+               'after "a"#2\n', 'after\r\n"a"']
 
 
 def test_fill_label_matches_the_engine():
@@ -525,14 +640,20 @@ def test_fill_label_matches_the_engine():
     sep = "\x1e"
     with tempfile.TemporaryDirectory() as d:
         src, out, script = Path(d) / "in.txt", Path(d) / "out.txt", Path(d) / "probe.ahk"
-        src.write_text(sep.join(FILL_LABELS), encoding="utf-8")
+        src.write_bytes(sep.join(FILL_LABELS).encode("utf-8"))   # bytes: no LF -> CRLF
         script.write_text(
             "#Requires AutoHotkey v2.0\n#SingleInstance Off\n#NoTrayIcon\n"
             f'#Include "{REAL_ROOT / "lib" / "Workflow.ahk"}"\n'
             "o := ''\n"
             f'for s in StrSplit(FileRead(A_Args[1], "UTF-8"), Chr({ord(sep)})) {{\n'
             "    L := WfFillLabel(s)\n"
-            "    o .= L.name '|' L.occ '|' (L.explicit ? 1 : 0) '|' (L.err != '' ? 1 : 0) '`n'\n"
+            "    a := ''\n"
+            "    for x in L.anchors\n"
+            "        a .= (A_Index > 1 ? Chr(31) : '') x\n"
+            # A name may hold a CR / LF / VT (an error keeps the input): spelled out.
+            "    nm := StrReplace(StrReplace(StrReplace(L.name, '`r', '<CR>'), '`n', '<LF>'), "
+            "Chr(11), '<VT>')\n"
+            "    o .= nm '|' L.occ '|' (L.explicit ? 1 : 0) '|' (L.err != '' ? 1 : 0) '|' a '`n'\n"
             "}\n"
             'FileAppend(o, A_Args[2], "UTF-8")\nExitApp(0)\n', encoding="utf-8")
         r = subprocess.run([vk.AHK_EXE, "/ErrorStdOut", str(script), str(src), str(out)],
@@ -541,7 +662,9 @@ def test_fill_label_matches_the_engine():
         got = out.read_text(encoding="utf-8-sig").split("\n")[:len(FILL_LABELS)]
     for raw, line in zip(FILL_LABELS, got):
         py = vk.fill_label(raw)
-        want = f"{py['name']}|{py['occ']}|{1 if py['explicit'] else 0}|{1 if py['err'] else 0}"
+        nm = py["name"].replace("\r", "<CR>").replace("\n", "<LF>").replace("\v", "<VT>")
+        want = (f"{nm}|{py['occ']}|{1 if py['explicit'] else 0}|{1 if py['err'] else 0}|"
+                + "\x1f".join(py["anchors"]))
         assert line == want, (raw, line, want)
 
 
@@ -573,6 +696,101 @@ def test_fill_inputs_match_the_engine():
     py = vk._input_labels([{"type": t, "a": a, "b": b, "c": c} for t, a, b, c in steps])
     assert py == ["Client", "Input", "Box 1", "Box 2"], py
     assert ahk == py, (ahk, py)
+
+
+# One bridge map for both implementations of the module-step lookup
+# (WfModuleResolve / module_step_target). Each case is a name a step could
+# carry; every precedence rule and refusal kind is in here.
+_MODULE_MAP = ("; a comment\n"
+               "Ctrl+Alt+Shift+A|open send number|hotkeys\\SendNumber.ahk|2026-10-12\n"
+               "Ctrl+Alt+Shift+B|send number|hotkeys\\Other.ahk|2026-10-12\n"
+               "Ctrl+Alt+Shift+D|Toggle Timer|hotkeys\\ToggleTimer.ahk|2026-10-12\n"
+               "Ctrl+Alt+Shift+F|open mod companion|hotkeys\\Thing.hotkey.ahk|2026-10-12\n"
+               "Ctrl+Alt+Shift+G|  padded phrase  |  hotkeys\\Padded.ahk  |2026-10-12\n"
+               "; Ctrl+Alt+Shift+J|parked one|hotkeys\\Parked.ahk|2026-10-12\n")
+_MODULE_BODIES = ("SendNumber", "Other", "Padded", "Parked")      # ToggleTimer: in-process
+_MODULE_NAMES = ["open send number", "OPEN SEND NUMBER", "  send number  ", "Send Number",
+                 "open other", "SendNumber", "Other", "toggle timer", "open toggle timer",
+                 "ToggleTimer", "open mod companion", "mod companion", "padded phrase",
+                 "open padded phrase", "parked one", "Parked", "nothing", "", "open",
+                 "open   send number", "send-number!", "Thing.hotkey"]
+
+
+def test_module_step_target_matches_the_engine():
+    """module_step_target is a second implementation of lib\\Workflow.ahk
+    WfModuleResolve (create_workflow refuses what the engine would refuse
+    mid-run). Run the REAL AHK function on the same names against the same
+    sandbox map and compare kind / phrase / module / body field by field."""
+    sep = "\x1e"
+    with _sandbox() as d:
+        (d / "bridge-map.txt").write_text(_MODULE_MAP, encoding="utf-8")
+        (d / "hotkeys" / "bodies").mkdir()
+        for b in _MODULE_BODIES:
+            (d / "hotkeys" / "bodies" / f"{b}.body.ahk").write_text("ExitApp(0)\n", encoding="utf-8")
+        src, out, script = d / "in.txt", d / "out.txt", d / "probe.ahk"
+        src.write_text(sep.join(_MODULE_NAMES), encoding="utf-8")
+        script.write_text(
+            "#Requires AutoHotkey v2.0\n#SingleInstance Off\n#NoTrayIcon\n"
+            f'#Include "{REAL_ROOT / "lib" / "_Common.ahk"}"\n'
+            f'#Include "{REAL_ROOT / "lib" / "Workflow.ahk"}"\n'
+            f'wfModuleRoot := "{d}"\n'
+            "o := ''\n"
+            f'for s in StrSplit(FileRead(A_Args[1], "UTF-8"), Chr({ord(sep)})) {{\n'
+            "    m := WfModuleResolve(s)\n"
+            "    o .= m.kind '|' m.phrase '|' m.module '|' m.body '`n'\n"
+            "}\n"
+            'FileAppend(o, A_Args[2], "UTF-8")\nExitApp(0)\n', encoding="utf-8")
+        r = subprocess.run([vk.AHK_EXE, "/ErrorStdOut", str(script), str(src), str(out)],
+                           capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, r.stdout + r.stderr
+        got = out.read_text(encoding="utf-8-sig").split("\n")[:len(_MODULE_NAMES)]
+        py = {n: vk.module_step_target(n) for n in _MODULE_NAMES}
+    for name, line in zip(_MODULE_NAMES, got):
+        m = py[name]
+        assert line == f"{m['kind']}|{m['phrase']}|{m['module']}|{m['body']}", (name, line, m)
+    # the rules themselves, so a shared mistake can't pass as agreement
+    assert py["open send number"]["module"] == "SendNumber"
+    assert py["  send number  "]["module"] == "Other", "an exact phrase beats an 'open '-less one"
+    assert py["open other"]["kind"] == "unknown", "'open other' is no phrase, and no base 'OpenOther'"
+    assert py["Other"]["module"] == "Other"                                # by file base
+    assert py["toggle timer"]["kind"] == "inprocess"
+    assert py["open mod companion"]["kind"] == "companion"
+    assert py["padded phrase"]["module"] == "Padded"
+    assert py["parked one"]["kind"] == "unknown", "a commented-out line is no module"
+    assert py["open   send number"]["module"] == "SendNumber"           # pass 2: open\s+
+    assert py[""]["kind"] == "unknown" and py["open"]["kind"] == "unknown"
+
+
+def test_create_workflow_module_step_guards():
+    """The writer refuses a module step the engine would refuse mid-run (no
+    module, an in-process one, a companion, an unknown name, a bad wait) and
+    stores a found one as its bridge-map phrase."""
+    wf_libs = ("_Common.ahk", "Workflow.ahk", "Acc.ahk", "UIA.ahk", "Clip.ahk", "ExplorerSel.ahk")
+    with _sandbox(libs=wf_libs) as d, _patched(make_shortcut=lambda *a, **k: None):
+        (d / "bridge-map.txt").write_text(_MODULE_MAP, encoding="utf-8")
+        (d / "hotkeys" / "bodies").mkdir()
+        for b in _MODULE_BODIES:
+            (d / "hotkeys" / "bodies" / f"{b}.body.ahk").write_text("ExitApp(0)\n", encoding="utf-8")
+
+        def refused(step, *words):
+            try:
+                vk.create_workflow("Module Probe Zz", [("wait", "100", "", ""), step])
+            except vk.VoiceKitError as e:
+                assert str(e).startswith("Step 2:") and all(w in str(e) for w in words), e
+                return
+            raise AssertionError(f"accepted {step}")
+
+        refused(("module", "", "", ""), "needs the hotkey module")
+        refused(("module", "toggle timer", "", ""), "isolate=False")
+        refused(("module", "open mod companion", "", ""), "companion")
+        refused(("module", "no such thing", "", ""), "no hotkey module answers", "list_automations")
+        for bad in ("0", "-5", "abc", "3601", "1e3", "nan"):
+            refused(("module", "SendNumber", bad, ""), "positive number of seconds")
+        vk.create_workflow("Module Probe Zz", [("module", "SendNumber", "3600", ""),
+                                               ("module", "  SEND NUMBER ", "", "")])
+        got = vk.read_workflow("Module Probe Zz")["steps"]
+        assert [(s["type"], s["a"], s["b"]) for s in got] == \
+            [("module", "open send number", "3600"), ("module", "send number", "")], got
 
 
 def test_ahk_str_lit_matches_ahk():
@@ -893,6 +1111,41 @@ def test_companion_hotkey_folds_into_listing_and_delete_cleans_up():
             encoding="utf-8-sig"), "delete must unwire the companion from _index.ahk"
         assert f"{base}.hotkey.ahk" not in (Path(d) / "bridge-map.txt").read_text(
             encoding="utf-8-sig"), "delete must free the companion's bridge key"
+
+
+def test_create_workflow_replace_reports_the_kept_companion_hotkey():
+    """2026-10-12 feedback: a replace kept the companion hotkey but said
+    nothing, so the caller ran list_automations to check. The result carries
+    "hotkey" exactly as list_automations shows it (same fold), says it was
+    kept, and leaves the companion's files and key alone; a workflow with no
+    companion has no "hotkey" field (list_automations omits it too)."""
+    with _sandbox(reload=lambda: False) as d, _patched(make_shortcut=lambda *a, **k: None,
+                                                       validate_ahk=lambda *a, **k: (True, "")):
+        plain = vk.create_workflow("No Companion Zz", [("wait", "100", "", "")])
+        assert "hotkey" not in plain and plain["replaced"] is False, plain
+
+        base = "KeepComboZz"
+        first = vk.create_workflow("Keep Combo Zz", [("wait", "100", "", "")])
+        assert first["replaced"] is False and "hotkey" not in first, first
+        comp = d / "hotkeys" / f"{base}.hotkey.ahk"
+        comp.write_text("#Requires AutoHotkey v2.0\n^!+V:: {\n}\n", encoding="utf-8")
+        idx = (f'#Requires AutoHotkey v2.0\n'
+               f'#Include "%A_ScriptDir%\\hotkeys\\{base}.hotkey.ahk"\n')
+        bmap = f"Ctrl+Alt+Shift+V|open keep combo zz|hotkeys\\{base}.hotkey.ahk|2026-10-12\n"
+        (d / "hotkeys" / "_index.ahk").write_text(idx, encoding="utf-8")
+        (d / "bridge-map.txt").write_text(bmap, encoding="utf-8")
+
+        again = vk.create_workflow("Keep Combo Zz", [("wait", "200", "", "")])
+        assert again["replaced"] is True, again
+        assert again.get("hotkey") == "Ctrl+Alt+Shift+V", again
+        assert "Ctrl+Alt+Shift+V was kept" in again["note"], again["note"]
+        listed = next(w for w in vk.list_automations()["workflows"] if w["base"] == base)
+        assert listed.get("hotkey") == again["hotkey"], "create and list must agree"
+        assert comp.exists(), "the companion module must survive a replace"
+        assert (d / "hotkeys" / "_index.ahk").read_text(encoding="utf-8") == idx
+        assert (d / "bridge-map.txt").read_text(encoding="utf-8") == bmap, \
+            "a replace must keep the companion's bridge key"
+        assert "wait|200" in (d / "workflows" / f"{base}.steps.txt").read_text(encoding="utf-8-sig")
 
 
 def test_hotkey_module_replace_keeps_key_and_guards_reserved_names():
@@ -2526,6 +2779,8 @@ def test_reference_bodies_are_readable_and_load():
 
     libs = ("_Common.ahk", "UIA.ahk", "Clip.ahk", "Browser.ahk")   # Browser.ahk includes UIA + Clip
     for entry in cat["references"]:
+        if entry["kind"] != "example":
+            continue            # a generated library reference — the next test
         got = vk.read_reference(entry["name"])
         assert got["code"].startswith("#Requires AutoHotkey v2.0"), entry
         with tempfile.TemporaryDirectory() as d:
@@ -2538,6 +2793,171 @@ def test_reference_bodies_are_readable_and_load():
             copy.write_text(got["code"], encoding="utf-8-sig", newline="")
             ok, err = vk.validate_ahk(str(copy))
             assert ok, f"reference '{entry['name']}' does not load as a body: {err}"
+
+
+def test_library_references_are_generated_from_the_source():
+    """read_reference('uia') / ('browser') are GENERATED from the library on
+    each read, so they can't drift: every top-level function definition in
+    the file (parsed independently here) appears with its parameter list
+    exactly as written — &why out-params included — and the catalogue lists
+    both. A function added to the library is in the reference with no edit."""
+    cat = {r["name"]: r for r in vk.read_reference()["references"]}
+    for name, lib in (("uia", "UIA.ahk"), ("browser", "Browser.ahk")):
+        assert cat.get(name, {}).get("kind") == "library", cat
+        got = vk.read_reference(name)
+        assert got["kind"] == "library" and got["name"] == name, got
+        src = (vk.REPO_ROOT / "lib" / lib).read_text(encoding="utf-8-sig")
+        defs = []
+        for line in src.splitlines():
+            # A trailing '; comment' after the '{' is still a definition.
+            m = re.match(r"^([A-Za-z_]\w*)\((.*)\)\s*(\{\s*(?:;.*)?$|=>)", line)
+            if m:
+                # A one-liner's params end at the FIRST ')' before '=>'.
+                if m.group(3) == "=>":
+                    m = re.match(r"^([A-Za-z_]\w*)\((.*?)\)\s*=>", line)
+                defs.append(f"{m.group(1)}({m.group(2)})")
+        assert len(defs) > 5 and got["functions"] == len(defs), (name, got["functions"], len(defs))
+        lines = got["code"].splitlines()
+        for sig in defs:
+            assert any(ln.startswith(sig) for ln in lines), f"{name}: missing signature {sig}"
+        # The taken-names index parses definitions its own way; both must
+        # see the same functions, or one of them is dropping some.
+        idx, _ = vk._ahk_file_defs(vk.REPO_ROOT / "lib" / lib)
+        taken = {v[0] for v in idx.values() if v[1] == "function"}
+        assert taken == {s.split("(")[0] for s in defs}, (name, taken ^ {s.split("(")[0] for s in defs})
+    uia = vk.read_reference("UIA")["code"]                     # names are case-insensitive
+    assert "UiaFindAll(hwnd, name, timeoutMs := 3000, maxItems := 0, &why?)" in uia
+    assert "UiaFindAllCond(hwnd, cond, timeoutMs := 3000, maxItems := 0, &why?)" in uia
+    assert "UIA_PROP_NAME() => 30005" in uia, "constants are listed with their values"
+    # Each signature's doc is the comment directly above it, indented under it.
+    i = uia.splitlines().index("UiaRect(el)")
+    assert "{x, y, w, h}" in uia.splitlines()[i + 1], uia.splitlines()[i:i + 3]
+    for rule in ("own process", "&why", "ComValue", "IsObject", "SUB-element"):
+        assert rule in uia.split("\n== ")[0], f"preamble must state: {rule}"
+    assert "; ====" not in uia and "WHY THIS EXISTS" not in uia, "the file header is left out"
+    try:
+        vk.read_reference("no-such-reference-zz")
+        assert False
+    except vk.VoiceKitError as e:
+        assert "uia" in str(e) and "web-scrape" in str(e), e
+
+
+def test_library_reference_parses_every_definition_style():
+    """The generated reference must not silently drop a definition the house
+    style allows (a review found three it missed — none in UIA.ahk today, so
+    a fixture file pins them): a trailing '; comment' after the '{'
+    (lib\\_Common.ahk, lib\\Json.ahk use it), a backtick-escaped quote in a
+    default value, a parameter list wrapped over two lines, and a one-line
+    body. A column-0 comment INSIDE a body is the function's own note — never
+    a loose note, never the next function's doc. A top-level call is not a
+    definition."""
+    src = "\n".join([
+        "; ---- Things ----",
+        "; doc of A1",
+        "A1(x) {",
+        "    return x",
+        "}",
+        "",
+        "; doc of B1",
+        "B1(x) {   ; trailing comment",
+        "; column-0 note inside B1's body",
+        "    s := \"{ not a brace\"",
+        "    return x",
+        "}",
+        "",
+        "; doc of A2",
+        "A2(q := \"`\"(\") {",
+        "    return q",
+        "}",
+        "",
+        "; doc of A3",
+        "A3(a,",
+        "    b := 1) {",
+        "    return a",
+        "}",
+        "Call(1)",
+        "; doc of C1",
+        "C1() => 5",
+        "; doc of D1",
+        "D1(n) { return n + 1 }",
+        "",
+    ])
+    tmp = Path(tempfile.mkdtemp(prefix="vk-libref-"))
+    try:
+        f = tmp / "Fixture.ahk"
+        f.write_text(src, encoding="utf-8")
+        text, count = vk._library_reference(str(f), "PRE")
+        lines = text.splitlines()
+        assert count == 6, (count, text)
+        for sig, doc in (("A1(x)", "doc of A1"), ("B1(x)", "doc of B1"),
+                         ('A2(q := "`"(")', "doc of A2"), ("A3(a, b := 1)", "doc of A3"),
+                         ("D1(n)", "doc of D1")):
+            assert sig in lines, (sig, text)
+            assert lines[lines.index(sig) + 1].strip() == doc, (sig, text)
+        assert "C1() => 5" in lines, text
+        assert "column-0 note" not in text, "a comment inside a body leaked out: " + text
+        assert not any(ln.startswith("Call(") for ln in lines), text
+        assert not any(ln.strip().startswith("->") for ln in lines), \
+            "no 'Returns' line, no '->' line: " + text
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _public_lib_defs(lib: str) -> list:
+    """(name, comment_lines) for every public function lib\\<lib> defines —
+    not _private, not a UIA_*() constant — parsed independently of the
+    generator: the ';' lines directly above the definition line."""
+    lines = (vk.REPO_ROOT / "lib" / lib).read_text(encoding="utf-8-sig").splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^([A-Za-z_]\w*)\(.*\)\s*(\{|=>)", line)
+        if not m or m.group(1).startswith("_") or m.group(1).upper().startswith("UIA_"):
+            continue
+        k, block = i - 1, []
+        while k >= 0 and lines[k].startswith(";"):
+            block.insert(0, lines[k])
+            k -= 1
+        out.append((m.group(1), block))
+    return out
+
+
+def test_library_functions_state_what_they_return():
+    """Feedback item 8 (2026-10-12): read_reference('uia') was to give
+    signatures AND return types, but returns were prose some functions never
+    stated (UiaFindById, UiaValue's empty case, UiaIsPassword's false case
+    ...). Every public lib\\UIA.ahk / lib\\Browser.ahk function's comment
+    block (directly above it) now carries a line starting 'Returns ', so a
+    new function can't ship without one, and the generated reference shows
+    that sentence as a '->' line right under the signature."""
+    for name, lib in (("uia", "UIA.ahk"), ("browser", "Browser.ahk")):
+        defs = _public_lib_defs(lib)
+        assert len(defs) > 5, (lib, defs)
+        missing = [n for n, block in defs
+                   if not any(re.match(r"^;\s*Returns\s", b) for b in block)]
+        assert not missing, (f"lib\\{lib}: these public functions have no '; Returns ...' "
+                             f"line in the comment directly above them: {missing}")
+        lines = vk.read_reference(name)["code"].splitlines()
+        for fn, _ in defs:
+            i = next(j for j, ln in enumerate(lines) if ln.startswith(fn + "("))
+            arrow = lines[i + 1]
+            assert arrow.startswith("    -> ") and len(arrow.strip()) > 6, (fn, lines[i:i + 3])
+            assert not arrow.strip()[3:].startswith("Returns"), (fn, arrow)
+    uia = vk.read_reference("uia")["code"].splitlines()
+
+    def arrow_of(fn):
+        return uia[next(j for j, ln in enumerate(uia) if ln.startswith(fn + "(")) + 1]
+    # The cases the feedback named: the empty / false answer and the &out.
+    assert '""' in arrow_of("UiaFindById") and "why" in arrow_of("UiaFindById")
+    assert '""' in arrow_of("UiaValue") and "Name" in arrow_of("UiaValue")
+    assert "false" in arrow_of("UiaIsPassword")
+    assert '""' in arrow_of("UiaTrueCondition") and '""' in arrow_of("UiaAndCondition")
+    assert "array" in arrow_of("UiaFindAll") and "empty" in arrow_of("UiaFindAll")
+    assert "has" in arrow_of("UiaValueOnly"), "a ByRef out is part of the return"
+    # A multi-line 'Returns' sentence is joined onto the one '->' line.
+    assert arrow_of("UiaFindCond").rstrip().endswith("how long it tried."), arrow_of("UiaFindCond")
+    assert vk._returns_sentence("Intro.\nReturns a\nb.\nMore.") == "a b."
+    assert vk._returns_sentence("Returns x.\nnext") == "x."
+    assert vk._returns_sentence("no such line") == ""
 
 
 def test_get_bridge_map_strips_padded_fields():
@@ -3332,6 +3752,12 @@ def test_create_workflow_owns_every_step_guard():
         (("fill", "w", "Amount"), "needs a value"),
         (("fill", "w", "Amount", "two\nlines"), "line break"),
         (("fill", "w", "Amount", "cr\rhere"), "line break"),
+        (("fill", "w", 'after "Deductions" > Insurance', "1"), "double quotes"),
+        (("fill", "w", 'after "Insurance', "1"), "never closes"),
+        (("fill", "w", 'after "  "', "1"), "empty after"),
+        (("fill", "w", 'after "Deductions" >', "1"), "ends with '>'"),
+        (("fill", "w", 'after "say "hi""', "1"), "unexpected text"),
+        (("fill", "w", 'after "Insurance"#0', "1"), "'#0'"),
     ]
     for step, why in cases:
         try:
@@ -3347,8 +3773,9 @@ def test_create_workflow_owns_every_step_guard():
             ok, ("click", "ahk_exe x.exe", "", "12,40"), ("drag", "w", "", "1,2,3,4"),
             ("move", "w", "max", ""), ("text", " ", "", ""), ("hover", "w", "Menu", ""),
             ("capture", "Inv", "echo hi", ""), ("capture", "Inv2", "echo {{Inv}}", "1.5"),
-            ("fill", "w", "Amount#2", "{{Inv2}}"), ("fill", "w", "Memo", "")])
-        assert got["step_count"] == 10
+            ("fill", "w", "Amount#2", "{{Inv2}}"), ("fill", "w", "Memo", ""),
+            ("fill", "w", 'after "Deductions" > "Insurance"#2', "{{Inv}}")])
+        assert got["step_count"] == 11
 
 
 def test_isolated_create_load_checks_the_body():
@@ -4112,6 +4539,257 @@ def test_run_automation_test_mode_refusals():
     assert not vk._warn_dialog_line("#Warn All, OutputDebug ; quiet")
 
 
+_DRY_LIBS = _TEST_LIBS + ("DryRunShim.ahk", "UIA.ahk")
+
+
+@contextlib.contextmanager
+def _dry_launch_only():
+    """Every launch inside must load DryRunShim, or it is refused BEFORE the
+    process starts. The dry-run tests run scripts that send keys and clicks;
+    if a regression ever dropped the shim from the command line (a reordered
+    shim list, dry_run not passed through), the asserts would fail only
+    after real input had gone to whatever window was active. This makes the
+    failure happen first."""
+    real = vk._run_bounded
+    seen: list = []
+
+    def guarded(cmd, *a, **k):
+        args = [str(x) for x in cmd]
+        i = args.index("/include") if "/include" in args else -1
+        if i < 0 or i + 1 >= len(args) or \
+                not args[i + 1].lower().endswith("\\lib\\dryrunshim.ahk"):
+            raise AssertionError(f"refused to launch a dry run without DryRunShim: {args}")
+        seen.append(args)
+        return real(cmd, *a, **k)
+    with _patched(_run_bounded=guarded):
+        yield seen
+
+
+def test_run_automation_dry_run_logs_instead_of_sending():
+    """run_automation(dry_run=True) (2026-10-12 feedback #6: a body's paste
+    sequence shipped untested because the only way to run it typed into a
+    live client return): keystrokes, clicks, control writes and UiaSetValue
+    come back in order as `actions` and NOTHING arrives — a throwaway target
+    window's edit box still holds its text, read back by the macro itself
+    (ControlGetText reads; it isn't replaced). UiaSetValue on nothing stays
+    false (no element, nothing logged), VkDryRun() is true, and the run is
+    quiet (TestShim came along)."""
+    with _sandbox(libs=_DRY_LIBS) as d, _patched(RUNS_ROOT=None):
+        vk.RUNS_ROOT = d / "runs"
+        title = "VK Dry Conf Target Zz"
+        tgt = d / "target.ahk"
+        tgt.write_text("#Requires AutoHotkey v2.0\n#SingleInstance Off\n"
+                       f'g := Gui(, "{title}")\ng.AddEdit("w200", "orig")\n'
+                       'g.Show("NoActivate")\nSetTimer(() => ExitApp(), -60000)\n',
+                       encoding="utf-8")
+        tp = subprocess.Popen([vk.AHK_EXE, str(tgt)])
+        try:
+            vk.create_launch_macro("Dry Probe Zz", ahk_body=(
+                '#Include "%A_ScriptDir%\\..\\lib\\UIA.ahk"\n'
+                f'win := "{title}"\n'
+                'WinWait(win, , 10)\n'
+                # Fail closed: without the shim every call below is real input.
+                'for f in [Send, SendText, MouseClick, ControlSend, ControlSetText]\n'
+                '    if !VkDryRun() || f.IsBuiltIn\n'
+                '        ExitApp(4)\n'
+                'Send("secret keys")\n'
+                'SendText("typed value")\n'
+                'MouseClick("Left", 10, 10)\n'
+                'ControlSend("cs", "Edit1", win)\n'
+                'ControlSetText("set", "Edit1", win)\n'
+                'VkResult(ControlGetText("Edit1", win))\n'
+                'el := UiaFindCond(WinExist(win), UiaIntCondition(UIA_PROP_CONTROLTYPE(), '
+                'UIA_TYPE_EDIT()), 3000)\n'
+                'VkResult(UiaSetValue(el, "uia value"))\n'
+                'VkResult(UiaSetValue("", "nothing"))\n'
+                'VkResult(ControlGetText("Edit1", win))\n'
+                'VkResult(VkDryRun())\n'
+                'MsgBox("dry done", "Dry Probe Zz")\n'))
+            with _DialogWatch("Zz") as watch, _dry_launch_only() as launched:
+                r = vk.run_automation("Dry Probe Zz", dry_run=True)
+            assert launched, "the run went through the guarded launcher"
+            assert not watch.seen, watch.seen
+            assert r["test"] is True and r["dry_run"] is True and r["ok"] is True, r
+            assert r["result"] == ["orig", 1, 0, "orig", 1], r["result"]
+            fns = [a["fn"] for a in r["actions"]]
+            assert fns == ["Send", "SendText", "MouseClick", "ControlSend", "ControlSetText",
+                           "UiaSetValue"], fns
+            a = r["actions"]
+            assert a[0]["keys"] == "secret keys" and a[1]["text"] == "typed value", a
+            assert a[2]["x"] == 10 and a[2]["button"] == "Left", a[2]
+            assert a[3]["control"] == "Edit1" and a[3]["window"] == title \
+                and a[3]["process"].lower().startswith("autohotkey"), a[3]
+            assert a[5]["text"] == "uia value" and "type" in a[5], a[5]
+            assert all("kind" not in x for x in a), a
+            assert [x["kind"] for x in r["dialogs"]] == ["MsgBox"], r["dialogs"]
+            assert "Dry run: 6 " in r["note"], r["note"]
+        finally:
+            tp.kill()
+
+
+def test_run_automation_dry_run_withholds_workflow_text():
+    """A WORKFLOW's dry run: the engine's typed text is a filled-in value, so
+    `actions` keeps only its kind and length (a whitelist — keys, text and
+    the clipboard never appear), exactly as its popups' text is withheld.
+    The run record still says every step ran. The steps are aimed at a
+    throwaway window (a focus step that fails if it is missing), and the
+    launch is refused unless it loads DryRunShim — never a bare text/keys
+    step into whatever the user has active."""
+    with _sandbox(libs=_TEST_WF_LIBS + ("DryRunShim.ahk",)) as d, _patched(RUNS_ROOT=None):
+        vk.RUNS_ROOT = d / "runs"
+        title = "VK Dry Wf Target Zz"
+        tgt = d / "wftarget.ahk"
+        tgt.write_text("#Requires AutoHotkey v2.0\n#SingleInstance Off\n"
+                       f'g := Gui(, "{title}")\ng.AddEdit("w200", "")\n'
+                       'g.Show("NoActivate")\nSetTimer(() => ExitApp(), -60000)\n',
+                       encoding="utf-8")
+        tp = subprocess.Popen([vk.AHK_EXE, str(tgt)])
+        try:
+            vk.create_workflow("Wf Dry Zz", [("waitwin", title, "10", ""),
+                                             ("focus", title, "", ""),
+                                             ("set", "Secret", "hunter2", ""),
+                                             ("text", "{{Secret}} typed", "", ""),
+                                             ("keys", "{End}", "", "")])
+            with _dry_launch_only() as launched:
+                r = vk.run_automation("Wf Dry Zz", dry_run=True)
+            assert launched, "the run went through the guarded launcher"
+        finally:
+            tp.kill()
+        assert r["dry_run"] is True and r["ok"] is True and r["run"]["outcome"] == "ok", r
+        fns = [a["fn"] for a in r["actions"]]
+        assert fns == ["SendText", "Send"], r["actions"]
+        assert r["actions"][0] == {"fn": "SendText", "text_len": len("hunter2 typed")}, r["actions"]
+        assert r["actions"][1] == {"fn": "Send", "keys_len": 5}, r["actions"]
+        assert "hunter2" not in json.dumps(r), "a workflow's typed value must not ride out"
+        assert "withheld" in r["actions_withheld"], r
+    # The whitelist itself: an unknown field is dropped, text becomes length.
+    got = vk._dry_action({"kind": "input", "fn": "ControlSetText", "text": "abc",
+                          "control": "Edit1", "window": "Client Smith", "clipboard": "x",
+                          "clipboard_len": 1, "new_field": "y", "x": 5}, True)
+    assert got == {"fn": "ControlSetText", "text_len": 3, "clipboard_len": 1, "x": 5}, got
+    got = vk._dry_action({"kind": "input", "fn": "Send", "keys": "k" * 3000}, False)
+    assert len(got["keys"]) == vk.DIALOG_TEXT_CAP, len(got["keys"])
+
+
+def test_dry_run_long_log_keeps_the_final_error():
+    """A long dry run (each keystroke call is a record) must still report
+    the uncaught error TestShim writes LAST, and count every action — the
+    reader used to stop parsing at TEST_LOG_CAP_RECORDS lines."""
+    n = vk.TEST_LOG_CAP_RECORDS + 1000
+    fake_macro = Path(tempfile.gettempdir()) / "VkLongDryZz.ahk"
+
+    def fake_run(cmd, wait, **k):
+        log = Path(k["env"]["VOICEKIT_TEST_LOG"])
+        with log.open("w", encoding="utf-8") as f:
+            for i in range(n):
+                f.write('{"fn":"Send","keys":"k%d","kind":"input"}\n' % i)
+            f.write('{"kind":"MsgBox","returned":"OK","text":"late","title":"t"}\n')
+            f.write('{"kind":"error","line":42,"message":"Boom Zz","type":"Error"}\n')
+        return {"exit_code": 3, "timed_out": False, "killed": [], "duration_s": 1,
+                "left_running": [], "possibly_left_running": [], "cancelled": False}
+    with _patched(_run_bounded=fake_run):
+        r = vk._test_run(fake_macro, [], 5, False, "test", dry_run=True)
+    assert r["uncaught_error"]["message"] == "Boom Zz" and r["uncaught_error"]["line"] == 42, r
+    assert f"{n} actions in all" in r["actions_truncated"], r.get("actions_truncated")
+    assert len(r["actions"]) == vk.ACTION_CAP_RECORDS, len(r["actions"])
+    assert "Boom Zz" in r["note"], r["note"]
+    # The not-covered list rides on EVERY dry-run reply — also one that logged
+    # no action at all (a script whose only effects are WinClose / Run).
+    assert "Not covered" in r["note"] and "PostMessage/SendMessage" in r["note"], r["note"]
+    n = 0
+    with _patched(_run_bounded=fake_run):
+        r = vk._test_run(fake_macro, [], 5, False, "test", dry_run=True)
+    assert "no keyboard/mouse/control/UIA action" in r["note"] and "Not covered" in r["note"] \
+        and "window commands" in r["note"], r["note"]
+
+
+def test_workflow_test_run_withholds_error_text_and_tells_a_module_body_apart():
+    """A workflow's test run shares its test log with any module step's body
+    (WfModuleRun runs it under the same shim, as a test run of its own). An
+    uncaught error there failed that STEP, not the run's script — and like
+    everything a workflow shows, its text may carry a filled-in value. So:
+    the body's error comes back as module_errors (script, type, line; text
+    withheld), never as the run's uncaught_error; the stub's own error text
+    is withheld too; a plain macro's error is unchanged."""
+    fake_macro = Path(tempfile.gettempdir()) / "VkWfErrZz.ahk"
+    body = r"C:\VK\hotkeys\bodies\Paste.body.ahk"
+    lines: list = []
+
+    def fake_run(cmd, wait, **k):
+        Path(k["env"]["VOICEKIT_TEST_LOG"]).write_text("".join(lines), encoding="utf-8")
+        return {"exit_code": 1, "timed_out": False, "killed": [], "duration_s": 1,
+                "left_running": [], "possibly_left_running": [], "cancelled": False}
+    lines[:] = [json.dumps({"kind": "error", "type": "Error", "message": "Client Smith 123",
+                            "line": 7, "script": body, "file": body}) + "\n"]
+    with _patched(_run_bounded=fake_run):
+        r = vk._test_run(fake_macro, [], 5, True, "test")
+    assert "uncaught_error" not in r, r
+    me = r["module_errors"][0]
+    assert me["script"] == "Paste.body.ahk" and me["line"] == 7 and me["type"] == "Error", me
+    assert "Smith" not in json.dumps(r), "a workflow's error text must not ride out"
+    assert "module step's body" in r["note"], r["note"]
+    # The stub's OWN uncaught error: reported, text withheld.
+    lines[:] = [json.dumps({"kind": "error", "type": "Error", "message": "Client Smith 123",
+                            "line": 9, "script": str(fake_macro)}) + "\n"]
+    with _patched(_run_bounded=fake_run):
+        r = vk._test_run(fake_macro, [], 5, True, "test")
+    assert r["uncaught_error"]["line"] == 9 and "Smith" not in json.dumps(r), r
+    # A plain macro: its own error text comes back as it was.
+    with _patched(_run_bounded=fake_run):
+        r = vk._test_run(fake_macro, [], 5, False, "test")
+    assert r["uncaught_error"]["message"] == "Client Smith 123", r
+
+
+def test_run_automation_dry_run_runs_a_module_body():
+    """test=True / dry_run=True take an ISOLATED hotkey module's name: its
+    body runs directly under the shims, in its own folder, with the result
+    and actions channels, and the reply names its hotkey. Refused, before
+    anything launches: a plain run of a module name (press_hotkey runs it),
+    an isolate=False module (no script of its own), and a body already
+    running (its BodySingleInstance mutex is held — the test instance would
+    exit 0 at once and read as a pass). A bare key letter never resolves."""
+    import ctypes
+    with _sandbox(libs=_DRY_LIBS) as d, _patched(RUNS_ROOT=None):
+        vk.RUNS_ROOT = d / "runs"
+        (d / "hotkeys" / "_index.ahk").write_text("#Requires AutoHotkey v2.0\n", encoding="utf-8")
+        (d / "bridge-map.txt").write_text("; map\n", encoding="utf-8")
+        vk.create_hotkey_module("Dry Mod Zz", (
+            'VkResult(VkDryRun())\n'
+            'VkResult(A_WorkingDir)\n'
+            'if VkDryRun()\n'
+            '    Send("{Tab}abc")\n'))
+        key = vk._module_bridge_key("DryModZz")
+        with _dry_launch_only():
+            r = vk.run_automation("Dry Mod Zz", dry_run=True)
+        assert r["module"] is True and r["dry_run"] is True and r["ok"] is True, r
+        assert r["result"] == [1, str(d / "hotkeys" / "bodies")], r["result"]
+        assert r["actions"] == [{"fn": "Send", "keys": "{Tab}abc"}], r["actions"]
+        assert r["hotkey"] == f"Ctrl+Alt+Shift+{key}", (r.get("hotkey"), key)
+        assert r["file"].endswith("DryModZz.body.ahk"), r["file"]
+        r = vk.run_automation("Dry Mod Zz", test=True)
+        assert r["ok"] is True and r["result"][0] == 0 and "actions" not in r \
+            and "dry_run" not in r, r
+        assert vk._run_module_target(key, key) == "", "a bare key letter must not resolve"
+
+        (d / "hotkeys" / "InprocZz.ahk").write_text("#Requires AutoHotkey v2.0\n", encoding="utf-8")
+        _refused(lambda: vk.run_automation("Dry Mod Zz"), "hotkey module", "press_hotkey")
+        _refused(lambda: vk.run_automation("Inproc Zz", dry_run=True),
+                 "inside the resident VoiceKit", "isolate=True")
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
+        k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        h = k32.CreateMutexW(None, 0, "Local\\VoiceKitBody_DryModZz")
+        try:
+            assert vk._body_mutex_held("DryModZz") and not vk._body_mutex_held("NoSuchZz")
+            _refused(lambda: vk.run_automation("Dry Mod Zz", dry_run=True),
+                     "running right now", "stop_module")
+        finally:
+            k32.CloseHandle(h)
+        assert not vk._body_mutex_held("DryModZz")
+
+
+
 def test_press_hotkey_resolves_a_companion_by_its_listed_name():
     """list_automations folds a companion hotkey onto its automation ('Record
     My Steps'), and press_hotkey is documented to press it — but resolved it
@@ -4208,6 +4886,15 @@ def test_server_schema_matches_the_writer():
         assert False, "a fill with no value must be refused, not turned into a clear"
     except vk.VoiceKitError as e:
         assert "needs a value" in str(e), e
+    assert server.WorkflowStep(type="module", module="send number", seconds=120).to_abc() == \
+        ("module", "send number", "120", "")
+    assert server.WorkflowStep(type="module", module="x").to_abc() == ("module", "x", "", "")
+    abc = server.WorkflowStep(type="module").to_abc()                    # no module
+    try:
+        vk.create_workflow("Schema Probe Zz", [abc])
+        assert False
+    except vk.VoiceKitError as e:
+        assert "needs the hotkey module" in str(e), e
     abc = server.WorkflowStep(type="capture", label="Inv").to_abc()      # no command
     try:
         vk.create_workflow("Schema Probe Zz", [abc])
@@ -4445,7 +5132,9 @@ def test_instructions_names_exist():
                  # without reading every docstring, and the honest cap.
                  "run_process", "background=True", "read_job", "test=True", "VkResult",
                  "list_processes", "check_path", "unmask=[", f"over {vk.max_wait_s()} s",
-                 "prefixes", "re-list"):
+                 "prefixes", "re-list",
+                 # 2026-10-12: where the library function lists live.
+                 "read_reference('uia')"):
         assert must in text, must
     assert len(text) < 4000, "instructions load every session — keep them short"
     try:

@@ -166,6 +166,8 @@ class WorkflowStep(BaseModel):
       set      -> label (+ value)        names a value for later steps to reuse
       capture  -> label + command (+ seconds, default 30) — runs a command line
                   hidden and saves what it printed as {{label}}
+      module   -> module (+ seconds, default 60, at most 3600) — runs an ISOLATED
+                  hotkey module and WAITS for it; a nonzero exit stops the run
       keys     -> keys
       click/dblclick/rclick -> window + element (name on screen)   [or xy]
       hover    -> window + element (or xy) — moves the mouse there and pauses
@@ -219,15 +221,41 @@ class WorkflowStep(BaseModel):
     value and reads it back. A reformatted box still passes (1234.5 matches
     1,234.50; 123456789 matches 123-45-6789) but a different value never does.
     Several inputs with one label: "Amount#2" is the second, and without #N the
-    first is filled (the run log says so) — write "##" for a literal "#". A
+    first is filled (the run log says so) — write "##" for a literal "#". When
+    every box shares one name (a page naming each input "expanded detail
+    input"), name the TEXT before the box instead: element='after "Insurance"'
+    is the first input after the element saying Insurance (exact name first,
+    else the first name containing it), 'after "Deductions" > "Insurance"' finds
+    Insurance within Deductions — when Deductions' element contains its content
+    (a group named after the heading) the search stays inside it and a miss
+    fails by name instead of reaching the next section; a bare heading only
+    orders it (logged) — and '#2' after the last quote picks the 2nd input
+    after it. Each text in double quotes, no quote inside it. A
     password box is filled but not read back. Failure reasons never contain the
     value; in a batch keep values as {{Column}} so the run log shows the
     placeholder, not client data.
+
+    MODULES: pressing a hotkey module's key only STARTS it. A `module` step
+    runs an isolated module's body and waits until it exits — exit code 0
+    carries on; ExitApp(1) in the body (or an uncaught error, which ends it
+    with exit 3 instead of a dialog) stops the workflow; a timeout or Stop ends
+    its whole process tree. Name the module as list_automations shows it (its
+    voice_phrase or name); it is stored as its bridge-map phrase. Refused for a
+    module that runs inside VoiceKit (isolate=False) — nothing can wait on it —
+    and at run time while the same body is already running. The run record
+    names only the module and its exit code; the body's own error text and its
+    last BodyStatus line go to the local popup. A test / dry run of the
+    workflow runs the body as a test run under the same shim (VkTestMode() is
+    true in it; under dry_run its keystrokes are logged, not sent); a body
+    that stops on a stop request fails the step.
     """
 
     type: Literal["run", "focus", "waitwin", "wait", "waitfor", "text", "fill", "ask", "collect",
-                  "set", "capture", "keys", "click", "dblclick", "rclick", "hover", "drag", "move",
-                  "close", "if", "else", "endif"]
+                  "set", "capture", "module", "keys", "click", "dblclick", "rclick", "hover", "drag",
+                  "move", "close", "if", "else", "endif"]
+    module: Optional[str] = Field(
+        None, description="module: the hotkey module to run and wait for — its voice phrase or "
+        "name as list_automations shows it (hotkey_modules). Must be an isolated module.")
     window: Optional[str] = Field(
         None, description="Window criterion: 'ahk_exe notepad.exe', 'ahk_class CabinetWClass', "
         "or a partial title. For focus/waitwin/click/dblclick/rclick/hover/drag/move/close/fill, "
@@ -240,7 +268,8 @@ class WorkflowStep(BaseModel):
         None, description="waitwin/waitfor: how long to keep waiting before giving up "
         "(default 10). Raise it for slow pages or big exports. capture: how long the "
         "command may run before its whole process tree is killed and the run stops "
-        "(default 30).")
+        "(default 30). module: how long to wait for the module to finish before ending it "
+        "and stopping the run (default 60, at most 3600).")
     command: Optional[str] = Field(
         None, description="capture: the cmd.exe command line to run, e.g. "
         "'python \"C:\\tools\\invoice.py\" {{selected_file}}'. Runs hidden from the VoiceKit "
@@ -278,7 +307,9 @@ class WorkflowStep(BaseModel):
         "hover over (button caption, link text, file name). Preferred — survives windows moving. "
         "collect: the named box whose content to read (omit to copy the current selection instead). "
         "fill: the input's label exactly as its accessible name reads (a web form's field label); "
-        "append #2, #3... when several inputs share it, and write ## for a literal #.")
+        "append #2, #3... when several inputs share it, and write ## for a literal #. Or, when the "
+        "boxes all share one name, the text before the box: 'after \"Insurance\"', "
+        "'after \"Deductions\" > \"Insurance\"', 'after \"Insurance\"#2'.")
     xy: Optional[str] = Field(
         None, description="click/dblclick/rclick/hover: fallback window-relative 'x,y' when there's no name. "
         "drag: required, the window-relative press and release points 'x1,y1,x2,y2'.")
@@ -333,6 +364,9 @@ class WorkflowStep(BaseModel):
             # substituted, the command is, the timeout rides in paramC.
             return (t, self.label or "", self.command or "",
                     "" if self.seconds is None else str(self.seconds))
+        if t == "module":
+            # on disk: module|module|seconds| — the wait rides in paramB.
+            return (t, self.module or "", "" if self.seconds is None else str(self.seconds), "")
         if t == "fill":
             # on disk: fill|window|label|value — the value is passed through
             # as given, None included, so the writer can tell "forgot it"
@@ -685,6 +719,11 @@ def create_hotkey_module(
     list_automations surface the latest line. A long LOOP should also check
     BodyStopRequested("<Base>") each pass so stop_module can end it cleanly.
 
+    A workflow can run an isolated module and WAIT for it (a `module` step):
+    exit code 0 means it worked, so a body should end with ExitApp(1) when it
+    failed — that is what makes the workflow stop instead of carrying on. An
+    uncaught error ends it with exit 3 (no dialog) when a module step started it.
+
     LIBRARY HELPERS a body can #Include (paths relative to the body file):
       ..\\..\\lib\\_Common.ahk  — BodyStatus / BodyStatusDone / BodyStopRequested,
         BodySingleInstance (one instance per module, immune to the launch race
@@ -698,13 +737,20 @@ def create_hotkey_module(
         (click for real; UiaInvoke does nothing to many inputs; the click
         helpers scroll a rect-less target into view and on false say why via
         an optional &why out-param), UiaScrollIntoView, UiaSetValue,
-        UiaTextPresent, UiaDumpText, UiaDumpTree
+        UiaTextPresent, UiaDumpText, UiaDumpTree, UiaTreeFingerprint. Every
+        find (UiaFromWindow, UiaFind*, UiaFindAll*, UiaFindFirst,
+        UiaFindElements) takes a trailing optional &why: "" on success, else
+        why it came back empty (no match after N ms, window gone, the search
+        threw...). A search from a SUB-element can come back with an element
+        outside it in Chrome — UiaFindFirst / UiaFindElements check and fall
+        back to walking (UiaFindFirstWalk); never call ComCall(5/6) raw
       ..\\..\\lib\\Browser.ahk  — driving a browser through its keyboard UI
         without the four ways that goes wrong: BrowserEnsureDomain (verify the
         tab BEFORE typing — this is what stops a query becoming a Google
         search), BrowserGrabPage (page text, retried when the grab looks like
         a stranded-omnibox URL), BrowserUrl, BrowserTypeVerified (click, type,
         read the FIELD back — never press Enter after an unverified type)
+    Full signatures and contracts: read_reference('uia') / ('browser').
     For a scraping job, start from read_reference("web-scrape") rather than
     writing the walk/capture/dedupe/resume machinery again.
 
@@ -800,8 +846,12 @@ def create_workflow(
     """Create a multi-step workflow (the recorder's output, authored instead of
     recorded): writes workflows/<Base>.steps.txt, a generated macro stub, and a
     Start Menu shortcut. Prefer clicking by `element` name over `xy`. An
-    existing workflow of the same name is replaced ('replaced': true). The stub
-    is load-checked; if it fails, nothing is changed — a workflow being
+    existing workflow of the same name is replaced ('replaced': true) — only
+    its steps and stub change: a companion hotkey (and the Voice Access
+    pairing made by hand for it) is kept, and the result carries it as
+    "hotkey" (e.g. 'Ctrl+Alt+Shift+V'; absent when there is none, as in
+    list_automations). So replace in place — never delete and recreate. The
+    stub is load-checked; if it fails, nothing is changed — a workflow being
     replaced is put back exactly as it was. Every step is checked first and a
     bad one is named ('Step N: ...'). Run it by saying 'open <name>'; nothing
     needs reloading."""
@@ -926,7 +976,10 @@ def inspect_focus() -> dict:
 def dump_uia_tree(
     window: Annotated[Optional[str], "Which window: 'ahk_exe chrome.exe', 'ahk_class ...', or "
                       "a title substring. Omit for the active window."] = None,
-    max_depth: Annotated[int, "How deep into the tree to walk (default 8, max 25)."] = 8,
+    max_depth: Annotated[int, "How deep into the tree to walk (default 8, max 100). Web "
+                         "forms nest deep — if the result's cut_at_depth is above 0, "
+                         "subtrees were cut off there and a match may be below; raise "
+                         "it."] = 8,
     name_filter: Annotated[Optional[str], "Case-insensitive substring; only elements whose name "
                            "contains it are listed. The walk still covers everything, so a match "
                            "keeps its real indent depth."] = None,
@@ -941,8 +994,21 @@ def dump_uia_tree(
     pages VIRTUALIZE: only content near the viewport is realized, so what's
     scrolled out of view can be missing from the dump entirely. Scroll and
     dump again, or navigate to items directly by URL instead of hunting.
+    The result says how complete the walk was: nodes (visited), cut_at_depth
+    (subtrees not shown because max_depth stopped there), budget_hit (the
+    node budget ran out), and a note in plain words whenever something was
+    cut — read it before concluding a name_filter match "isn't there". The
+    fingerprint hashes every visited node (independent of name_filter and
+    max_lines): compare it across calls at the same max_depth to see that
+    the page changed even when the window title didn't — only for a walk
+    that completed: a time_hit walk has none (not reproducible), and with
+    budget_hit it covers only the nodes visited. The walk doesn't stop at
+    max_lines, so an unfiltered dump of a big page can take seconds (up to
+    the 15 s cap); lower max_depth for a quick look.
     Long-run helpers for module bodies live in lib/UIA.ahk — UiaFocused,
-    UiaFind, UiaFindEdit, UiaDumpTree and friends."""
+    UiaFind, UiaFindEdit, UiaDumpTree (its &stats carries the same numbers),
+    UiaTreeFingerprint and friends; every find takes an optional &why that
+    says why it came back empty."""
     return _guard(vk.dump_uia_tree, window, max_depth, name_filter, max_lines)
 
 
@@ -953,7 +1019,10 @@ def dump_uia_tree(
 def run_automation(
     name: Annotated[str, "Any spoken automation: a workflow, launch macro, AI action, "
                     "or VoiceKit tool — e.g. 'Morning Tabs'. 'loop Morning Tabs' starts "
-                    "the workflow's loop companion (repeats until the user stops it)."],
+                    "the workflow's loop companion (repeats until the user stops it). With "
+                    "test=True or dry_run=True, also an ISOLATED hotkey module's name or "
+                    "phrase: its body runs directly under the shims (press_hotkey runs a "
+                    "module for real)."],
     wait_seconds: Annotated[int, "0 (default) = fire-and-forget. >0 = wait up to this long "
                             "for it to finish and report the outcome. " + _CAP_TEXT +
                             " Longer runs: pass 0 and check back (read_workflow_sheet, "
@@ -983,6 +1052,21 @@ def run_automation(
                     "keystrokes, emails) still happen. Refused for loops, Workflow Studio and "
                     "VoiceKit's own tools, a workflow that asks for input, a macro with a "
                     "dialog-mode #Warn."] = False,
+    dry_run: Annotated[bool, "True = a DRY run (implies test=True): keystrokes, clicks, mouse "
+                       "moves and control writes (Send/SendText/SendInput..., Click, "
+                       "MouseClick/Drag/Move, ControlSend/Click/SetText/Focus/SetChecked/"
+                       "Choose*/AddItem/DeleteItem/SetEnabled/Show/Hide/Move/SetStyle/"
+                       "ShowDropDown..., EditPaste, MenuSelect) and lib\\UIA.ahk's "
+                       "UiaSetValue / UiaInvoke / UiaFocus are LOGGED instead of performed, returned in order as "
+                       "`actions` (a paste records the clipboard it would paste; a Control* "
+                       "call still throws if its control is missing). For a workflow the "
+                       "typed text is withheld (lengths only). NOT covered: what the script "
+                       "Run()s, its file and clipboard writes, window commands (WinActivate/"
+                       "WinClose...), PostMessage/SendMessage, and COM/DllCall it makes "
+                       "itself — VkDryRun() is true in "
+                       "the script so it can skip those. A step that checks an action's "
+                       "effect (a fill's read-back, a wait for a window) sees the screen "
+                       "unchanged and may fail there."] = False,
 ) -> dict:
     """Trigger an automation now — the MCP equivalent of the user saying
     'open <name>', with the same working directory the voice shortcut uses
@@ -1015,8 +1099,16 @@ def run_automation(
     process, and real side effects — file writes, keystrokes, clicks and
     emails still happen; it is quiet, not a sandbox. For a workflow, the
     engine's own popups are suppressed too (their text is withheld — `run`
-    says what failed). There is no generic dry-run."""
-    return _guard(vk.run_automation, name, wait_seconds, args, test)
+    says what failed).
+
+    dry_run=True is the same quiet run with the input built-ins replaced
+    (lib\\DryRunShim.ahk): nothing is typed or clicked, and `actions` lists
+    what would have been, in order. It takes an isolated hotkey module's name
+    too — the way to run a body's full sequence without touching a live
+    document. Refused for a module running right now (its single-instance
+    guard would end the test at once and read as a pass) and for an
+    isolate=False module (no script of its own)."""
+    return _guard(vk.run_automation, name, wait_seconds, args, test, dry_run)
 
 
 @mcp.tool
@@ -1172,7 +1264,9 @@ def run_ahk_snippet(
     the click landed. Web pages VIRTUALIZE: only content near the viewport
     exists in the UIA tree, so a find that misses something 'on the page'
     means scroll it into view or navigate directly by URL —
-    read_reference('web-scrape') shows the robust pattern.
+    read_reference('web-scrape') shows the robust pattern. Every UIA /
+    Browser helper with its exact signature and contract:
+    read_reference('uia') / read_reference('browser').
 
     Privacy: a masked path pasted back INSIDE a quoted string ("%USERPROFILE%
     \\Documents\\<dir#1c2e>\\<file#3a9f>.pdf") is expanded to the real path on
@@ -1362,17 +1456,31 @@ def press_hotkey(
 
 @mcp.tool
 def read_reference(
-    name: Annotated[Optional[str], "Which worked example: 'web-scrape'. Omit for the "
-                    "catalogue."] = None,
+    name: Annotated[Optional[str], "A worked example ('web-scrape') or a library's "
+                    "function reference — signatures and return values ('uia', "
+                    "'browser'). Omit for the catalogue."] = None,
 ) -> dict:
-    """Worked example code to copy. Start here for a 'scrape a website' request
-    instead of writing a body from scratch: 'web-scrape' is a complete,
-    load-checked scraper body — search term, keyboard walk of the results,
-    background-tab capture, dedupe file, resumable queue, varied pacing, and a
-    stop the user (Esc) or stop_module can trigger. Every guard in it is there
-    because its absence cost a real failed run. Copy it into
-    hotkeys/bodies/<Base>.body.ahk and edit the CONFIGURE ME block; its
-    #Include paths are already correct for that folder."""
+    """Worked example code to copy, or a library's function reference
+    (signatures and return values).
+
+    'uia' / 'browser': every function lib\\UIA.ahk / lib\\Browser.ahk defines
+    — the signature exactly as written (optional params with their defaults,
+    &why / &stats out-params), a '->' line under it saying what it returns
+    (including the empty / failure value — "" / 0 / false / an empty array —
+    and what each &out-param holds), and the comment above it, in file order, under
+    a short preamble of the rules that hold for all of them (own-process rule,
+    nothing throws, UiaRect's object, search from the window root). Generated
+    from the source on each read, so it matches this install — read it
+    instead of probing for names with run_ahk_snippet.
+
+    'web-scrape': start here for a 'scrape a website' request instead of
+    writing a body from scratch — a complete, load-checked scraper body:
+    search term, keyboard walk of the results, background-tab capture, dedupe
+    file, resumable queue, varied pacing, and a stop the user (Esc) or
+    stop_module can trigger. Every guard in it is there because its absence
+    cost a real failed run. Copy it into hotkeys/bodies/<Base>.body.ahk and
+    edit the CONFIGURE ME block; its #Include paths are already correct for
+    that folder."""
     return _guard(vk.read_reference, name or "")
 
 
