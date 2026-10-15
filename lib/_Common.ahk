@@ -365,6 +365,8 @@ LogUncaughtError(err, mode) {
     ErrorLogAppend(ErrorLogLine(err))
     if VkModuleScoped()
         VkModuleErrorNote(ErrorLogLine(err))
+    else if (VkBodyBase() != "")
+        VkBodyErrorNote(err)
     return 0            ; observe only — dialogs and later handlers proceed
 }
 
@@ -385,13 +387,18 @@ LogUncaughtError(err, mode) {
 ;  nothing on screen; a later handler returning 1 -> the hook stays quiet,
 ;  exit 0). ExitApp from a handler is no good — an OnExit callback can veto
 ;  it and the dialog appears anyway (lib\TestShim.ahk, measured 2026-10-01).
-;  A handler that shows its OWN MsgBox / InputBox while it decides is a
-;  #32770 too, created while the error is pending — so the hook tells
-;  them apart by the dialog's module (CREATESTRUCT.hInstance, measured on
-;  2.0.x: AutoHotkey's error dialog 0, a MsgBox user32's, an InputBox the
-;  exe's) and lets a MsgBox / InputBox through. (An OnError callback added
-;  mid-chain is NOT called for that error — measured — so "arm last" can't
-;  be done by registering one.)
+;  A handler that shows its OWN dialog while it decides makes a #32770 too,
+;  so the hook acts only on AutoHotkey's error dialog, told apart by its
+;  module (CREATESTRUCT.hInstance). Measured on 2.0.26, 2026-10-14, every
+;  #32770 vetoed by a probe's own hook: the error dialog 0, MsgBox user32,
+;  InputBox the exe, FileSelect comdlg32, DirSelect shell32. (An OnError
+;  callback added mid-chain is NOT called for that error — measured — so
+;  "arm last" can't be done by registering one.)
+;
+;  Ending the process this way skips the script's OnExit callbacks (a vetoed
+;  ExitApp is exactly what it avoids), so cleanup a body needs after an
+;  uncaught error — a restored clipboard, a released modifier key — belongs
+;  in try/finally or its own OnError handler, not in OnExit.
 ;
 ;  The two variables are read ONCE, at load, and then removed from this
 ;  process's environment: Run() hands the environment to every child, and a
@@ -425,14 +432,27 @@ VkModuleErrorNote(line) {
             h.Close()
         }
     }
+    VkModuleArm()
+}
+
+; Armed for good, never "unpended". Nothing in AutoHotkey says when an
+; OnError chain is over, and both ways of guessing failed (2026-10-14): a
+; one-shot timer ran INSIDE a later handler's own MsgBox (it pumps
+; messages), cleared the flag, and AutoHotkey's dialog came up after all;
+; holding the timer back with Thread "NoTimers" fixed that, but a handler
+; returning -1 continues the thread, which then kept NoTimers — none of
+; the body's own SetTimer callbacks ran again, and the flag stayed set
+; anyway. Staying armed is safe because the hook only acts on AutoHotkey's
+; OWN error dialog (hInstance 0, above), never on a MsgBox / InputBox /
+; FileSelect / DirSelect the body shows later, and nothing reaches that
+; dialog without an uncaught error — which arrives here first and is noted
+; afresh (the notice describes the latest one).
+VkModuleArm() {
     VkModulePending(true)
-    SetTimer(VkModuleUnpend, -1)    ; a later handler took it: the run goes on
     VkModuleHook()
 }
 
-VkModuleUnpend() => VkModulePending(false)
-
-; An uncaught error is between its OnError chain and its dialog.
+; An uncaught error has been noted in this process (see VkModuleArm).
 VkModulePending(set := "") {
     static held := false
     if (set != "")
@@ -449,10 +469,9 @@ VkModuleHook() {
     return hook
 }
 
-; HCBT_CREATEWND (3) of a #32770 while an error is pending: AutoHotkey's
-; error dialog being created. End the body before it exists — unless it is
-; a MessageBox (user32's) or an InputBox (the exe's) that a handler of the
-; body's own is showing (see above).
+; HCBT_CREATEWND (3) of AutoHotkey's error dialog (a #32770 with hInstance
+; 0) once an error is noted: end the body before the dialog exists. Any
+; other #32770 — a dialog of the body's own — goes through (see above).
 VkModuleCbt(nCode, wParam, lParam) {
     if (nCode = 3 && VkModulePending()) {
         cls := Buffer(64, 0)
@@ -460,13 +479,149 @@ VkModuleCbt(nCode, wParam, lParam) {
         if (StrGet(cls) = "#32770") {
             hInst := -1
             try hInst := NumGet(NumGet(lParam, 0, "Ptr"), A_PtrSize, "Ptr")   ; CREATESTRUCT.hInstance
-            if (hInst != DllCall("GetModuleHandle", "Str", "user32", "Ptr")
-                && hInst != DllCall("GetModuleHandle", "Ptr", 0, "Ptr"))
+            if (hInst = 0) {
+                VkBodyErrorEnd()            ; a pressed body: status + timed notice
                 DllCall("kernel32\ExitProcess", "UInt", 3)
+            }
         }
     }
     return DllCall("CallNextHookEx", "Ptr", 0, "Int", nCode, "Ptr", wParam, "Ptr", lParam, "Ptr")
 }
+
+; ---- a body run by a key press (2026-10-14, Karbon File feedback) --------
+;  The same uncaught error in a body a PRESS started used to leave
+;  AutoHotkey's error dialog up — often behind the browser the body was
+;  driving — with the process alive behind it, holding the body's mutex,
+;  so BodySingleInstance quietly refused every later press: "it's hung".
+;  Now such a body ends the way a module step's does (the same note +
+;  WH_CBT hook above, exit 3, the body's own OnError handlers still
+;  deciding first), and on the way out it publishes a final BodyStatus
+;  line and starts lib\BodyErrorNotice.ahk: a separate tiny process that
+;  shows an always-on-top notice which closes itself after 30 s, naming
+;  the module, the error and its line, and saying a press retries. A
+;  separate process because the body is in the middle of a CBT hook (a
+;  window being created) and ends a moment later — no place for a modal.
+;  The errors.log line is LogUncaughtError's, as before. Two things a
+;  pressed body no longer gets: AutoHotkey's "Continue" on an error no
+;  handler took (the body ends instead), and its OnExit callbacks when an
+;  uncaught error ends it (ExitProcess — see the module-step notes above).
+;
+;  A body says it IS one by calling BodySingleInstance(base), which every
+;  generated body does first thing — so every existing body gets this
+;  without being regenerated. Left as they were: a workflow's module step
+;  (VkModuleScoped: exit 3, no notice — the engine reports it) and a test
+;  run (VkTestMode: TestShim reports it).
+;
+;  Tests redirect the notice: %VOICEKIT_BODY_NOTICE_OUT% names a file the
+;  notice process writes its text to instead of showing it, and applies
+;  only when %VOICEKIT_BODY_NOTICE_SCRIPT% names this script (scoped like
+;  VkModuleScoped). Read once, in BodySingleInstance — before the body can
+;  Run() anything — and then removed from this process's environment.
+
+; The base this process runs as a body for, "" when it isn't one.
+VkBodyBase(set := "") {
+    static base := ""
+    if (set != "")
+        base := set
+    return base
+}
+
+; The test redirect (see above): the notice's output file, or "".
+VkBodyNoticeOut() {
+    static out := ""
+    static read := false
+    if !read {
+        read := true
+        script := EnvGet("VOICEKIT_BODY_NOTICE_SCRIPT"), file := EnvGet("VOICEKIT_BODY_NOTICE_OUT")
+        if (script != "" || file != "") {
+            EnvSet("VOICEKIT_BODY_NOTICE_SCRIPT")
+            EnvSet("VOICEKIT_BODY_NOTICE_OUT")
+        }
+        if (script != "" && VkLongPath(script) = VkLongPath(A_ScriptFullPath))
+            out := file
+    }
+    return out
+}
+
+; The notice that VkBodyErrorEnd hands over, kept from the moment the error
+; is noted (while a later handler may still take it) to the moment the
+; body ends. "" = nothing to say.
+VkBodyPendingNotice(set := "") {
+    static held := ""
+    if (set != "")
+        held := set
+    return held
+}
+
+; Note an uncaught error in a pressed body and arm the hook. Everything the
+; notice needs is worked out HERE, in an ordinary OnError callback, so the
+; hook itself only writes two small files and starts one process.
+VkBodyErrorNote(err) {
+    try VkBodyPendingNotice(VkBodyNoticeText(VkBodyBase(), err))
+    VkModuleArm()
+}
+
+; Title line, then the message. The module is named by its bridge-map phrase
+; and key when the map has them (what the user says / presses), else by its
+; spaced-out base.
+VkBodyNoticeText(base, err) {
+    root := A_LineFile "\..\.."                ; lib\_Common.ahk -> repo root
+    name := SpaceOut(base), key := ""
+    try for e in BridgeMapEntries(root)
+        if (e.file = "hotkeys\" base ".ahk") {
+            name := e.phrase, key := e.combo
+            break
+        }
+    msg := "unknown error", where := "", extra := ""
+    try {
+        if (err is Error) {
+            msg := err.Message
+            if (err.HasProp("File") && err.File != "") {
+                SplitPath(err.File, &fname)
+                where := "Line " err.Line " of " fname
+            }
+            if (err.HasProp("Extra") && err.Extra != "")
+                extra := "Specifically: " Abbrev(String(err.Extra), 200)
+        } else
+            msg := String(err)
+    }
+    return "VoiceKit: " name " stopped`n"
+        . "'" name "'" (key != "" ? " (" key ")" : "") " stopped because of an error, and has been closed.`n`n"
+        . msg (extra != "" ? "`n" extra : "") (where != "" ? "`n" where : "") "`n`n"
+        . "The error is also in logs\errors.log.`n"
+        . "Press " (key != "" ? key : "the key") " again to try again.`n`n"
+        . "(This message closes itself in 30 seconds.)"
+}
+
+; Called from the hook just before the body ends (a no-op outside a pressed
+; body): the final status line, then the notice in its own process.
+VkBodyErrorEnd() {
+    base := VkBodyBase(), text := VkBodyPendingNotice()
+    if (base = "" || text = "")
+        return
+    ; The LAST "Line N of <file>" line (VkBodyNoticeText puts it after the
+    ; message, which could itself contain such a line). The file is named
+    ; because an error inside an #Included library (UIA.ahk) carries THAT
+    ; file's line number, not the body's.
+    where := ""
+    if RegExMatch(text, "s)^.*\nLine (\d+) of ([^\n]+)", &m)
+        where := " at line " m[1] " of " m[2]
+    BodyStatus(base, "Stopped by an error" where " - see logs\errors.log; press the key again to retry")
+    SplitPath(A_LineFile, , &libDir)
+    notice := libDir "\BodyErrorNotice.ahk"
+    if !FileExist(notice)       ; never Run a missing script: that's a dialog too
+        return
+    f := A_Temp "\voicekit-body-error-" DllCall("GetCurrentProcessId", "UInt") "-" A_TickCount ".txt"
+    try {
+        h := FileOpen(f, "w", "UTF-8")
+        h.Write(text)
+        h.Close()
+        out := VkBodyNoticeOut()
+        Run('"' A_AhkPath '" "' notice '" "' f '"' (out != "" ? ' "' out '"' : ""))
+    } catch
+        try FileDelete(f)       ; the notice deletes it; without one, nobody would
+}
+
 ; Top-level on purpose: it registers during the include, so every host —
 ; macros, bodies, the Studio, the master — gets the log line with no code
 ; of its own. (With VkModuleEnv() above, _Common.ahk's only auto-execute
@@ -672,6 +827,29 @@ VkLongPath(p) {
     if DllCall("GetLongPathNameW", "Str", p, "Ptr", buf, "UInt", 32768, "UInt")
         p := StrGet(buf)
     return p
+}
+
+; ---- a module's own Python (2026-10-14, Karbon File feedback) ------------
+;  A module that needs a Python package (pypdf for a combined PDF) gets its
+;  own virtual environment under <root>\tools\python\<env>\ — made by the
+;  MCP, never VoiceKit's own mcp\.venv, and per machine (tools\ is
+;  gitignored and never shipped). A body runs it as:
+;      py := VkPythonExe("karbon")
+;      if (py = "")
+;          throw Error("The 'karbon' Python environment isn't set up on this PC.")
+;      RunWait('"' py '" "' A_ScriptDir '\..\..\tools\combine.py" ...')
+;  Returns the environment's python.exe, or "" when it doesn't exist. The
+;  name keeps only [\w\-.] (so it can't leave tools\python\), and a name
+;  left empty or all dots, or longer than 64, is no environment — exactly
+;  the names ensure_python_env refuses (_pyenv_name).
+VkPythonExe(env, root := "") {
+    env := RegExReplace(env, "[^\w\-.]")
+    if (Trim(env, ".") = "" || StrLen(env) > 64)
+        return ""
+    if (root = "")
+        root := A_LineFile "\..\.."            ; lib\_Common.ahk -> repo root
+    exe := root "\tools\python\" env "\Scripts\python.exe"
+    return FileExist(exe) && !InStr(FileExist(exe), "D") ? VkLongPath(exe) : ""
 }
 
 VkResult(value) {
@@ -888,10 +1066,25 @@ ComSpecPath() {
 ; reload, every preflight and the login launcher forever. After timeoutMs
 ; the whole tree (cmd + its AutoHotkey child) is killed and the check
 ; fails with timedOut=true and a note saying what blocked it.
+;
+; Warnings (2026-10-14, Karbon File feedback): AutoHotkey warns at load BY
+; DEFAULT — an unassigned variable, a call to a function that doesn't exist
+; yet (a half-finished edit) — and shows it as a dialog, so such a check
+; used to hang its whole bound and then blame #Warn. lib\ValidateWarnings.ahk,
+; passed with /include, routes the default warnings to stdout instead:
+; measured, the check then ends in ~60 ms with exit 0 and the text
+; '<file> (N) : ==> Warning: ...'. Any such warning FAILS the check (ok
+; false, timedOut false) — it would be a dialog at every real run — and has
+; the shape of a load error, so MasterPreflight parks the module it names.
+; A file with its OWN #Warn line is checked as before (its author chose,
+; and the line would win over the /include anyway). Python validate_ahk
+; applies the same rule.
 AhkValidate(file, timeoutMs := 20000) {
     outFile := A_Temp "\voicekit-validate-" DllCall("GetCurrentProcessId") "-" A_TickCount ".txt"
     try FileDelete(outFile)
-    cmd := ComSpecPath() ' /c ""' A_AhkPath '" /ErrorStdOut=UTF-8 /validate "' file '"'
+    inc := AhkValidateWarnInclude(file)
+    cmd := ComSpecPath() ' /c ""' A_AhkPath '" /ErrorStdOut=UTF-8'
+        . (inc != "" ? ' /include "' inc '"' : "") ' /validate "' file '"'
         . ' > "' outFile '" 2>&1"'
     readOut() {
         t := ""
@@ -925,7 +1118,7 @@ AhkValidate(file, timeoutMs := 20000) {
             Sleep(30)
         }
         t := readOut()
-        return {ok: (t = ""), timedOut: false, text: t}
+        return {ok: (t = ""), timedOut: false, text: t}   ; a warning is text too
     }
     timedOut := false
     while (DllCall("WaitForSingleObject", "ptr", h, "uint", 0, "uint") = 258) {   ; WAIT_TIMEOUT
@@ -951,7 +1144,26 @@ AhkValidate(file, timeoutMs := 20000) {
     rc := 1
     DllCall("GetExitCodeProcess", "ptr", h, "uint*", &rc)
     DllCall("CloseHandle", "ptr", h)
-    return {ok: (rc = 0), timedOut: false, text: readOut()}
+    t := readOut()
+    ; A warning exits 0 (re-measured 2026-10-14, 2.0.26: 84 ms, exit 0, the
+    ; text on stdout) — its text is what fails it. That holds for a file
+    ; with its OWN '#Warn ..., StdOut' too: it used to pass, and now fails
+    ; on its warnings, exactly as Python validate_ahk does.
+    return {ok: (rc = 0 && !InStr(t, "==> Warning:")), timedOut: false, text: t}
+}
+
+; lib\ValidateWarnings.ahk for AhkValidate's /include, or "" when the file
+; being checked has its own #Warn line (same pattern as MasterWarnModules;
+; Python _OWN_WARN_RE) or the include file is missing (an old install: the
+; check then behaves as it did before it existed).
+AhkValidateWarnInclude(file) {
+    SplitPath(A_LineFile, , &libDir)
+    inc := libDir "\ValidateWarnings.ahk"
+    if !FileExist(inc)
+        return ""
+    txt := ""
+    try txt := FileRead(file, "UTF-8")
+    return RegExMatch(txt, "im)^[ \t]*#Warn\b") ? "" : inc
 }
 
 ; The repo-relative module an AHK load error points at ("hotkeys\Foo.ahk"),
@@ -1543,6 +1755,10 @@ BodyStopRequested(base, root := "") {
 ;  A kernel mutex is claimed atomically, so the second process ALWAYS
 ;  sees it, however narrow the gap. Generated bodies call this first
 ;  thing; the handle is held for the life of the process on purpose.
+;
+;  It is also where a body says it IS one (2026-10-14): from here on an
+;  uncaught error ends it with a timed notice instead of a dialog that
+;  holds the mutex forever (VkBodyBase / VkBodyErrorNote, above).
 BodySingleInstance(base) {
     static hMutex := 0
     if hMutex                          ; this process already holds it
@@ -1555,7 +1771,9 @@ BodySingleInstance(base) {
     }
     if !hMutex
         hMutex := 0                    ; CreateMutex failed outright — never let
-    return true                        ; the guard stop legitimate work
+    VkBodyBase(base)                   ;   the guard stop legitimate work
+    VkBodyNoticeOut()                  ; read (and drop) the test redirect now
+    return true
 }
 
 ; The mutex a running body holds (voicekit_writer._body_mutex_held builds

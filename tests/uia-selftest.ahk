@@ -23,7 +23,7 @@ if !UiaAvailable() {
 }
 
 ; ---- bring up the target process (pinned to its fresh PID) ------------
-if !(hwnd := TargetLaunch("uia-selftest-target.ahk", "VKUiaTarget_ZZ"))
+if !(hwnd := TargetLaunch("uia-selftest-target.ahk", "VKUiaTarget_ZZ", &tpid))
     ExitApp(1)
 Say("target up, hwnd=" hwnd)
 
@@ -518,6 +518,434 @@ scoped := UiaScopedHits(rowsIn, listEl, &dropped)
 Check("a stray at the end of a long list is caught (the ends are always sampled)",
     scoped.Length = 40 && dropped = 1, "kept " scoped.Length " dropped " dropped)
 
+; ---- a rectangle is not a place you can click (2026-10-14) ------------
+; From a real build: Chrome reports rectangles for content scrolled out of
+; an inner panel or under a pinned header, and UiaClickEl clicked there —
+; once on a different monitor. The target's second window (VKUiaVis_ZZ) is
+; the Win32 stand-in: a pane with scroll bars (a scroll container) holding
+; a button inside it, one two-thirds past its edge, and one wholly past it
+; but still inside the window (it keeps a rectangle and IsOffscreen stays
+; false — measured); a button an overlay window covers; and VKUiaFar_ZZ,
+; shown off every monitor. Every refused click is proved NOT sent: each
+; button (and the overlay) counts its clicks, and the mouse doesn't move.
+visHwnd := WinExist("VKUiaVis_ZZ ahk_pid " tpid)
+farHwnd := WinExist("VKUiaFar_ZZ ahk_pid " tpid)
+coverHwnd := WinExist("VKUiaCover_ZZ ahk_pid " tpid)
+Check("the visibility fixtures are up", visHwnd && farHwnd && coverHwnd)
+; The main target window may have been activated above them: raise the
+; fixture window, then the overlay over it (WinMoveTop: no activation).
+WinActivate("ahk_id " visHwnd)
+WinWaitActive("ahk_id " visHwnd, , 2)
+WinMoveTop("ahk_id " coverHwnd)
+Sleep(300)
+VisClicks(k) => Integer(TargetState(k "clicks"))
+
+Say("about to: get_CurrentIsOffscreen (Element slot 38) / get_CurrentProcessId (slot 20)")
+Check("a button is not offscreen", UiaIsOffscreen(el) = false)
+farRow := UiaFind(hwnd, "Lv Row 40", 2000)
+Check("a list row past the fold reports IsOffscreen (and no rectangle)",
+    farRow != "" && UiaIsOffscreen(farRow) = true && UiaRect(farRow) = "")
+Check("UiaIsOffscreen of nothing is false", UiaIsOffscreen("") = false)
+Check("UiaProcessId names the target's process", UiaProcessId(el) = tpid, UiaProcessId(el) " vs " tpid)
+Check("UiaProcessId of nothing is 0", UiaProcessId("") = 0)
+
+Say("about to: GetCurrentPattern(ScrollPattern 10004) — UiaIsScrollContainer")
+paneEl := UiaFromWindow(Integer(TargetState("panehwnd")))
+Check("the pane with scroll bars is a scroll container", UiaIsScrollContainer(paneEl) = true)
+Check("...so is the list", UiaIsScrollContainer(listEl) = true)
+Check("...a button is not", UiaIsScrollContainer(el) = false)
+Check("...nor a top-level window", UiaIsScrollContainer(root) = false)
+Check("UiaIsScrollContainer of nothing is false", UiaIsScrollContainer("") = false)
+
+Say("about to: UiaIntersect / UiaOnMonitors")
+ix := UiaIntersect({x: 0, y: 0, w: 10, h: 10}, {x: 5, y: 6, w: 10, h: 10})
+Check("UiaIntersect overlaps", IsObject(ix) && ix.x = 5 && ix.y = 6 && ix.w = 5 && ix.h = 4)
+Check("...edge-touching rectangles don't overlap", UiaIntersect({x: 0, y: 0, w: 10, h: 10}, {x: 10, y: 0, w: 5, h: 5}) = "")
+Check("...nor does a non-rectangle", UiaIntersect("", {x: 0, y: 0, w: 1, h: 1}) = "")
+vRight := SysGet(76) + SysGet(78)
+Check("a rectangle past the virtual screen is on no monitor",
+    UiaOnMonitors({x: vRight + 50, y: SysGet(77) + 10, w: 100, h: 100}) = "")
+MonitorGet(MonitorGetPrimary(), &pl, &pt_, &pr, &pb)
+straddle := UiaOnMonitors({x: pl - 5000, y: pt_ + 10, w: 5100, h: 50})
+Check("a rectangle straddling the primary monitor's edge keeps an on-monitor piece",
+    IsObject(straddle) && straddle.x >= pl - 5000 && straddle.w <= 5100 && straddle.w > 0)
+
+Say("about to: UiaVisibleRect")
+inBtn := UiaFind(visHwnd, "Inside Btn Zz", 2000)
+clipBtn := UiaFind(visHwnd, "Clipped Btn Zz", 2000)
+hidBtn := UiaFind(visHwnd, "Hidden Btn Zz", 2000)
+covBtn := UiaFind(visHwnd, "Covered Btn Zz", 2000)
+Check("the fixtures are findable", inBtn && clipBtn && hidBtn && covBtn)
+rIn := UiaRect(inBtn), vIn := UiaVisibleRect(inBtn, &whyV)
+Check("a wholly visible button: the visible rect IS its rect",
+    IsObject(vIn) && vIn.x = rIn.x && vIn.y = rIn.y && vIn.w = rIn.w && vIn.h = rIn.h && whyV = "", whyV)
+rClip := UiaRect(clipBtn), rPane := UiaRect(paneEl)
+vClip := UiaVisibleRect(clipBtn, &whyV)
+Check("a button two-thirds past its scroll pane's edge: only the part inside the pane",
+    IsObject(vClip) && vClip.x = rClip.x && vClip.w < rClip.w && vClip.x + vClip.w <= rPane.x + rPane.w && whyV = "",
+    IsObject(vClip) ? vClip.x "," vClip.y " " vClip.w "x" vClip.h " of " rClip.w "x" rClip.h : whyV)
+rHid := UiaRect(hidBtn)
+Check("the hidden button still reports a rectangle and is NOT IsOffscreen (the Chrome-like case)",
+    IsObject(rHid) && UiaIsOffscreen(hidBtn) = false)
+Check("...yet it has no visible rect, and why says a scroll container (a Pane) clips it",
+    UiaVisibleRect(hidBtn, &whyV, &detV) = "" && InStr(whyV, "scrolling container (a Pane)"), whyV)
+Check("...why names no element (it may be recorded); detail does",
+    !InStr(whyV, "VKUiaPane_ZZ") && InStr(detV, "VKUiaPane_ZZ"), detV)
+; The point at the hidden button's full centre is over its own WINDOW — an
+; ancestor. Chrome answers a hit test with the nearest hit-testable
+; ancestor, so some ancestors must count — but not the window, the page or
+; the scroll container, which a click can hit without touching the element
+; (review, 2026-10-14: the first version accepted any ancestor, so a header
+; the accessibility tree ignores, pinned over a panel, passed as a hit).
+Check("...and a hit test at its full centre says the WINDOW is there, not the button",
+    UiaHitTest(hidBtn, rHid.x + rHid.w // 2, rHid.y + rHid.h // 2, &whatH) = 0
+    && InStr(whatH, "a Window that holds the element"), whatH)
+Check("UiaHitCountsFor: the window and the scroll pane above a button don't count",
+    !UiaHitCountsFor(inBtn, UiaFromWindow(visHwnd))
+    && !UiaHitCountsFor(inBtn, paneEl) && !UiaHitCountsFor("", paneEl))
+Check("a rect-less row has no visible rect (no bounding rectangle)",
+    UiaVisibleRect(farRow, &whyV) = "" && InStr(whyV, "no bounding rectangle"), whyV)
+Check("UiaVisibleRect of nothing is empty with a reason", UiaVisibleRect("", &whyV) = "" && InStr(whyV, "no element"), whyV)
+Check("UiaWaitVisible returns the visible rect at once", IsObject(UiaWaitVisible(inBtn, 300)))
+
+Say("about to: UiaElementAtPoint (IUIAutomation slot 7, with &why) / UiaHitTest")
+cIn := UiaJitteredCenter(rIn)
+atIn := UiaElementAtPoint(cIn.x, cIn.y, &whyP)
+Check("UiaElementAtPoint finds the button under its centre",
+    atIn != "" && UiaSameElement(atIn, inBtn) && whyP = "", whyP)
+Check("UiaHitTest: a click there reaches the button", UiaHitTest(inBtn, cIn.x, cIn.y) = 1)
+rCov := UiaRect(covBtn), cCov := UiaJitteredCenter(rCov)
+atCov := UiaElementAtPoint(cCov.x, cCov.y)
+Check("over the covered button, the point holds the OVERLAY", UiaName(atCov) = "Cover Zz",
+    "got " UiaDescribe(atCov))
+Check("UiaHitTest says something else is there: its type, no names",
+    UiaHitTest(covBtn, cCov.x, cCov.y, &whatC, &detC) = 0 && whatC = "a Text", whatC)
+Check("...detail names it and its window", InStr(detC, 'Text "Cover Zz"') && InStr(detC, "VKUiaCover_ZZ"), detC)
+Check("UiaHitTest of nothing can't tell", UiaHitTest("", 1, 1) = -1)
+; r.x + r.w / 2 is a Float in v2; the int64 POINT packing threw on one
+; (measured) from functions that promise never to throw.
+Check("Float coordinates are rounded, not thrown on",
+    UiaSameElement(UiaElementAtPoint(cIn.x + 0.4, cIn.y + 0.4, &whyP), inBtn) && UiaHitTest(inBtn, cIn.x + 0.4, cIn.y - 0.4) = 1, whyP)
+Check("...and a non-number is a refusal with a reason",
+    UiaElementAtPoint("x", 5, &whyP) = "" && InStr(whyP, "not a screen point") && UiaHitTest(inBtn, "x", 5) = -1, whyP)
+
+Say("about to: UiaClickEl on the clipped button (clicks the VISIBLE part)")
+cp := UiaClickablePoint(clipBtn, 0, &whyCp)
+Check("UiaClickablePoint picks a point inside the visible part",
+    IsObject(cp) && cp.x >= vClip.x && cp.x < vClip.x + vClip.w && cp.y >= vClip.y && cp.y < vClip.y + vClip.h && whyCp = "", whyCp)
+Check("...which is NOT the full rect's centre (that one is clipped away)",
+    IsObject(cp) && cp.x < rClip.x + rClip.w // 2)
+before := VisClicks("clip")
+Check("UiaClickEl clicks the clipped button", UiaClickEl(clipBtn, 3, "Left", 1, &whyCp) = true, whyCp)
+Check("...and the click landed on it", TargetState("clipclicks", before + 1) = before + 1,
+    before " -> " TargetState("clipclicks"))
+
+Say("about to: UiaClickEl refusals (nothing may be clicked)")
+; The click above activated VKUiaVis_ZZ, which lifts it over the overlay:
+; put the overlay back on top before relying on it.
+WinMoveTop("ahk_id " coverHwnd)
+Sleep(300)
+Check("the overlay covers the button again", UiaName(UiaElementAtPoint(cCov.x, cCov.y)) = "Cover Zz")
+CoordMode("Mouse", "Screen")
+MouseGetPos(&mx0, &my0)
+hidBefore := VisClicks("hid"), covBefore := VisClicks("cov"), coverBefore := VisClicks("cover")
+whyH := "", whyC := ""
+Check("UiaClickEl refuses the hidden button", UiaClickEl(hidBtn, 0, "Left", 1, &whyH) = false)
+Check("...why: nowhere visible, outside the scroll container, can't scroll itself",
+    InStr(whyH, "nowhere visible") = 1 && InStr(whyH, "scrolling container") && InStr(whyH, "no ScrollItemPattern"), whyH)
+Check("UiaClickEl refuses the covered button", UiaClickEl(covBtn, 0, "Left", 1, &whyC) = false)
+Check("...why says something is in the way, by type only", InStr(whyC, "something else is in the way") = 1
+    && InStr(whyC, "a Text") && !InStr(whyC, "Cover Zz") && !InStr(whyC, "VKUiaCover_ZZ"), whyC)
+UiaClickEl(covBtn, 0, "Left", 1, &whyC, &detC)
+Check("...detail names it", InStr(detC, 'Text "Cover Zz"') && InStr(detC, "VKUiaCover_ZZ"), detC)
+Check("UiaClickCenter inherits the refusal",
+    UiaClickCenter(visHwnd, "Covered Btn Zz", 2000, 0, &whyC, &detC) = false && InStr(whyC, "in the way") && InStr(detC, "Cover Zz"), detC)
+Sleep(500)
+MouseGetPos(&mx1, &my1)
+Check("NO click was sent: the hidden button's count is unchanged", VisClicks("hid") = hidBefore)
+Check("...nor the covered button's", VisClicks("cov") = covBefore)
+Check("...nor the overlay's (a blind click would have hit it)", VisClicks("cover") = coverBefore)
+Check("...and the mouse never moved", mx0 = mx1 && my0 = my1, mx0 "," my0 " -> " mx1 "," my1)
+
+Say("about to: a window off every monitor")
+WinGetPos(&fx, &fy, &fw, &fh, "ahk_id " farHwnd)
+if (fx >= vRight) {
+    farBtn := UiaFind(farHwnd, "Far Btn Zz", 2000)
+    Check("the off-monitor button is findable and has a rectangle", farBtn != "" && IsObject(UiaRect(farBtn)))
+    Check("...but no visible rect: it is on no monitor",
+        UiaVisibleRect(farBtn, &whyF) = "" && InStr(whyF, "not on any monitor"), whyF)
+    ; UiaClickablePoint first: it is the whole decision UiaClickEl makes, and
+    ; it clicks nothing — so a regression fails HERE instead of clicking at
+    ; the screen edge the cursor would be clamped to.
+    if (UiaClickablePoint(farBtn, 0, &whyF) = "") {
+        farBefore := VisClicks("far")
+        MouseGetPos(&mx0, &my0)
+        Check("UiaClickEl refuses it", UiaClickEl(farBtn, 0, "Left", 1, &whyF) = false
+            && InStr(whyF, "not on any monitor"), whyF)
+        Sleep(400)
+        MouseGetPos(&mx1, &my1)
+        Check("...with no click sent and the mouse unmoved",
+            VisClicks("far") = farBefore && mx0 = mx1 && my0 = my1)
+    } else {
+        Check("UiaClickablePoint refuses an off-monitor element (UiaClickEl NOT called)", false)
+    }
+} else {
+    Say("SKIP  the off-monitor window was moved back onto a monitor (x=" fx ") — not provable here")
+}
+
+; ---- the hit test's ScrollIntoView retry (review, 2026-10-14) ---------
+; VKUiaRescue_ZZ: a ListView showing five and a half rows. VKUiaPin_ZZ sits
+; over the first row slot (a header pinned over the content); VKUiaStrip_ZZ
+; over the half row at the bottom. Both overlays count their clicks, and so
+; does the list (rsn, with the row in rslast).
+Say("about to: the hit-test retry - a pinned header (refused) and a covering strip (rescued)")
+rsHwnd := WinExist("VKUiaRescue_ZZ ahk_pid " tpid)
+stripHwnd := WinExist("VKUiaStrip_ZZ ahk_pid " tpid)
+pinHwnd := WinExist("VKUiaPin_ZZ ahk_pid " tpid)
+Check("the retry fixtures are up", rsHwnd && stripHwnd && pinHwnd)
+WinMoveTop("ahk_id " stripHwnd)
+WinMoveTop("ahk_id " pinHwnd)
+Sleep(300)
+rs1 := UiaFind(rsHwnd, "Rs Row 1", 2000)
+rs6 := UiaFind(rsHwnd, "Rs Row 6", 2000)
+v1 := UiaVisibleRect(rs1, &w1), v6 := UiaVisibleRect(rs6, &w6)
+Check("row 1 is visible, and so is the part of row 6 above the fold",
+    IsObject(v1) && IsObject(v6) && v6.h < v1.h, w1 " / " w6)
+if (IsObject(v1) && IsObject(v6)) {
+    c1 := UiaJitteredCenter(v1), c6 := UiaJitteredCenter(v6)
+    Check("...the pin covers row 1", UiaName(UiaElementAtPoint(c1.x, c1.y)) = "VKUiaPin_ZZ",
+        UiaDescribe(UiaElementAtPoint(c1.x, c1.y)))
+    Check("...the strip covers what shows of row 6", UiaName(UiaElementAtPoint(c6.x, c6.y)) = "VKUiaStrip_ZZ",
+        UiaDescribe(UiaElementAtPoint(c6.x, c6.y)))
+    Check("before: row 1 is the top row", TargetState("rstop") = "0")
+
+    rsBefore := Integer(TargetState("rsn")), pinBefore := VisClicks("pin"), stripBefore := VisClicks("strip")
+    MouseGetPos(&mx0, &my0)
+    whyPin := "", detPin := ""
+    Check("UiaClickEl refuses the row under the pinned header",
+        UiaClickEl(rs1, 0, "Left", 1, &whyPin, &detPin) = false, detPin)
+    Check("...after a ScrollIntoView retry that couldn't help: why says 'still'",
+        InStr(whyPin, "something else is in the way") = 1 && InStr(whyPin, "still, after ScrollIntoView"), whyPin)
+    Check("...why names no window; detail does", !InStr(whyPin, "VKUiaPin_ZZ") && InStr(detPin, "VKUiaPin_ZZ"),
+        whyPin " | " detPin)
+    Sleep(400)
+    MouseGetPos(&mx1, &my1)
+    Check("...NO click sent: the list and the pin counted nothing, the mouse didn't move",
+        Integer(TargetState("rsn")) = rsBefore && VisClicks("pin") = pinBefore && mx0 = mx1 && my0 = my1)
+
+    WinMoveTop("ahk_id " stripHwnd)
+    Sleep(200)
+    why6 := "unset", det6 := ""
+    Check("UiaClickEl rescues row 6 from under the strip (hit test in the way -> ScrollIntoView -> retry)",
+        UiaClickEl(rs6, 0, "Left", 1, &why6, &det6) = true, det6)
+    Check("...the list really scrolled", TargetState("rstop", "1") = "1", "top=" TargetState("rstop"))
+    Check("...the click landed on row 6", TargetState("rslast", "Rs Row 6") = "Rs Row 6"
+        && Integer(TargetState("rsn")) = rsBefore + 1, TargetState("rslast") " n=" TargetState("rsn"))
+    Check("...and not on the strip", VisClicks("strip") = stripBefore)
+}
+
+; ---- the element's OWN window (code review, 2026-10-14) ----------------
+; UiaVisibleRect once took "the ancestor just below the desktop root" as the
+; element's window, and a walk that failed partway as complete. An owned
+; window (a dialog) may sit under its owner in the tree, and its controls
+; were clipped to the owner's box.
+Say("about to: get_CurrentNativeWindowHandle (Element slot 36) / UiaIsWindowRoot / UiaClipChain")
+visRoot := UiaFromWindow(visHwnd)
+Check("UiaNativeHwnd of a window's element is its HWND", UiaNativeHwnd(visRoot) = visHwnd, UiaNativeHwnd(visRoot) " vs " visHwnd)
+Check("...of a child pane, the pane's", UiaNativeHwnd(paneEl) = Integer(TargetState("panehwnd")))
+Check("...of nothing, 0", UiaNativeHwnd("") = 0)
+Check("UiaIsWindowRoot: a top-level window yes; a child pane, a button, nothing and the desktop no",
+    UiaIsWindowRoot(visRoot) && !UiaIsWindowRoot(paneEl) && !UiaIsWindowRoot(inBtn)
+    && !UiaIsWindowRoot("") && !UiaIsWindowRoot(UiaParent(visRoot)))
+chIn := UiaClipChain(inBtn, &whyCh)
+Check("UiaClipChain: from a button, up through its pane, ending AT its window (no desktop root)",
+    IsObject(chIn) && chIn.Length >= 2 && UiaSameElement(chIn[chIn.Length], visRoot)
+    && UiaIsWithin(paneEl, chIn[1]) && whyCh = "", whyCh)
+Check("...a window's own chain is empty", IsObject(UiaClipChain(visRoot)) && UiaClipChain(visRoot).Length = 0)
+Check("...and nothing has none, with a reason", UiaClipChain("", &whyCh) = "" && whyCh != "")
+
+ownerHwnd := WinExist("VKUiaOwner_ZZ ahk_pid " tpid)
+ownedHwnd := WinExist("VKUiaOwned_ZZ ahk_pid " tpid)
+Check("the owned-window fixtures are up", ownerHwnd && ownedHwnd)
+WinMoveTop("ahk_id " ownedHwnd)
+Sleep(200)
+ownedRoot := UiaFromWindow(ownedHwnd)
+ownedUp := UiaParent(ownedRoot)
+Say("INFO  the owned window's UIA parent is " (UiaSameElement(ownedUp, UiaFromWindow(ownerHwnd)) ? "its OWNER" : "not its owner (" UiaDescribe(ownedUp) ")"))
+ownedBtn := UiaFind(ownedHwnd, "Owned Btn Zz", 2000)
+rOwned := UiaRect(ownedBtn), rOwner := UiaRect(UiaFromWindow(ownerHwnd))
+Check("the owned window's button lies wholly outside its owner's box",
+    IsObject(rOwned) && IsObject(rOwner) && rOwned.x >= rOwner.x + rOwner.w)
+chOwned := UiaClipChain(ownedBtn)
+Check("...its chain ends at the OWNED window, not the owner",
+    IsObject(chOwned) && UiaSameElement(chOwned[chOwned.Length], ownedRoot))
+vOwned := UiaVisibleRect(ownedBtn, &whyO)
+Check("...so it is wholly visible", IsObject(vOwned) && vOwned.x = rOwned.x && vOwned.w = rOwned.w && whyO = "", whyO)
+ownedBefore := VisClicks("owned")
+Check("UiaClickEl clicks it", UiaClickEl(ownedBtn, 0, "Left", 1, &whyO, &detO) = true, detO)
+Check("...and the click landed", TargetState("ownedclicks", ownedBefore + 1) = ownedBefore + 1)
+seenOwner := UiaDumpTree(ownerHwnd, 8, "Owned Btn", 50, , false, true)
+seenOwned := UiaDumpTree(ownedHwnd, 8, "Owned Btn", 50, , false, true)
+Check("a visibleOnly dump from the owned window shows the button", InStr(seenOwned, "Owned Btn Zz") > 0, seenOwned)
+if UiaSameElement(ownedUp, UiaFromWindow(ownerHwnd))
+    Check("...and so does one from the OWNER (the owned window starts its own clip)",
+        InStr(seenOwner, "Owned Btn Zz") > 0, seenOwner)
+
+; ---- one coordinate space for the click (2026-10-14) -------------------
+; Measured: UIA rectangles, MonitorGet, WindowFromPoint and MouseMove all
+; follow the thread's DPI context; UiaClickEl decides and clicks in
+; per-monitor-v2 (physical pixels) and must hand the script back its own.
+Say("about to: UiaDpiPhysical / UiaDpiRestore / UiaSleep")
+DpiAw() => DllCall("GetAwarenessFromDpiAwarenessContext", "ptr", DllCall("GetThreadDpiAwarenessContext", "ptr"))
+aw0 := DpiAw()
+prevCtx := UiaDpiPhysical()
+awIn := DpiAw()
+UiaSleep(50)
+awAfterSleep := DpiAw()
+UiaDpiRestore(prevCtx)
+Check("UiaDpiPhysical switches to per-monitor awareness and back", prevCtx && awIn = 2 && DpiAw() = aw0,
+    aw0 " -> " awIn " -> " DpiAw())
+Check("...and UiaSleep inside it keeps the scope", awAfterSleep = 2)
+UiaClickEl(UiaFind(visHwnd, "Inside Btn Zz", 2000), 0)
+Check("UiaClickEl leaves the script's own DPI context as it found it", DpiAw() = aw0, DpiAw() " vs " aw0)
+UiaClickEl(hidBtn, 0)
+Check("...also when it refuses", DpiAw() = aw0)
+
+; ---- walking up, not searching down (2026-10-14) ----------------------
+; A window-wide UiaFindById on a big Chrome page ran past 400 ms although the
+; id was there; walking up from an element in hand was instant.
+Say("about to: UiaFindAncestorById / UiaFindAncestorByName")
+listId := UiaAutomationId(listEl)
+Check("the list has an AutomationId (Win32: its control id)", listId != "", "id='" listId "'")
+anc := UiaFindAncestorById(rowIn, listId, 64, &whyA)
+Check("from a row, the ancestor with the list's id IS the list", UiaSameElement(anc, listEl) && whyA = "", whyA)
+Check("...an element is not its own ancestor", UiaFindAncestorById(listEl, listId, 64, &whyA) = ""
+    && InStr(whyA, "top of the element's window"), whyA)
+Check("...a missing id says it walked to the top",
+    UiaFindAncestorById(rowIn, "no.such.id.zz", 64, &whyA) = "" && InStr(whyA, "AutomationId 'no.such.id.zz'"), whyA)
+Check("...and maxHops bounds the walk",
+    UiaFindAncestorById(rowIn, "no.such.id.zz", 1, &whyA) = "" && InStr(whyA, "within 1 levels"), whyA)
+Check("...and nothing to start from says so", UiaFindAncestorById("", listId, 64, &whyA) = "" && InStr(whyA, "no start element"), whyA)
+Check("UiaFindAncestorByName finds the pane above its button",
+    UiaSameElement(UiaFindAncestorByName(inBtn, "VKUiaPane_ZZ"), paneEl))
+Check("...the type must match when one is given",
+    UiaFindAncestorByName(inBtn, "VKUiaPane_ZZ", UIA_TYPE_BUTTON(), 64, &whyA) = "" && InStr(whyA, "of type Button"), whyA)
+Check("...and it never answers with the desktop root",
+    UiaFindAncestorByName(inBtn, UiaName(UiaParent(UiaFromWindow(visHwnd))), 0, 64) = "")
+
+; ---- icon-font characters (2026-10-14) ---------------------------------
+; A web app's "..." toggle was named by ONE private-use character (U+E611),
+; so every "has no name" check said it had one.
+Say("about to: UiaStripIcons / UiaShowIcons / UiaName(el, true)")
+Check("a name that is only an icon strips to empty", UiaStripIcons(Chr(0xE611)) = "")
+Check("...icons and the space around them go, text stays", UiaStripIcons(" " Chr(0xE611) " Menu " Chr(0xF8FF)) = "Menu")
+Check("...supplementary-plane icons (planes 15/16) go too",
+    UiaStripIcons("a" Chr(0xF0001) "b" Chr(0x10FFFD)) = "ab")
+Check("...ordinary text is untouched", UiaStripIcons("Caf" Chr(0xE9) " " Chr(0x2026)) = "Caf" Chr(0xE9) " " Chr(0x2026))
+; A LONE surrogate (malformed UTF-16) once swallowed the next real
+; character: the regex read "high surrogate + b" as one plane-15/16 icon.
+Check("...a lone high surrogate keeps the character after it",
+    UiaStripIcons("a" Chr(0xDB80) "b") = "a" Chr(0xDB80) "b" && UiaStripIcons("a" Chr(0xDB80) "b" Chr(0xE611)) = "a" Chr(0xDB80) "b")
+Check("...and so does UiaShowIcons", UiaShowIcons(Chr(0xE611) "a" Chr(0xDC00) "b") = "<U+E611>a" Chr(0xDC00) "b")
+Check("UiaShowIcons writes each icon out", UiaShowIcons(Chr(0xE611) "x" Chr(0x10FFFD)) = "<U+E611>x<U+10FFFD>",
+    UiaShowIcons(Chr(0xE611) "x" Chr(0x10FFFD)))
+Check("...and leaves a name without one alone", UiaShowIcons("Plain Zz") = "Plain Zz")
+iconBtn := UiaFind(visHwnd, Chr(0xE611), 2000)
+Check("the icon-named button is findable by its glyph", iconBtn != "")
+Check("UiaName returns the glyph by default (unchanged)", UiaName(iconBtn) = Chr(0xE611))
+Check("UiaName(el, true) says it has no name", UiaName(iconBtn, true) = "")
+Check("UiaDescribe shows the glyph visibly", InStr(UiaDescribe(iconBtn), 'Button "<U+E611>"') = 1, UiaDescribe(iconBtn))
+
+; ---- the dump: subtrees, positions, visible only (2026-10-14) ----------
+Say("about to: UiaDumpTree positions / visibleOnly / icons")
+plainVis := UiaDumpTree(visHwnd, 8, "", 300, &stPlain)
+posVis := UiaDumpTree(visHwnd, 8, "", 300, &stPos, true)
+seenVis := UiaDumpTree(visHwnd, 8, "", 300, &stSeen, false, true)
+Check("an icon name shows as <U+E611> in the dump", InStr(plainVis, 'Button "<U+E611>"') > 0)
+Check("...and nameFilter finds it by that form", InStr(UiaDumpTree(visHwnd, 8, "<U+E611>", 50), 'Button "<U+E611>"') > 0)
+okPos := posVis != ""
+for dl in StrSplit(posVis, "`n")
+    okPos := okPos && RegExMatch(dl, " @(-?\d+,-?\d+ \d+x\d+|none)$")
+Check("positions: every line ends in @x,y wxh (or @none)", okPos, SubStr(posVis, 1, 200))
+Check("...with the clipped button's real rectangle",
+    InStr(posVis, 'Button "Clipped Btn Zz" <id=') && InStr(posVis, "@" rClip.x "," rClip.y " " rClip.w "x" rClip.h))
+Check("positions and visibleOnly don't change the walk: same fingerprint and count",
+    stPos.fingerprint = stPlain.fingerprint && stSeen.fingerprint = stPlain.fingerprint
+    && stPos.visited = stPlain.visited && stSeen.visited = stPlain.visited,
+    stPlain.fingerprint " / " stPos.fingerprint " / " stSeen.fingerprint)
+UiaDumpTree(visHwnd, 8, "", 2, &stCap, true, true)
+Check("...also with the line cap hit (the per-line reads stop there; the walk doesn't)",
+    stCap.linesHit && stCap.fingerprint = stPlain.fingerprint && stCap.visited = stPlain.visited)
+Check("visibleOnly keeps the visible buttons", InStr(seenVis, "Inside Btn Zz") && InStr(seenVis, "Clipped Btn Zz"))
+Check("...and drops the one clipped away by the scroll pane", !InStr(seenVis, "Hidden Btn Zz"))
+Check("...without counting it as a line cap", stSeen.linesHit = false)
+seenMain := UiaDumpTree(hwnd, 8, "Lv Row", 300, , false, true)
+Check("visibleOnly drops list rows past the fold", InStr(seenMain, "Lv Row") && !InStr(seenMain, '"Lv Row 40"'),
+    SubStr(seenMain, 1, 200))
+UiaDumpTree(hwnd, 8, "", 300, &stMainPos, true, true)
+Check("...and leaves the main window's fingerprint as it was", stMainPos.fingerprint = stFull.fingerprint,
+    stMainPos.fingerprint " vs " stFull.fingerprint)
+
+Say("about to: UiaDumpSubtree")
+sub := UiaDumpSubtree(paneEl, 8, "", 300, &stSub, true)
+subLines := StrSplit(sub, "`n")
+Check("a subtree dump starts at its element, at depth 0",
+    subLines.Length && InStr(subLines[1], 'Pane "VKUiaPane_ZZ"') = 1, subLines.Length ? subLines[1] : "(empty)")
+Check("...its children one level in", RegExMatch(sub, 'm)^  Button "Inside Btn Zz"') > 0)
+Check("...and nothing from outside it", !InStr(sub, "Covered Btn Zz") && !InStr(sub, "Visibility fixtures"))
+Check("...walking fewer nodes than the window", stSub.visited > 0 && stSub.visited < stPlain.visited,
+    stSub.visited " vs " stPlain.visited)
+subSeen := UiaDumpSubtree(paneEl, 8, "Btn", 300, , false, true)
+Check("a visible-only subtree dump drops the hidden button too",
+    InStr(subSeen, "Inside Btn Zz") && !InStr(subSeen, "Hidden Btn Zz"), subSeen)
+UiaDumpSubtree(UiaFromWindow(visHwnd), 8, "", 0, &stRootSub)
+Check("a subtree dump from the window root = the window dump's fingerprint", stRootSub.fingerprint = stPlain.fingerprint)
+; The fingerprint hashes the RAW name: a one-node dump of the icon button
+; equals the CRC of its line built with the glyph itself, not <U+E611>.
+UiaDumpSubtree(iconBtn, 0, "", 10, &stIcon)
+rawCrc := Format("{:08x}", UiaCrc32("0`t" UiaControlType(iconBtn) "`t" Chr(0xE611) "`t" UiaAutomationId(iconBtn) "`n"))
+Check("the fingerprint hashes the raw glyph, not its shown form", stIcon.fingerprint = rawCrc,
+    stIcon.fingerprint " vs " rawCrc)
+Check("UiaDumpSubtree of nothing: empty, and why says so",
+    UiaDumpSubtree("", 8, "", 300, &stNoSub) = "" && stNoSub.visited = 0 && InStr(stNoSub.why, "no start element"), stNoSub.why)
+
+; ---- the probe's tree mode (mcp\uia_probe.ahk) --------------------------
+; The MCP's dump_uia_tree calls it with the trailing args in this order:
+; window, max_depth, max_lines, name_filter, root_id, root_name,
+; positions (0|1), visible_only (0|1). Run it as the server does.
+ProbeTree(args) {
+    out := A_Temp "\vk-uia-selftest-probe.txt"
+    try FileDelete(out)
+    Run('"' A_AhkPath '" /ErrorStdOut "' A_ScriptDir '\..\mcp\uia_probe.ahk" "' out '" tree ' args, , "Hide", &ppid)
+    if ProcessWaitClose(ppid, 30) {
+        ProcessClose(ppid)
+        return "(probe timed out)"
+    }
+    txt := ""
+    try txt := FileRead(out, "UTF-8")
+    try FileDelete(out)
+    return txt
+}
+Say("about to: the probe, rooted by name, with positions and visible_only")
+win := '"VKUiaVis_ZZ ahk_pid ' tpid '"'
+rep := ProbeTree(win ' 8 300 "" "" "VKUiaPane_ZZ" 1 1')
+hdr := StrSplit(rep, "`n`n")[1]
+Check("probe: root= names the element the dump starts at", InStr(rep, '`nroot=Pane "VKUiaPane_ZZ"`n'), hdr)
+Check("probe: the outline starts there, with positions",
+    RegExMatch(rep, '\n\nPane "VKUiaPane_ZZ" @-?\d+,-?\d+ \d+x\d+') > 0, SubStr(rep, 1, 400))
+Check("probe: visible_only drops the hidden button", InStr(rep, "Inside Btn Zz") && !InStr(rep, "Hidden Btn Zz"))
+inId := UiaAutomationId(inBtn)
+rep2 := ProbeTree(win ' 8 300 "" "' inId '" "Inside Btn Zz"')
+Check("probe: root_id AND root_name pick the element with both",
+    InStr(rep2, '`nroot=Button "Inside Btn Zz" <id=' inId '>`n'), StrSplit(rep2, "`n`n")[1])
+rep3 := ProbeTree(win ' 8 300 "" "no.such.id.zz"')
+Check("probe: a root that isn't there is an error= answer with the find's reason",
+    InStr(rep3, "error=No element with AutomationId 'no.such.id.zz'") = 1 && InStr(rep3, "no match"), rep3)
+rep4 := ProbeTree(win ' 8 300')
+Check("probe: no root args = today's report (no root= line, the window first)",
+    !InStr(rep4, "root=") && InStr(rep4, '`n`nWindow "VKUiaVis_ZZ"') && InStr(rep4, "Hidden Btn Zz") && !InStr(rep4, " @"),
+    SubStr(rep4, 1, 300))
+
 ; ---- the own-process guards -------------------------------------------
 ; Deliberately LAST. All three entrances must refuse our own process; if a
 ; guard ever regresses, its call does not fail, it HANGS — the runner's
@@ -546,6 +974,37 @@ Check("a point over our own window is refused",
     UiaFromPoint(sx + sw // 2, sy + sh // 2) = "")
 Check("...while a point over the target still answers",
     UiaFromPoint(r.x + r.w // 2, r.y + r.h // 2) != "")
+UiaElementAtPoint(sx + sw // 2, sy + sh // 2, &whyP)
+Check("UiaElementAtPoint's why names the own-process rule", InStr(whyP, "own process") > 0, whyP)
+
+; The click check meets the same rule: OUR window over the target's button
+; is something in the way — reported from WindowFromPoint alone, never by
+; asking UIA about our own window — and nothing is clicked.
+Say("about to: a click on a button OUR OWN window covers (must refuse, no UIA on us)")
+cIn := UiaJitteredCenter(rIn)
+; Raise it until it really IS the window at that point (z-order changes from
+; another process can land late; measured once: a single WinMoveTop + 200 ms
+; was not enough). Only then is the click attempt safe to make.
+covered := false
+Loop 20 {
+    WinMove(rIn.x - 5, rIn.y - 5, rIn.w + 10, rIn.h + 10, "ahk_id " selfGui.Hwnd)
+    WinMoveTop("ahk_id " selfGui.Hwnd)
+    Sleep(100)
+    atHwnd := DllCall("WindowFromPoint", "int64", (cIn.y << 32) | (cIn.x & 0xFFFFFFFF), "ptr")
+    if (covered := DllCall("GetAncestor", "ptr", atHwnd, "uint", 2, "ptr") = selfGui.Hwnd)
+        break
+}
+if covered {
+    inBefore := VisClicks("in")
+    Check("UiaHitTest: our own window is in the way", UiaHitTest(inBtn, cIn.x, cIn.y, &whatS) = 0
+        && InStr(whatS, "this script's own process"), whatS)
+    Check("UiaClickEl refuses, naming it", UiaClickEl(inBtn, 0, "Left", 1, &whyS) = false
+        && InStr(whyS, "in the way") && InStr(whyS, "own process"), whyS)
+    Sleep(400)
+    Check("...and the covered button got no click", VisClicks("in") = inBefore)
+} else {
+    Say("SKIP  couldn't put our own window over the target's button — own-window cover not provable here")
+}
 
 ; Third entrance: focus. With our own window foreground, GetFocusedElement
 ; would call back into this thread — the guard answers "" instead.

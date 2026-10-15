@@ -558,7 +558,98 @@ def _kill_tree(pid: int) -> None:
         pass
 
 
-def validate_ahk(path: str, timeout_s: float | None = None) -> tuple[bool, str]:
+_OWN_WARN_RE = re.compile(r"(?im)^[ \t]*#Warn\b")
+# A load WARNING in AutoHotkey's output (routed to stdout by ValidateWarnings.ahk).
+VALIDATE_WARNING = "==> Warning:"
+
+
+def _validate_warnings_file() -> Path | None:
+    """lib\\ValidateWarnings.ahk ('#Warn VarUnset, StdOut' + '#Warn
+    Unreachable, StdOut' — the two types AutoHotkey has ON by default; not
+    '#Warn All', which would switch LocalSameAsGlobal on and fail scripts that
+    run without a word), passed with /include
+    to every load check: from the install being checked, else from the code
+    this server runs from (a test's sandbox root has no copy). None when
+    neither exists — then the check behaves as it did before the file."""
+    for root in (REPO_ROOT, Path(__file__).resolve().parent.parent):
+        p = root / "lib" / "ValidateWarnings.ahk"
+        if p.is_file():
+            return p
+    return None
+
+
+def _own_warn(path: str) -> bool:
+    """Whether the checked file itself carries a #Warn line — its author chose
+    how warnings show, and that line would override the /include anyway."""
+    try:
+        return bool(_OWN_WARN_RE.search(_read_text_any(Path(path))))
+    except OSError:
+        return False
+
+
+_WARNING_ITEM_RE = re.compile(r"==> Warning: (.*?)\s*\n\s*Specifically:\s*([A-Za-z_]\w*)")
+
+
+def _only_provided_warnings(out: str, provided) -> bool:
+    """True when every warning in `out` is 'never assigned' about a name in
+    `provided` (lower-case names the including script defines)."""
+    items = _WARNING_ITEM_RE.findall(out)
+    return bool(items) and len(items) == out.count(VALIDATE_WARNING) and all(
+        "never be assigned" in what and name.lower() in provided for what, name in items)
+
+
+# One message in AutoHotkey's output starts at a '<file> (N) : ==>' line;
+# its 'Specifically:' (and any source excerpt) follow on the next lines.
+_MSG_HEAD_RE = re.compile(r"^\s*\S.*? \((?:snippet line )?\d+\) : ==>")
+
+
+def _drop_provided_warnings(out: str, provided) -> str:
+    """`out` without the 'never assigned' warnings about names in `provided` —
+    so when a check fails for a REAL reason, the text (and the Hint built on
+    its first 'Specifically:') names that reason, not Notify. Measured shape
+    (2026-10-14, two warnings): 'w.ahk (3) : ==> Warning: This local variable
+    appears to never be assigned a value.\\n     Specifically: Notify\\n' then
+    the same two lines for the next one."""
+    blocks: list[list[str]] = []
+    for line in out.splitlines():
+        if _MSG_HEAD_RE.match(line) or not blocks:
+            blocks.append([line])
+        else:
+            blocks[-1].append(line)
+    kept = []
+    for b in blocks:
+        m = _WARNING_ITEM_RE.search("\n".join(b))
+        if m and "never be assigned" in m.group(1) and m.group(2).lower() in provided:
+            continue
+        kept.append("\n".join(b))
+    return "\n".join(kept)
+
+
+def _master_provided(exclude: Path | None = None) -> frozenset:
+    """Every function/class name VoiceKit.ahk's include chain defines — what
+    an in-process module (isolate=False) can call without defining it. Such
+    a module is load-checked ON ITS OWN, where a call to Notify reads as a
+    never-assigned variable (measured 2026-10-14 on a real one:
+    'FaceCam.ahk (39) : ==> Warning: This local variable appears to never be
+    assigned a value. Specifically: Notify'); the master reload that follows
+    checks it in context, and _undo_if_parked rolls it back if it doesn't fit.
+
+    `exclude` is the module being written: the chain includes it AS IT IS ON
+    DISK, so without this an edit that renames a function the module still
+    calls would pass on the stale definition and only fail at the reload
+    (park, roll back, reload again) instead of being refused here."""
+    try:
+        chain = ahk_defs_in_chain(_master_path())
+    except OSError:
+        return frozenset()
+    # Cheap per call: each file's parse is cached by mtime (_ahk_file_defs).
+    skip = _path_key(exclude) if exclude is not None else None
+    return frozenset(lk for lk, defs in chain.items()
+                     if skip is None or any(_path_key(f) != skip for _n, _k, f, _l in defs))
+
+
+def validate_ahk(path: str, timeout_s: float | None = None,
+                 provided: frozenset | None = None) -> tuple[bool, str]:
     """Load-check a script with AutoHotkey /validate. Returns (ok, error_text).
 
     Never raises for a slow check: past the timeout the process tree is
@@ -566,11 +657,36 @@ def validate_ahk(path: str, timeout_s: float | None = None) -> tuple[bool, str]:
     every write-then-validate caller still reaches its rollback. The error
     text is read as UTF-8 (as run_ahk_snippet reads it) — the ANSI default
     turned the quoted source line's non-Latin characters into '?'. Mirrors
-    lib\\_Common.ahk AhkValidate."""
+    lib\\_Common.ahk AhkValidate — except `provided` below, which only this
+    side has (the AHK writers check in-process modules without it).
+
+    Warnings (2026-10-14, the Karbon File feedback item 4b): AutoHotkey v2
+    warns at load BY DEFAULT ('This global variable appears to never be
+    assigned a value' — what a half-finished multi-step edit looks like) and
+    shows it as a dialog even under /validate, so such a check hung its full
+    20 s and then blamed '#Warn'. lib\\ValidateWarnings.ahk (the default-on
+    warning types, to StdOut) is passed with /include unless the file has its
+    own #Warn line:
+    measured, the warning then comes back on STDOUT with exit code 0 in
+    ~0.06 s ('<file> (N) : ==> Warning: ...'), while a load error still exits
+    2 with its text on stderr. Any warning fails the check, with its text —
+    the same shape as a load error, so _error_module parks the module it
+    names. A file with its own #Warn keeps the old behaviour (its directive
+    wins over the /include either way — measured by the lead).
+
+    `provided` (in-process module checks only — _master_provided) lets a
+    'never assigned' warning about a name the including master defines
+    pass: the file is checked alone, but runs inside VoiceKit.ahk. When the
+    check fails anyway, those warnings are left out of the text, so it names
+    only what is really wrong."""
     timeout_s = VALIDATE_TIMEOUT_S if timeout_s is None else timeout_s
+    inc = _validate_warnings_file()
+    args = [AHK_EXE, "/ErrorStdOut=UTF-8"]
+    if inc is not None and not _own_warn(path):
+        args += ["/include", str(inc)]
     try:
         proc = subprocess.Popen(
-            [AHK_EXE, "/ErrorStdOut=UTF-8", "/validate", path],
+            args + ["/validate", path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             encoding="utf-8", errors="replace")
     except OSError as e:
@@ -591,7 +707,18 @@ def validate_ahk(path: str, timeout_s: float | None = None) -> tuple[bool, str]:
                        f"was stopped. Something in it is waiting on a dialog nobody can see — "
                        f"almost always a #Warn warning, which pops a message box even during a "
                        f"load check. Remove #Warn (or fix what it warns about) and try again.")
-    return proc.returncode == 0, (out or err or "").strip()
+    out, err = (out or "").strip(), (err or "").strip()
+    if provided and VALIDATE_WARNING in out:
+        if proc.returncode == 0 and _only_provided_warnings(out, provided):
+            return True, out
+        out = _drop_provided_warnings(out, provided).strip()
+    if proc.returncode != 0:
+        # The load error first: _error_module and _failing_line read the
+        # FIRST 'file (N)' in the text.
+        return False, "\n".join(t for t in (err, out) if t)
+    if VALIDATE_WARNING in out:
+        return False, out
+    return True, out or err
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +753,7 @@ class _FileSnapshot:
 
 
 def _write_validated(writes: list, check: list, fail_msg: str,
-                     also: tuple = ()) -> _FileSnapshot:
+                     also: tuple = (), provided: frozenset | None = None) -> _FileSnapshot:
     """Write each (path, text) in `writes` (BOM + LF, _write_new), then
     load-check every entry of `check` — a path, or (path, its own failure
     message). On a failed check — or ANY exception, a timeout or missing
@@ -642,7 +769,7 @@ def _write_validated(writes: list, check: list, fail_msg: str,
             _write_new(p, text)
         for c in check:
             p, msg = c if isinstance(c, tuple) else (c, fail_msg)
-            ok, err = validate_ahk(str(p))
+            ok, err = validate_ahk(str(p), provided=provided)
             if not ok:
                 # Explained HERE, while the failing file is still on disk
                 # (the restore below may remove it).
@@ -657,6 +784,131 @@ def _replace_validated(path: Path, text: str, fail_msg: str) -> bytes | None:
     """One file: write, load-check, byte-exact restore on failure. Returns
     the previous bytes (None when the file is new)."""
     return _write_validated([(path, text)], [path], fail_msg).prev(path)
+
+
+# The suffix of the copy a live edit is load-checked as. NOT .ahk: no scanner
+# (hotkeys\*.ahk, macros\*.ahk, bodies\*.body.ahk, the home window's Loop
+# Files) can ever pick it up, and AutoHotkey /validate takes a script path
+# with any extension (measured 2026-10-14: 'Foo.ahk.vkcheck.tmp' loads, its
+# %A_ScriptDir% includes resolve beside it, and errors name it with the same
+# line numbers as the real file would get).
+_CHECK_SUFFIX = ".vkcheck.tmp"
+_SWAP_RETRY_S = 2.0
+
+
+def _check_copy(target: Path) -> Path:
+    """A unique sibling of `target` to load-check before it moves into place —
+    same folder, so relative and %A_ScriptDir% includes resolve identically."""
+    return target.with_name(f"{target.name}.{os.getpid()}-{secrets.token_hex(3)}{_CHECK_SUFFIX}")
+
+
+def _swap_validated(target: Path, text: str, fail_msg: str,
+                    provided: frozenset | None = None, against: str | None = None,
+                    read_tool: str = "") -> _FileSnapshot:
+    """The live-edit write (Karbon File feedback item 6): never let a press
+    load a half-written or not-yet-checked file. _write_validated writes the
+    TARGET first and load-checks it in place (up to VALIDATE_TIMEOUT_S), so a
+    hotkey pressed in that window ran the broken file — a user got 'local
+    variable not assigned' that way between two splices. Here the new text
+    goes to a non-.ahk sibling (_check_copy), that copy is load-checked, and
+    only a copy that passed is moved over the target with os.replace (one
+    rename: a reader sees the old file or the new one, never a mix). The
+    copy is always removed. Error text names the REAL file, not the copy.
+
+    `against` is the text the change was computed from (what the caller read
+    and checked expected_sha256 on). The target is read again AFTER the load
+    check, right before the rename, and the write is refused if it changed in
+    between — two sessions are two server processes, so nothing else
+    serializes them, and the check can take seconds (item 5).
+
+    Returns the same snapshot _write_validated does (the target's previous
+    bytes — taken at that final read), so banking and _undo_if_parked work
+    exactly as before. A load check that raises (timeout handling aside, a
+    missing AutoHotkey) leaves the target untouched and re-raises."""
+    return _swap_validated_all([(target, text, fail_msg)], provided=provided,
+                               against=against, read_tool=read_tool)
+
+
+def _replace_retrying(tmp: Path, target: Path) -> None:
+    """os.replace(tmp, target), retried briefly while something holds the
+    target without delete-sharing (an editor, an AV scan)."""
+    deadline = time.monotonic() + _SWAP_RETRY_S
+    while True:
+        try:
+            os.replace(tmp, target)
+            return
+        except PermissionError as e:
+            if time.monotonic() >= deadline:
+                raise VoiceKitError(
+                    f"The change loads, but {target.name} couldn't be replaced "
+                    f"(another program has it open: {e.strerror or e}), so nothing "
+                    f"changed. Close it and try again.") from None
+            time.sleep(0.1)
+
+
+def _swap_validated_all(items: list, provided: frozenset | None = None, also: tuple = (),
+                        against: str | None = None, read_tool: str = "") -> _FileSnapshot:
+    """_swap_validated for several files written together (a create replace:
+    launcher + body, steps file + stub). `items` is [(target, text,
+    fail_msg)] — fail_msg None for a file that isn't AutoHotkey (not checked,
+    still moved into place the same way). Every copy is written and every
+    check passes BEFORE the first rename; the renames then run in order, and
+    if one fails the files already moved get their previous bytes back.
+    `also` names extra files to snapshot (ones the caller may delete next);
+    `against` applies to the first item."""
+    copies: list[Path] = []
+    try:
+        for target, text, _msg in items:
+            copies.append(_check_copy(target))
+            _write_new(copies[-1], text)
+        for (target, _text, msg), tmp in zip(items, copies):
+            if msg is None:
+                continue
+            ok, err = validate_ahk(str(tmp), provided=provided)
+            if not ok:
+                # Explained while the copy is on disk (the hint reads the
+                # failing line from the file the error names), then renamed back.
+                raise VoiceKitError(_unswap_paths(
+                    f"{msg}\n{_explain_ahk_error(err, script=tmp)}", tmp, target))
+        snap = _FileSnapshot(*[t for t, _x, _m in items], *also)
+        if against is not None:
+            target = items[0][0]
+            now = snap.prev(target)
+            if now is None or _text_sha256(_decode_any(now)) != _text_sha256(against):
+                raise VoiceKitError(
+                    f"Refused: {target.name} changed while this change was being load-checked "
+                    f"— someone else edited it. Nothing was changed. Read it again"
+                    f"{f' ({read_tool})' if read_tool else ''}, then redo your change against "
+                    f"what's there now.")
+        done: list[Path] = []
+        try:
+            for (target, _t, _m), tmp in zip(items, copies):
+                _replace_retrying(tmp, target)
+                done.append(target)
+        except BaseException:
+            for p in done:
+                raw = snap.prev(p)
+                try:
+                    if raw is None:
+                        p.unlink(missing_ok=True)
+                    else:
+                        p.write_bytes(raw)
+                except OSError:
+                    pass
+            raise
+        return snap
+    finally:
+        for tmp in copies:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _unswap_paths(text: str, tmp: Path, target: Path) -> str:
+    """Error text about the check copy, made to name the real file — the
+    full path and the bare file name (AutoHotkey prints either)."""
+    return text.replace(str(tmp), str(target)).replace(tmp.name, target.name)
 
 
 
@@ -935,7 +1187,11 @@ _QUOTE_HINT = ('Hint: AutoHotkey v2 escapes a double quote inside "..." as `" '
                '(backtick-quote), not "" as v1 did: "say `"hi`"". Or put the string '
                'in single quotes: \'say "hi"\'.')
 _DOUBLED_QUOTE_RE = re.compile(r'\w""|""\w|"""')
-_LOAD_ERR_LINE_RE = re.compile(r"(?m)^\s*(\S.*?\.ahk) \((snippet line )?(\d+)\) : ==>")
+# The file may be a live edit's check copy ('Foo.ahk.<pid>-<hex>.vkcheck.tmp',
+# _check_copy): its errors are explained while it is still on disk, and the
+# hints read the failing line from it — the real file still holds the OLD text.
+_LOAD_ERR_LINE_RE = re.compile(
+    r"(?m)^\s*(\S.*?\.ahk(?:\.\d+-[0-9a-f]+\.vkcheck\.tmp)?) \((snippet line )?(\d+)\) : ==>")
 _RUNTIME_LINE_RE = re.compile(r"UNCAUGHT \w+: (.*?) — snippet line (\d+)")
 
 
@@ -1045,6 +1301,40 @@ def _explain_ahk_error(text: str, code: str | None = None, script: Path | str | 
         if _DOUBLED_QUOTE_RE.search(_failing_line(text, code)) or \
                 (spec and '"""' in spec.group(1)):
             hints.append(_QUOTE_HINT)
+
+    # (4) What a half-finished multi-step edit looks like (Karbon File
+    # feedback item 4): a call added before the function it calls exists.
+    # Measured 2026-10-14: the missing function reads as a variable nobody
+    # assigns ('==> Warning: This local/global variable appears to never be
+    # assigned a value. Specifically: Later'), a changed signature as
+    # 'Too many parameters passed to function.'
+    w = re.search(r"==> Warning: This (?:local |global )?variable appears to never be "
+                  r"assigned a value\.\s*Specifically:\s*([A-Za-z_]\w*)", text)
+    if w:
+        hints.append(
+            f"Hint: nothing defines or assigns '{w.group(1)}' — usually a call to a function "
+            f"that doesn't exist (yet), or a misspelled variable. If you are in the middle of "
+            f"a change that adds the function in a later step, send every splice in ONE "
+            f"call: edit_hotkey_module / edit_macro take edits=[{{old_string, new_string}}, "
+            f"...], applied together with one load check.")
+    elif re.search(r"==> Too (?:many|few) parameters passed to function", text):
+        hints.append(
+            "Hint: the call doesn't match the function's parameter list. If this change "
+            "also updates that function, send both splices in ONE call (edits=[...] on "
+            "edit_hotkey_module / edit_macro) — each step alone may not load.")
+
+    # (5) A string/number assigned to `base` — loads clean, fails at run time
+    # (measured: TypeError 'Expected an Object but got a String.', ValueError
+    # 'Invalid base.' for an object literal). _lint_saved_code refuses it in
+    # saved code; a snippet only finds out here.
+    if rt and BASE_RUNTIME_RE.search(rt.group(1)):
+        n = int(rt.group(2))
+        lines = code.splitlines()
+        line = lines[n - 1] if 0 < n <= len(lines) else ""
+        if _base_assignments(line) or re.search(r"(?i)\.base\b|[{,]\s*base\s*:", line):
+            hints.append(
+                "Hint: 'base' is every object's prototype in AutoHotkey v2, not a property "
+                "you can name — it only accepts an object. Rename the field (e.g. baseName).")
     if not hints:
         return text
     return text.rstrip() + "\n" + "\n".join(hints)
@@ -1800,6 +2090,10 @@ NORMALIZE_EXEMPT = {
     "read_reference": ("code",),
     # Its undo path: the old prompt, to hand back to update_ai_prompt.
     "update_ai_prompt": ("previous_prompt",),
+    # A batch edit's undo: the caller's own splices, reversed, to send back
+    # verbatim (a masked path in them would be refused by _no_tokens).
+    "edit_hotkey_module": ("undo_edits",),
+    "edit_macro": ("undo_edits",),
 }
 
 # Tool results whose listed top-level fields each hold exactly ONE path:
@@ -1808,6 +2102,7 @@ NORMALIZE_EXEMPT = {
 # ('Smith jr' beside 'Smith') is masked whole, never cut at the sibling.
 PATH_FIELDS = {
     "check_path": ("path", "deepest_existing", "missing_path"),
+    "ensure_python_env": ("python", "folder"),
 }
 
 # Tool results whose (field, path_field) pairs hold a path's LAST segment:
@@ -2338,8 +2633,8 @@ def _instructions_text(solo: list[str], families: list[str]) -> str:
         "doubled \"\" does not load. Or use single quotes: 'say \"hi\"'.",
         "",
         "Changing an automation: read it first (read_macro_source, read_hotkey_module, "
-        "read_workflow, read_ai_prompt), then edit_macro / edit_hotkey_module (one exact "
-        "splice) or update_macro / update_hotkey_module / update_ai_prompt (the whole file). "
+        "read_workflow, read_ai_prompt), then edit_macro / edit_hotkey_module (exact "
+        "splices) or update_macro / update_hotkey_module / update_ai_prompt (the whole file). "
         "create_workflow replaces a same-named workflow. Never delete-and-recreate: a hotkey "
         "module's key pairing is made by hand.",
         "",
@@ -2866,6 +3161,7 @@ def create_launch_macro(name: str, ahk_body: str | None = None,
     _no_tokens(ahk_body, "ahk_body")
     if ahk_body and opens:
         raise VoiceKitError("Give either 'opens' or 'ahk_body', not both.")
+    _lint_saved_code(ahk_body, "ahk_body")
     if opens is not None:
         # '%USERPROFILE%\...' (the form responses show) means the real path.
         opens = expand_user_paths(opens.strip())
@@ -2890,6 +3186,8 @@ def create_launch_macro(name: str, ahk_body: str | None = None,
     log(f"launch | {disp} | macros\\{base}.ahk" + (f" | opens {opens}" if opens else ""))
     return {"type": "launch_macro", "phrase": disp, "file": str(macro),
             "shortcut": str(link), "voice_phrase": f"open {disp}",
+            # read_macro_source's hash of this file — expected_sha256 for a first edit.
+            "source_sha256": _text_sha256(content),
             "note": f'{NO_RELOAD_NOTE} Say "open {disp}".'}
 
 
@@ -2911,13 +3209,14 @@ def create_ai_action(name: str, prompt: str) -> dict:
     disp = space_out(base)
     link = _require_free_lnk(disp)
     prompt_file = _prompt_file(base)
-    _write_validated([(prompt_file, prompt + "\n"), (macro, _ai_action_content(phrase, base))],
+    content = _ai_action_content(phrase, base)
+    _write_validated([(prompt_file, prompt + "\n"), (macro, content)],
                      [macro], "The generated AI action failed to load, so nothing was kept:")
     make_shortcut(str(link), str(macro))
     log(f"ai-action | {disp} | macros\\{base}.ahk")
     return {"type": "ai_action", "phrase": disp, "file": str(macro),
             "prompt_file": str(prompt_file), "shortcut": str(link),
-            "voice_phrase": f"open {disp}",
+            "voice_phrase": f"open {disp}", "source_sha256": _text_sha256(content),
             "note": NO_RELOAD_NOTE + " Runs on the user's selected text; needs their "
                     "OpenRouter key (home window -> AI Settings) the first time."}
 
@@ -3029,13 +3328,16 @@ def _module_backup_file(base: str) -> Path:
 
 def _bank_previous(kind: str, base: str, raw: bytes, prefix: str) -> dict:
     """Bank `raw` as <base>'s previous version; returns the response fields
-    (<prefix>_sha256 / _length / _first_lines / _backup). The hash and length
+    (<prefix>_sha256 / _length / _first_lines / _backup). The hash is
+    _text_sha256 (so it equals the body_sha256 / source_sha256 that was read
+    for that content, CRLF or not); the hash and length
     describe the decoded text — what read_*(previous=True) gives back."""
     backup = _backup_file(kind, base)
     backup.parent.mkdir(parents=True, exist_ok=True)
     backup.write_bytes(raw)
     text = _decode_any(raw)
-    return {f"{prefix}_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    # _text_sha256: the same hash read_*/edit/update report for this content.
+    return {f"{prefix}_sha256": _text_sha256(text),
             f"{prefix}_length": len(text),
             f"{prefix}_first_lines": text.splitlines()[:3],
             f"{prefix}_backup": str(backup)}
@@ -3159,15 +3461,18 @@ def read_hotkey_module(name: str, previous: bool = False) -> dict:
     body_file = REPO_ROOT / _body_rel(base)
     isolated = body_file.exists()
     src = body_file if isolated else module
+    body = _read_text_any(src)
     return {
         "type": "hotkey_module", "phrase": phrase, "base": base,
         "isolated": isolated, "file": str(src),
         "bridge_key": (lambda k: f"Ctrl+Alt+Shift+{k}" if k else "")(_module_bridge_key(base)),
-        "body": _read_text_any(src),
+        "body": body,
+        # Pass back as expected_sha256 to edit/update: refused if it changed since.
+        "body_sha256": _text_sha256(body),
         "note": ("This is the body that runs in its own process; hotkeys\\"
                  f"{base}.ahk is just the key binding. Change it with "
-                 "edit_hotkey_module (one splice) or update_hotkey_module (the whole "
-                 "file, verbatim)." if isolated else
+                 "edit_hotkey_module (splices, several in one call) or "
+                 "update_hotkey_module (the whole file, verbatim)." if isolated else
                  "This module runs in VoiceKit's own process (isolate=False). Change "
                  "it with edit_hotkey_module or update_hotkey_module."),
     }
@@ -3190,6 +3495,7 @@ def create_hotkey_module(name: str, ahk_body: str | None = None,
     `key` asks for a specific one instead of taking whatever comes next off
     the pool; it must be free, and it is only honoured when creating."""
     _no_tokens(ahk_body, "ahk_body")
+    _lint_saved_code(ahk_body, "ahk_body")
     phrase, base = _require_name(name)
     if base.lower() in RESERVED_MODULE_BASES:
         raise VoiceKitError(
@@ -3232,27 +3538,29 @@ def create_hotkey_module(name: str, ahk_body: str | None = None,
 
     rel = f"hotkeys\\{base}.ahk"
     was_parked = _was_parked(rel)
-    # Written, load-checked, and on any failure put back to the exact previous
-    # bytes (or removed, if new). The launcher is what the MASTER loads, so its
-    # check protects every hotkey. The body runs in its own process, where a
-    # mistake costs that process and nothing else — its check is there to TELL
-    # the caller now, instead of a load-error dialog on the first key press in
-    # a process nobody is watching (and before _Common's error logging exists).
+    # Load-checked as copies and only then moved into place (_swap_validated_all
+    # — a REPLACE rewrites a module that is live and may be pressed during the
+    # check; Karbon File feedback item 6), so a failure changes nothing. The
+    # launcher is what the MASTER loads, so its check protects every hotkey.
+    # The body runs in its own process, where a mistake costs that process and
+    # nothing else — its check is there to TELL the caller now, instead of a
+    # load-error dialog on the first key press in a process nobody is watching
+    # (and before _Common's error logging exists).
     if isolate:
         body_file.parent.mkdir(parents=True, exist_ok=True)
-        snap = _write_validated(
-            [(module, _hotkey_launcher_content(phrase, base, key)),
-             (body_file, _hotkey_body_content(phrase, base, key, ahk_body))],
-            [module, (body_file, "The steps failed to load, so nothing was changed "
-                                 "(they run in their own process, so this could never "
-                                 "have hurt VoiceKit — this check just tells you now "
-                                 "rather than on the first key press):")],
-            "The generated module failed to load, so nothing was changed:")
+        written = _hotkey_body_content(phrase, base, key, ahk_body)
+        snap = _swap_validated_all(
+            [(module, _hotkey_launcher_content(phrase, base, key),
+              "The generated module failed to load, so nothing was changed:"),
+             (body_file, written,
+              "The steps failed to load, so nothing was changed (they run in their own "
+              "process, so this could never have hurt VoiceKit — this check just tells "
+              "you now rather than on the first key press):")])
     else:
-        snap = _write_validated(
-            [(module, _hotkey_content(phrase, key, ahk_body))], [module],
-            "The generated module failed to load, so nothing was changed:",
-            also=(body_file,))
+        written = _hotkey_content(phrase, key, ahk_body)
+        snap = _swap_validated_all(
+            [(module, written, "The generated module failed to load, so nothing was changed:")],
+            also=(body_file,), provided=_master_provided(exclude=module))
         # An isolate=False rewrite of a previously isolated module orphans its body.
         if body_file.exists():
             body_file.unlink()
@@ -3289,7 +3597,11 @@ def create_hotkey_module(name: str, ahk_body: str | None = None,
             'Say: "show voice shortcuts"',
             "Create a new shortcut -> When I say: " + phrase,
             f"Action: Press keys -> Ctrl + Alt + Shift + {key}",
+            VOICE_PHRASE_LATER,
         ]),
+        # What read_hotkey_module would report — pass it as expected_sha256
+        # on the first edit, no read needed.
+        "body_sha256": _text_sha256(written),
         "note": note,
     }
     if replacing:
@@ -3303,6 +3615,193 @@ def create_hotkey_module(name: str, ahk_body: str | None = None,
                         f"process, so a crash there can't take VoiceKit down; "
                         f"{module.name} is just the key binding.")
     return out
+
+
+# create_hotkey_module's reply: how to change the SPOKEN phrase later without
+# touching the key (Karbon File feedback: 'Karbon' kept being heard as 'Carbon').
+VOICE_PHRASE_LATER = (
+    "Later, to change what you say (e.g. 'Karbon' keeps being heard as 'Carbon'): say "
+    "\"show voice shortcuts\" and edit this shortcut's phrase, or add a second shortcut "
+    "with another phrase that presses the same keys. The pairing lives in Voice Access, "
+    "so VoiceKit's key and module stay as they are.")
+
+
+# ---------------------------------------------------------------------------
+# A static check for code the MCP SAVES (Karbon File feedback item 11): an
+# assignment of a string or number to `base`. base is every object's
+# PROTOTYPE, not a free property, and it loads clean — measured 2026-10-14,
+# AutoHotkey 2.0 run time: `o.base := "text"` throws TypeError "Expected an
+# Object but got a String." (an Integer / an empty string likewise), and an
+# object literal `{kind: "x", base: "y"}` throws ValueError "Invalid base.".
+# `o.base := someObject` is legal (that is what base is for) and never
+# flagged; Map keys (`m["base"]`) are unaffected.
+# ---------------------------------------------------------------------------
+_STR_LIT_RE = re.compile(r'"(?:`.|[^"`])*"|\'(?:`.|[^\'`])*\'')
+_BASE_DOT_RE = re.compile(r"(?i)\.base\s*:=\s*(?:[\"']|[-+]?\.?\d)")
+_BASE_LIT_RE = re.compile(r"(?i)(?:^|[{,])\s*base\s*:(?![=:])\s*(?:[\"']|[-+]?\.?\d)")
+BASE_RUNTIME_RE = re.compile(r"Expected an Object but got (?:a String|an Integer|a Float|"
+                             r"an empty string)|Invalid base\.")
+
+
+def _code_lines(code: str):
+    """(line number, code part) of every line outside a comment, with string
+    literals emptied — what a static check should look at. A continuation
+    section ('(' [options] alone on a line, through the line starting ')') is
+    skipped whole: in a body it is almost always TEXT — a JS or JSON snippet
+    for a browser, HTML — where 'base: "x"' is data, not AutoHotkey."""
+    in_block = in_cont = False
+    for n, line in enumerate((code or "").replace("\r\n", "\n").split("\n"), 1):
+        s = line.strip()
+        if in_cont:
+            if s.startswith(")"):
+                in_cont = False
+            continue
+        if in_block:
+            if s.startswith("*/") or s.endswith("*/"):
+                in_block = False
+            continue
+        if s.startswith("(") and ")" not in s:
+            in_cont = True
+            continue
+        if s.startswith("/*"):
+            in_block = not s.endswith("*/") or len(s) < 4
+            continue
+        if not s or s.startswith(";"):
+            continue
+        bare = _STR_LIT_RE.sub('""', line)
+        bare = re.split(r"(?:^|\s);", bare, maxsplit=1)[0]
+        yield n, bare
+
+
+def _base_assignments(code: str) -> list[tuple[int, str]]:
+    """(line number, the line) of each string/number assigned to `base`."""
+    lines = (code or "").replace("\r\n", "\n").split("\n")
+    return [(n, lines[n - 1].strip()) for n, bare in _code_lines(code)
+            if _BASE_DOT_RE.search(bare) or _BASE_LIT_RE.search(bare)]
+
+
+def _lint_saved_code(code: str | None, what: str, before: str | None = None) -> None:
+    """Refuse code that assigns a string/number to `base` (see above). With
+    `before` (the file as it was), only lines it did not already have count —
+    an edit is never blocked by a line it didn't write."""
+    hits = _base_assignments(code or "")
+    if before is not None and hits:
+        old = [ln for _n, ln in _base_assignments(before)]
+        fresh = []
+        for n, ln in hits:
+            if ln in old:
+                old.remove(ln)
+            else:
+                fresh.append((n, ln))
+        hits = fresh
+    if not hits:
+        return
+    n, ln = hits[0]
+    more = f" (and {len(hits) - 1} more line{'s' if len(hits) > 2 else ''})" if len(hits) > 1 else ""
+    raise VoiceKitError(
+        f"Refused before saving: line {n} of {what} assigns a value to 'base'{more}: {ln}\n"
+        f"In AutoHotkey v2, base is every object's prototype, not a property you can "
+        f"name — it only accepts an object. This loads fine and then fails when it runs "
+        f"(\"Expected an Object but got a String.\", or \"Invalid base.\" in an object "
+        f"literal). Rename the field (e.g. baseName, module). Nothing was changed.")
+
+
+def _text_sha256(text: str) -> str:
+    """THE content hash of an editable file, as every read/edit/update tool
+    reports it (body_sha256 / source_sha256) and expected_sha256 is checked
+    against: the decoded text (BOM dropped), CRLF -> LF, UTF-8 — the exact
+    text edits match against, so a file re-saved as CRLF by Notepad keeps
+    its hash."""
+    return hashlib.sha256(text.replace("\r\n", "\n").encode("utf-8")).hexdigest()
+
+
+def _check_expected_sha(expected: str | None, current: str, file: Path, read_tool: str) -> None:
+    """Optional optimistic concurrency (Karbon File feedback item 5): when the
+    caller passes the hash it last saw, refuse if the file has changed since
+    — another session (or the user) edited it in between."""
+    if expected is None or not str(expected).strip():
+        return
+    want = str(expected).strip().lower()
+    have = _text_sha256(current)
+    if want != have:
+        raise VoiceKitError(
+            f"Refused: {file.name} changed since you read it (expected_sha256 "
+            f"{want[:12]}…, it is now {have[:12]}…) — someone else edited it. Nothing was "
+            f"changed. Read it again ({read_tool}), then redo your change against what's "
+            f"there now.")
+
+
+def _edit_list(old_string, new_string, edits) -> list[tuple[str, str]]:
+    """The splices an edit call asked for, as [(old, new)], LF-normalized:
+    either the single old_string/new_string pair or `edits` (a list of
+    {old_string, new_string}), never both."""
+    single = old_string is not None or new_string is not None
+    if edits is not None and single:
+        raise VoiceKitError("Pass either old_string + new_string (one edit) or edits=[...] "
+                            "(several, applied in order) — not both.")
+    if edits is None:
+        if old_string is None or new_string is None:
+            raise VoiceKitError("Pass old_string and new_string, or edits=[{old_string, "
+                                "new_string}, ...].")
+        pairs = [(old_string, new_string)]
+    else:
+        if not isinstance(edits, (list, tuple)) or not edits:
+            raise VoiceKitError("edits must be a non-empty list of {old_string, new_string}.")
+        pairs = []
+        for i, e in enumerate(edits, 1):
+            if hasattr(e, "model_dump"):
+                e = e.model_dump()
+            o = e.get("old_string") if isinstance(e, dict) else None
+            nw = e.get("new_string") if isinstance(e, dict) else None
+            if not isinstance(o, str) or not isinstance(nw, str):
+                raise VoiceKitError(f"Edit {i} of {len(edits)}: needs old_string and "
+                                    f"new_string, both text.")
+            pairs.append((o, nw))
+    return [(o.replace("\r\n", "\n"), nw.replace("\r\n", "\n")) for o, nw in pairs]
+
+
+def _splice_all(src: str, pairs: list[tuple[str, str]], read_hint: str) -> str:
+    """Apply every splice in order to an in-memory copy — each one must match
+    exactly once in the text as the earlier ones left it (Karbon File
+    feedback item 4a: a change to a function and its callers is ONE call, one
+    load check and one write, so no half-finished state ever exists on disk
+    for a check to fail on or a press to run)."""
+    out = src
+    for i, (o, nw) in enumerate(pairs, 1):
+        try:
+            out = _splice_once(out, o, nw, read_hint)
+        except VoiceKitError as e:
+            if len(pairs) == 1:
+                raise
+            after = (f" (checked against the code as edits 1-{i - 1} left it)" if i > 2 else
+                     " (checked against the code as edit 1 left it)" if i == 2 else "")
+            raise VoiceKitError(f"Edit {i} of {len(pairs)}{after}: {e} Nothing was "
+                                f"changed.") from None
+    return out
+
+
+def _undo_for(src: str, edited: str, pairs: list[tuple[str, str]], tool: str) -> dict:
+    """The undo a reply can honestly promise. The inverse of a batch is the
+    reversed list with the strings swapped — but only when each swapped
+    splice would itself match exactly once (a new_string that is empty, or
+    that already occurred elsewhere, can't be found again uniquely). So the
+    inverse is replayed in memory, and offered only if it gives back the
+    exact original."""
+    inverse = [(nw, o) for o, nw in reversed(pairs)]
+    try:
+        ok = _splice_all(edited, inverse, "") == src
+    except VoiceKitError:
+        ok = False
+    if not ok:
+        return {"undo": (f"No exact inverse: swapping the strings back wouldn't match "
+                         f"exactly once (an empty new_string, or one that also appears "
+                         f"elsewhere). To undo, {tool} again with old_string/new_string "
+                         f"that include more surrounding context.")}
+    if len(pairs) == 1:
+        return {"undo": f"Call {tool} again with old_string and new_string swapped."}
+    return {"undo": f"Call {tool} again with edits=undo_edits (this batch reversed, "
+                    f"each pair swapped).",
+            "undo_edits": [{"old_string": o, "new_string": nw} for o, nw in inverse]}
 
 
 def _splice_once(src: str, old_string: str, new_string: str, read_hint: str) -> str:
@@ -3328,9 +3827,18 @@ def _splice_once(src: str, old_string: str, new_string: str, read_hint: str) -> 
 
 
 @_serialized
-def edit_hotkey_module(name: str, old_string: str, new_string: str) -> dict:
+def edit_hotkey_module(name: str, old_string: str | None = None, new_string: str | None = None,
+                       *, edits: list | None = None, expected_sha256: str | None = None) -> dict:
     """Exact-match splice into a hotkey module's code — file-Edit-tool
     semantics: old_string must appear in the current code exactly once.
+
+    edits=[{old_string, new_string}, ...] applies several splices in order
+    to an in-memory copy (each exact-once at its turn), then ONE load check
+    and ONE write (Karbon File feedback item 4a). expected_sha256 (the
+    body_sha256 read_hotkey_module or the last edit returned) refuses the
+    edit if someone else changed the file since (item 5). The write itself
+    goes through _swap_validated: a press during the load check runs the
+    old file, never the unchecked one (item 6).
 
     This is the cheap iteration path item 2 of the scrape feedback left
     open: most fixes change one function, and a full create_hotkey_module
@@ -3340,13 +3848,16 @@ def edit_hotkey_module(name: str, old_string: str, new_string: str) -> dict:
     with NO master reload. An in-process module (isolate=False) is edited in
     its module file and the master reloaded.
 
-    The edited file must still load: it is /validate'd and put back to its
-    exact previous bytes on failure, so a typo'd splice can never brick the
-    module (or, for an in-process one, the master). An unwanted edit is
-    undone by calling again with the two strings swapped — a splice is its
-    own inverse, which is why there is no backup file here like the replace
-    path keeps."""
-    _no_tokens(new_string, "new_string")
+    The edited file must still load: a copy is /validate'd before it replaces
+    the file, so a typo'd splice can never brick the module (or, for an
+    in-process one, the master). An unwanted edit is undone by calling again
+    with the two strings swapped (a batch: `undo_edits`, the list reversed
+    and swapped) — which is why there is no backup file here like the
+    replace path keeps; the reply only offers that inverse after replaying
+    it in memory (_undo_for)."""
+    pairs = _edit_list(old_string, new_string, edits)
+    for i, (_o, nw) in enumerate(pairs, 1):
+        _no_tokens(nw, "new_string" if len(pairs) == 1 else f"edits[{i}].new_string")
     phrase, base, module = _require_module(name, "edited")
     body_file = REPO_ROOT / _body_rel(base)
     isolated = body_file.exists()
@@ -3355,20 +3866,23 @@ def edit_hotkey_module(name: str, old_string: str, new_string: str) -> dict:
     # user touched in Notepad is CRLF, and an agent's old_string (written with
     # plain \n) would then never match. AHK reads either; LF is canonical.
     src = _read_text_any(target).replace("\r\n", "\n")
-    old_string = old_string.replace("\r\n", "\n")
-    new_string = new_string.replace("\r\n", "\n")
-    edited = _splice_once(src, old_string, new_string, "read_hotkey_module")
+    _check_expected_sha(expected_sha256, src, target, "read_hotkey_module")
+    edited = _splice_all(src, pairs, "read_hotkey_module")
+    _lint_saved_code(edited, target.name, before=src)
     rel = f"hotkeys\\{base}.ahk"
     was_parked = _was_parked(rel)
-    snap = _write_validated(
-        [(target, edited)], [target],
-        "That edit would stop the module loading, so it was rolled back and nothing "
-        "changed:")
+    snap = _swap_validated(
+        target, edited,
+        ("That edit" if len(pairs) == 1 else f"Those {len(pairs)} edits (checked together)")
+        + " would stop the module loading, so nothing was written and nothing changed:",
+        provided=None if isolated else _master_provided(exclude=target),
+        against=src, read_tool="read_hotkey_module")
     out = {"type": "hotkey_module", "phrase": phrase, "base": base,
            "isolated": isolated, "file": str(target), "edited": True,
-           "body_sha256": hashlib.sha256(edited.encode("utf-8")).hexdigest(),
+           "edits_applied": len(pairs),
+           "body_sha256": _text_sha256(edited),
            "body_length": len(edited),
-           "undo": "Call edit_hotkey_module again with old_string and new_string swapped."}
+           **_undo_for(src, edited, pairs, "edit_hotkey_module")}
     if isolated:
         # A body runs fresh on every press — nothing to reload.
         out["note"] = _isolated_live_note(base)
@@ -3414,10 +3928,10 @@ def _defines_combo(code: str, key: str) -> bool:
 
 
 @_serialized
-def update_hotkey_module(name: str, code: str) -> dict:
+def update_hotkey_module(name: str, code: str, *, expected_sha256: str | None = None) -> dict:
     """Replace a hotkey module's code in full — the write half of the
     read_hotkey_module round trip, for rewrites too broad for
-    edit_hotkey_module's single splice.
+    edit_hotkey_module's splices.
 
     It rewrites exactly the file read_hotkey_module returns: the BODY for an
     isolated module (live on the next press, no reload), the module file
@@ -3428,10 +3942,12 @@ def update_hotkey_module(name: str, code: str) -> dict:
     nest one generated header inside another, and restoring a banked backup
     is one verbatim call.
 
-    The new code is load-checked and the file put back to its exact previous
-    bytes on failure; the overwritten file is banked one step deep in
-    logs\\module-backups\\ (the same slot a create replace uses) and comes
-    back via read_hotkey_module(name, previous=True).
+    The new code is load-checked as a copy before it replaces the file
+    (_swap_validated), so a failure leaves the file untouched; the
+    overwritten file is banked one step deep in logs\\module-backups\\ (the
+    same slot a create replace uses) and comes back via
+    read_hotkey_module(name, previous=True). expected_sha256 refuses the
+    write when the file changed since it was read (another session).
 
     An in-process module file IS its key binding, so the new code must still
     define the registered combo — dropping ^!+<key> would leave
@@ -3459,11 +3975,19 @@ def update_hotkey_module(name: str, code: str) -> dict:
             f"definition; to change a combo, delete the module and create it "
             f"again, then re-pair the phrase in Voice Access.")
 
+    current = _read_text_any(target)
+    _check_expected_sha(expected_sha256, current, target, "read_hotkey_module")
+    new_text = code.replace("\r\n", "\n").strip("\n") + "\n"
+    _lint_saved_code(new_text, "code", before=current)
     rel = f"hotkeys\\{base}.ahk"
     was_parked = _was_parked(rel)
-    snap = _write_validated(
-        [(target, code.replace("\r\n", "\n").strip("\n") + "\n")], [target],
-        "The new code failed to load, so the module was left exactly as it was:")
+    # Checked as a copy and moved into place (_swap_validated): a press
+    # during the check runs the old file, never the unchecked one.
+    snap = _swap_validated(
+        target, new_text,
+        "The new code failed to load, so the module was left exactly as it was:",
+        provided=None if isolated else _master_provided(exclude=target),
+        against=current, read_tool="read_hotkey_module")
 
     unparked = False
     rl: dict = {}
@@ -3492,6 +4016,7 @@ def update_hotkey_module(name: str, code: str) -> dict:
         "type": "hotkey_module", "phrase": phrase, "base": base,
         "isolated": isolated, "file": str(target), "updated": True,
         "bridge_key": f"Ctrl+Alt+Shift+{key}" if key else "",
+        "body_sha256": _text_sha256(new_text), "body_length": len(new_text),
         **banked, **rl,
         "note": note,
     }
@@ -3643,7 +4168,10 @@ def read_macro_source(name: str, previous: bool = False) -> dict:
                 "note": "The full file as it stood before the last update_macro."}
     out = {"type": "macro", "phrase": phrase, "base": base,
            "name": space_out(base), "kind": kind, "file": str(macro),
-           "source": txt, "note": _MACRO_KIND_NOTES[kind]}
+           "source": txt,
+           # Pass back as expected_sha256 to edit/update: refused if it changed since.
+           "source_sha256": _text_sha256(txt),
+           "note": _MACRO_KIND_NOTES[kind]}
     desc = _macro_description(txt)
     if desc:
         out["description"] = desc
@@ -3670,59 +4198,78 @@ def _updatable_macro(base: str, verb: str) -> Path:
     return macro
 
 
-def update_macro(name: str, ahk_source: str) -> dict:
+def update_macro(name: str, ahk_source: str, *, expected_sha256: str | None = None) -> dict:
     """Replace a macro's source in full — the write half of the read/patch
     loop (an agent used to produce a patch a human then had to hand-apply).
 
-    The new source (saved as UTF-8 with LF line endings) is load-checked and
-    the file put back to its exact previous bytes on failure, reusing the
+    The new source (saved as UTF-8 with LF line endings) is load-checked as a
+    copy before it replaces the file (_swap_validated — a run started during
+    the check gets the old file, never the unchecked one), reusing the
     create-tools' discard rule: a broken write must never be what's left
     behind. The overwritten file is banked one step deep (logs\\macro-backups\\,
     raw bytes) and retrievable via read_macro_source(name, previous=True), so
-    an unwanted overwrite stays undoable without the response echoing it."""
+    an unwanted overwrite stays undoable without the response echoing it.
+    expected_sha256 (read_macro_source's source_sha256) refuses the write when
+    the file changed since it was read."""
     _no_tokens(ahk_source, "ahk_source")
     phrase, base = _require_name(name)
     if not (ahk_source or "").strip():
         raise VoiceKitError("The new source is empty — to remove a macro, use "
                             "delete_automation.")
     macro = _updatable_macro(base, "update")
-    prev = _replace_validated(
-        macro, ahk_source.replace("\r\n", "\n").strip("\n") + "\n",
-        "The new source failed to load, so the macro was left exactly as it was:")
+    current = _read_text_any(macro)
+    _check_expected_sha(expected_sha256, current, macro, "read_macro_source")
+    new_text = ahk_source.replace("\r\n", "\n").strip("\n") + "\n"
+    _lint_saved_code(new_text, "ahk_source", before=current)
+    prev = _swap_validated(
+        macro, new_text,
+        "The new source failed to load, so the macro was left exactly as it was:",
+        against=current, read_tool="read_macro_source").prev(macro)
     banked = _bank_previous(_MACRO_BACKUPS, base, prev, "previous_source")
     log(f"macro updated | {base}")
     return {
         "type": "macro", "phrase": phrase, "base": base, "file": str(macro),
-        "updated": True, **banked,
+        "updated": True,
+        "source_sha256": _text_sha256(new_text), "source_length": len(new_text),
+        **banked,
         "note": ("Live on its next run — macros run fresh each time, so nothing needs "
                  "reloading. read_macro_source(name, previous=True) returns the "
                  "overwritten version if this needs undoing."),
     }
 
 
-def edit_macro(name: str, old_string: str, new_string: str) -> dict:
+def edit_macro(name: str, old_string: str | None = None, new_string: str | None = None,
+               *, edits: list | None = None, expected_sha256: str | None = None) -> dict:
     """Exact-match splice into a macro's source — the patch-shaped tool.
-    Same semantics as edit_hotkey_module: old_string must match exactly once,
-    the edited file is load-checked and rolled back on failure, and undo is
-    the same call with the strings swapped (which is why there's no backup
-    file here, unlike update_macro)."""
-    _no_tokens(new_string, "new_string")
+    Same semantics as edit_hotkey_module: old_string must match exactly once
+    (or edits=[...]: several splices applied in order, ONE load check, ONE
+    write), the edited text is load-checked as a copy before it replaces the
+    file, expected_sha256 refuses a file someone changed since it was read,
+    and undo is the same call with the strings swapped (a batch: undo_edits)
+    — which is why there's no backup file here, unlike update_macro."""
+    pairs = _edit_list(old_string, new_string, edits)
+    for i, (_o, nw) in enumerate(pairs, 1):
+        _no_tokens(nw, "new_string" if len(pairs) == 1 else f"edits[{i}].new_string")
     phrase, base = _require_name(name)
     macro = _updatable_macro(base, "edit")
     src = _read_text_any(macro).replace("\r\n", "\n")
-    edited = _splice_once(src, old_string.replace("\r\n", "\n"),
-                          new_string.replace("\r\n", "\n"), "read_macro_source")
-    _replace_validated(macro, edited,
-                       "That edit would stop the macro loading, so it was rolled back "
-                       "and nothing changed:")
+    _check_expected_sha(expected_sha256, src, macro, "read_macro_source")
+    edited = _splice_all(src, pairs, "read_macro_source")
+    _lint_saved_code(edited, macro.name, before=src)
+    _swap_validated(macro, edited,
+                    ("That edit" if len(pairs) == 1 else
+                     f"Those {len(pairs)} edits (checked together)")
+                    + " would stop the macro loading, so nothing was written and "
+                      "nothing changed:",
+                    against=src, read_tool="read_macro_source")
     log(f"macro edited | {base}")
     return {
         "type": "macro", "phrase": phrase, "base": base, "file": str(macro),
-        "edited": True,
-        "source_sha256": hashlib.sha256(edited.encode("utf-8")).hexdigest(),
+        "edited": True, "edits_applied": len(pairs),
+        "source_sha256": _text_sha256(edited),
         "source_length": len(edited),
         "note": "Live on its next run — macros run fresh each time, so nothing needs reloading.",
-        "undo": "Call edit_macro again with old_string and new_string swapped.",
+        **_undo_for(src, edited, pairs, "edit_macro"),
     }
 
 
@@ -4086,9 +4633,12 @@ def create_workflow(name: str, steps: list) -> dict:
     # (a lib file mid-edit, say) puts the OLD workflow back byte for byte —
     # this used to delete the very workflow it was replacing.
     replacing = steps_file.exists()
-    _write_validated([(steps_file, steps_to_text(phrase, steps)),
-                      (macro, workflow_stub(phrase, base))], [macro],
-                     "The generated workflow stub failed to load, so nothing was changed:")
+    # Checked as a copy and moved into place, steps file and stub alike
+    # (_swap_validated_all): a run started during a replace's load check reads
+    # the old workflow whole, never a new steps file behind an unchecked stub.
+    _swap_validated_all([(steps_file, steps_to_text(phrase, steps), None),
+                         (macro, workflow_stub(phrase, base),
+                          "The generated workflow stub failed to load, so nothing was changed:")])
     _ensure_voice_dir()
     disp = space_out(base)
     link = VOICE_MACROS / f"{disp}.lnk"
@@ -4187,6 +4737,154 @@ def _body_processes() -> list:
         if m:
             out.append({"base": m.group(1), "pid": row["pid"], "started": row["started"]})
     return out
+
+
+# --- A body sitting on a dialog ----------------------------------------------
+# 2026-10-14 feedback ("Karbon File"): an uncaught error in a body showed
+# AutoHotkey's error dialog, the process stayed alive behind it, and
+# BodySingleInstance quietly refused every later press — the user saw "it's
+# hung", and read_module_status said only "running". So both status tools now
+# look at the body's visible top-level windows. Shapes MEASURED 2026-10-14
+# (AutoHotkey 2.0.26, a script that calls a missing method, its windows read
+# with EnumWindows/EnumChildWindows): the error dialog is a '#32770' titled
+# with the script's file name, its message in a RICHEDIT50W ("Error: ...",
+# the failing line marked with U+25B6, then "Show call stack »") and buttons
+# Abort / Help / Edit / Reload / ExitApp / Continue; a MsgBox is a '#32770'
+# with its text in a Static and its own buttons. Read-only: WM_GETTEXT with
+# SMTO_ABORTIFHUNG (a hung window answers nothing, never blocks the call); a
+# plain Edit (an InputBox's typed answer) is never read.
+_DIALOG_TEXT_CAP = 600
+_WM_GETTEXT = 0x000D
+_SMTO_ABORTIFHUNG = 0x0002
+_USER32: dict = {}
+_USER32_LOCK = threading.Lock()
+
+
+def _user32() -> dict:
+    """user32 entry points for reading windows, declared once (ctypes)."""
+    with _USER32_LOCK:
+        if _USER32:
+            return _USER32
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        u.EnumWindows.restype = wintypes.BOOL
+        u.EnumWindows.argtypes = (proto, wintypes.LPARAM)
+        u.EnumChildWindows.restype = wintypes.BOOL
+        u.EnumChildWindows.argtypes = (wintypes.HWND, proto, wintypes.LPARAM)
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        u.GetClassNameW.restype = ctypes.c_int
+        u.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        u.IsWindowVisible.restype = wintypes.BOOL
+        u.IsWindowVisible.argtypes = (wintypes.HWND,)
+        u.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+        u.SendMessageTimeoutW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                          wintypes.LPARAM, wintypes.UINT, wintypes.UINT,
+                                          ctypes.POINTER(ctypes.c_size_t))
+        _USER32.update(u=u, proto=proto, ctypes=ctypes, wintypes=wintypes)
+        return _USER32
+
+
+def _win_class(h) -> str:
+    api = _user32()
+    buf = api["ctypes"].create_unicode_buffer(256)
+    api["u"].GetClassNameW(h, buf, 256)
+    return buf.value
+
+
+def _win_text(h, cap: int = 8192) -> str:
+    """A window's text by WM_GETTEXT, bounded: "" when it doesn't answer
+    within 300 ms (SMTO_ABORTIFHUNG — a hung window is skipped at once)."""
+    api = _user32()
+    ct = api["ctypes"]
+    buf = ct.create_unicode_buffer(cap)
+    res = ct.c_size_t()
+    ok = api["u"].SendMessageTimeoutW(h, _WM_GETTEXT, cap, ct.addressof(buf),
+                                      _SMTO_ABORTIFHUNG, 300, ct.byref(res))
+    return buf.value if ok else ""
+
+
+def _dialog_report(title: str, statics: list, rich: list, buttons: list) -> dict:
+    """{title, text, kind, buttons[, failing_line]} for one dialog. kind is
+    'error' / 'warning' for AutoHotkey's own error dialog (its RichEdit text
+    starts 'Error' / 'Warning', or it carries the ExitApp + Continue buttons
+    only that dialog has — measured, see above), else 'message'."""
+    names = [b.replace("&", "").strip() for b in buttons if b.strip()]
+    body = "\n".join(t for t in rich if t.strip()) or "\n".join(statics)
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    lead = body.lstrip()
+    kind = "message"
+    failing = ""
+    if rich and (lead.startswith(("Error", "Warning")) or
+                 {"ExitApp", "Continue"} <= set(names)):
+        kind = "warning" if lead.startswith("Warning") else "error"
+        body = re.sub(r"\n*Show call stack\s*»?\s*$", "", body)
+        m = re.search(r"^▶\s*(.+)$", body, re.M)       # the failing line's marker
+        if m:
+            failing = m.group(1).strip()
+    text = re.sub(r"\n{3,}", "\n\n", body).strip()
+    if len(text) > _DIALOG_TEXT_CAP:
+        text = text[:_DIALOG_TEXT_CAP].rstrip() + " ..."
+    out = {"title": title, "text": text, "kind": kind, "buttons": names}
+    if failing:
+        out["failing_line"] = failing
+    return out
+
+
+def _process_dialogs(pids) -> list[dict]:
+    """Every VISIBLE dialog ('#32770' top-level window) the given processes
+    show, as _dialog_report dicts with the owning pid. [] on any failure:
+    this is a courtesy on a status answer, never a reason for it to fail."""
+    want = {int(p) for p in pids or () if _as_int(p, 0)}
+    if not want:
+        return []
+    try:
+        api = _user32()
+        u, ct, wt = api["u"], api["ctypes"], api["wintypes"]
+        tops: list = []
+
+        def on_top(h, _lp):
+            if u.IsWindowVisible(h):
+                pid = wt.DWORD()
+                u.GetWindowThreadProcessId(h, ct.byref(pid))
+                if pid.value in want and _win_class(h) == "#32770":
+                    tops.append((int(pid.value), h))
+            return True
+        u.EnumWindows(api["proto"](on_top), 0)
+        out = []
+        for pid, h in tops:
+            statics: list = []
+            rich: list = []
+            buttons: list = []
+
+            def on_child(c, _lp):
+                if u.IsWindowVisible(c):
+                    cls = _win_class(c).lower()
+                    if cls == "static":
+                        statics.append(_win_text(c))
+                    elif cls.startswith("richedit"):
+                        rich.append(_win_text(c))
+                    elif cls == "button":
+                        buttons.append(_win_text(c, 256))
+                return True
+            u.EnumChildWindows(h, api["proto"](on_child), 0)
+            rep = _dialog_report(_win_text(h, 512), statics, rich, buttons)
+            rep["pid"] = pid
+            out.append(rep)
+        # An error dialog first: it is the one that explains the hang.
+        out.sort(key=lambda d: 0 if d["kind"] == "error" else 1)
+        return out
+    except Exception:               # noqa: BLE001
+        return []
+
+
+def _dialog_note(d: dict) -> str:
+    what = {"error": "an error dialog", "warning": "a warning dialog"}.get(d.get("kind"),
+                                                                          "a dialog")
+    return (f"Alive, but sitting on {what} ({d.get('title') or 'untitled'!r}) — presses "
+            f"of its key are ignored until it's closed; stop_module ends it.")
 
 
 # Worked examples shipped as readable code. Not generator templates —
@@ -4573,6 +5271,15 @@ def read_module_status(name: str) -> dict:
                        f"ago — that is where it got to, whether it finished or died.")
     else:
         out["note"] = "Not running, and it has never published a status line."
+    # Alive is not the same as working: a body on a dialog (AutoHotkey's
+    # uncaught-error dialog above all) waits for a click nobody sees, and
+    # its single-instance guard turns every later press away meanwhile.
+    dialogs = _process_dialogs(out["pids"]) if procs else []
+    if dialogs:
+        out["dialog"] = dialogs[0]
+        if len(dialogs) > 1:
+            out["dialogs"] = dialogs
+        out["note"] = _dialog_note(dialogs[0]) + " " + out["note"]
     return out
 
 
@@ -4594,13 +5301,24 @@ def list_running() -> dict:
         if st:
             e["last_status"] = st
         running.append(e)
-    return {"running": running,
-            "note": ("Nothing running. Only isolated module bodies appear here — "
-                     "isolate=False modules run inside the resident VoiceKit."
-                     if not running else
-                     "stop_module stops one; a body that checks BodyStopRequested() "
-                     "in its loop exits cleanly, anything else is force-killed "
-                     "after the grace period.")}
+    # One window scan for every body (read_module_status explains why).
+    blocked = []
+    for d in _process_dialogs([e["pid"] for e in running]) if running else []:
+        e = next((r for r in running if _as_int(r["pid"], 0) == d["pid"]), None)
+        if e is not None and "dialog" not in e:
+            e["dialog"] = d
+            e["note"] = _dialog_note(d)
+            blocked.append(e["name"])
+    note = ("Nothing running. Only isolated module bodies appear here — "
+            "isolate=False modules run inside the resident VoiceKit."
+            if not running else
+            "stop_module stops one; a body that checks BodyStopRequested() "
+            "in its loop exits cleanly, anything else is force-killed "
+            "after the grace period.")
+    if blocked:
+        note = (f"{', '.join(blocked)}: sitting on a dialog (see its 'dialog') — "
+                f"its key does nothing until that is closed or stop_module ends it. " + note)
+    return {"running": running, "note": note}
 
 
 STOP_KILL_WAIT_S = 5        # stop_module: how long a force-killed body may take to go
@@ -4858,7 +5576,9 @@ DUMP_MAX_DEPTH = 100     # cap on dump_uia_tree's max_depth (was 25 until
 
 
 def dump_uia_tree(window: str | None = None, max_depth: int = 8,
-                  name_filter: str | None = None, max_lines: int = 300) -> dict:
+                  name_filter: str | None = None, max_lines: int = 300,
+                  root_id: str | None = None, root_name: str | None = None,
+                  positions: bool = False, visible_only: bool = False) -> dict:
     """A window's UIA tree as an indented text outline — 'what am I looking at'.
 
     Read-only, same probe as inspect_focus. `window` is an AutoHotkey WinTitle
@@ -4881,11 +5601,34 @@ def dump_uia_tree(window: str | None = None, max_depth: int = 8,
     and the fingerprint whole), so an unfiltered dump of a big page walks
     to the node budget or the time cap — seconds, not milliseconds. Lower
     max_depth for a quick look.
+
+    2026-10-14 feedback (a 1,500-line browser module built by hand-rolled
+    subtree walks): root_id / root_name start the dump at ONE element of the
+    window (the first with that automation id / exact name — with both, the
+    one that has both) instead of the window — max_depth, the counts and the fingerprint then
+    cover that subtree, and `root` says which element it was; a root that
+    isn't there is an error naming it. positions=True ends each line with
+    ' @x,y wxh' (screen pixels) or ' @none' (no rectangle). visible_only=True
+    lists only elements with a visible part (UiaVisibleRect's rules: a
+    rectangle, not IsOffscreen, not clipped away by a scroll container or
+    their window, on a monitor) — a line
+    filter like name_filter: the walk and the fingerprint are unchanged, and
+    a visible_only dump that lists nothing says the element may simply be
+    scrolled out of view.
     """
     max_depth = max(1, min(_as_int(max_depth, 8), DUMP_MAX_DEPTH))
     max_lines = max(1, min(_as_int(max_lines, 300), 2000))
+    root_id = (root_id or "").strip()
+    root_name = (root_name or "").strip()
+    for what, v in (("root_id", root_id), ("root_name", root_name)):
+        if "\n" in v or "\r" in v:
+            raise VoiceKitError(f"{what} is one line: an automation id or an exact name.")
+    # The probe's argument contract (mcp\uia_probe.ahk, tree mode):
+    # window, max_depth, max_lines, name_filter, root_id, root_name,
+    # positions 0|1, visible_only 0|1.
     txt = _run_uia_probe(
-        ["tree", window or "", max_depth, max_lines, name_filter or ""])
+        ["tree", window or "", max_depth, max_lines, name_filter or "",
+         root_id, root_name, 1 if positions else 0, 1 if visible_only else 0])
     header, _, tree = txt.partition("\n\n")
     rec = _parse_kv(header)
     if "error" in rec:
@@ -4899,35 +5642,57 @@ def dump_uia_tree(window: str | None = None, max_depth: int = 8,
            "budget_hit": rec.get("budget_hit") == "1",
            "fingerprint": rec.get("fingerprint", ""),
            "tree": tree.rstrip("\n")}
+    if rec.get("root"):
+        out["root"] = rec["root"]
+    elif root_id or root_name:
+        # A probe that ignored the root arguments (older than this contract)
+        # dumped the WHOLE window: never let that pass as the subtree.
+        raise VoiceKitError("The UIA probe didn't report the root element it started from "
+                            "(mcp\\uia_probe.ahk is older than root_id/root_name) — this "
+                            "dump would be the whole window, not that subtree.")
     if rec.get("time_hit") == "1":
         out["time_hit"] = True
         out["fingerprint"] = ""     # not reproducible — see the note
     note = _dump_note(out, max_depth, max_lines, name_filter,
-                      lines_hit=rec.get("lines_hit") == "1")
+                      lines_hit=rec.get("lines_hit") == "1",
+                      visible_only=bool(visible_only))
     if note:
         out["note"] = note
     return out
 
 
 def _dump_note(out: dict, max_depth: int, max_lines: int, name_filter: str | None,
-               lines_hit: bool = False) -> str:
+               lines_hit: bool = False, visible_only: bool = False) -> str:
     """The plain-words verdict on how complete a dump_uia_tree walk was.
 
     Empty when nothing was cut. The reason this exists (2026-10-12): a dump
     capped at depth 25 showed a form's inputs as empty groups and a filtered
     dump came back with zero lines and no warning, which read as "the field
-    isn't there"."""
+    isn't there". A subtree dump (out['root']) speaks of that subtree, and
+    an empty visible_only dump never says "not there" — offscreen elements
+    were walked and only hidden from the listing."""
     parts = []
     cut, nodes = out.get("cut_at_depth", 0), out.get("nodes", 0)
     incomplete = bool(cut or out.get("budget_hit") or out.get("time_hit"))
-    if name_filter and out.get("lines", 0) == 0:
+    where = (f"under {out['root']}" if out.get("root") else "in the tree")
+    if out.get("lines", 0) == 0 and (name_filter or visible_only):
+        what = (f"name_filter {name_filter!r} matched nothing" if name_filter else
+                "Nothing was listed")
+        if visible_only:
+            what += (" VISIBLE" if name_filter else " (visible_only)")
         if incomplete:
-            parts.append(f"name_filter {name_filter!r} matched nothing — but the walk was "
-                         f"INCOMPLETE, so that does not mean it isn't there:")
+            parts.append(f"{what} — but the walk was INCOMPLETE, so that does not mean it "
+                         f"isn't there:")
+        elif visible_only:
+            parts.append(f"{what} in the complete walk ({nodes} nodes) — visible_only hides "
+                         f"elements that have no rectangle, are offscreen, are clipped away "
+                         f"by a scrolling panel or their window, or are on no monitor, so it "
+                         f"may be there but scrolled out of view: dump again without "
+                         f"visible_only, or scroll it into view.")
         else:
-            parts.append(f"name_filter {name_filter!r} matched nothing in the complete walk "
-                         f"({nodes} nodes) — it isn't in the tree right now (web pages "
-                         f"virtualize: scroll it into view, then dump again).")
+            parts.append(f"{what} in the complete walk ({nodes} nodes) — it isn't {where} "
+                         f"right now (web pages virtualize: scroll it into view, then dump "
+                         f"again).")
     if cut:
         parts.append(f"{cut} subtree{'s were' if cut != 1 else ' was'} cut off at "
                      f"max_depth={max_depth} — the match may be deeper; raise max_depth"
@@ -8051,7 +8816,7 @@ def _now_text() -> str:
 
 
 def _start_job(path: str, argv: list, cwd: str | None, env: dict, stdin_bytes: bytes | None,
-               lifetime_s, tokens: tuple = ()) -> dict:
+               lifetime_s, tokens: tuple = (), meta_extra: dict | None = None) -> dict:
     lifetime = JOB_DEFAULT_LIFETIME_S if lifetime_s is None else max(0, _as_int(lifetime_s, 0))
     lifetime = min(lifetime, JOB_MAX_LIFETIME_S)
     _prune_jobs(JOB_KEEP_MAX - 1)
@@ -8087,6 +8852,7 @@ def _start_job(path: str, argv: list, cwd: str | None, env: dict, stdin_bytes: b
     meta = {"id": jid, "pid": tree.pid, "created": tree.created, "exe": path,
             "started": _now_text(), "started_epoch": time.time(), "lifetime_s": lifetime,
             "cwd": cwd or str(d), "tokens": list(tokens)}
+    meta.update(meta_extra or {})       # what started it (ensure_python_env: its env folder)
     _write_json(d / "meta.json", meta)
     entry = {"tree": tree, "lock": threading.RLock(), "stopped": False, "released": False,
              "dir": d, "t0": time.monotonic(), "lifetime": lifetime}
@@ -8357,6 +9123,381 @@ def stop_job(job_id: str, grace_s: int = 0) -> dict:
     return out
 
 
+# --- ensure_python_env: Python packages a module can use ----------------------
+# 2026-10-14 feedback ("Karbon File"): a body's combined-PDF step needed
+# pypdf, and the agent hand-built a venv under tools\ rather than touch
+# VoiceKit's own Python. This makes that the supported way: one virtual
+# environment per name at <root>\tools\python\<env>\, made from the BASE
+# interpreter of the server's own Python (never a pip install into
+# mcp\.venv — the server's dependencies are not a module's to change), and
+# a body finds it with VkPythonExe(env) in lib\_Common.ahk (the same path,
+# the same name sanitizing). Every child — the check, venv creation, pip —
+# is a _ProcTree: the checks run bounded (_run_bounded); the install runs
+# as a background JOB the call waits on up to max_wait_s(), so a slow
+# download carries on (read_job / stop_job) instead of being killed
+# half-installed, and a cancelled call stops it.
+PYENV_LIFETIME_S = 1800          # an install job is ended after this at the latest
+PYENV_CHECK_TIMEOUT_S = 15
+PYENV_MAX_PACKAGES = 30
+_PYENV_STRIP_RE = re.compile(r"[^\w\-.]", re.ASCII)      # = VkPythonExe's sanitize
+_PYREQ_NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+_PYREQ_VER = r"(?:~=|===|==|!=|<=|>=|<|>)[ \t]*[A-Za-z0-9.*+!_-]+"
+# A requirement spec, and nothing else a pip argument could be: a name,
+# optional [extras], optional comma-separated version specifiers. No URL
+# ('@' / '://'), no path, no marker (';'), no option ('-...').
+_PYREQ_RE = re.compile(
+    rf"^{_PYREQ_NAME}"
+    rf"(?:[ \t]*\[[ \t]*{_PYREQ_NAME}(?:[ \t]*,[ \t]*{_PYREQ_NAME})*[ \t]*\])?"
+    rf"(?:[ \t]*{_PYREQ_VER}(?:[ \t]*,[ \t]*{_PYREQ_VER})*)?$")
+# pip takes a "name" ending in an archive extension as a FILE to install
+# (its ARCHIVE_EXTENSIONS; review 2026-10-14: 'evil.whl' passed _PYREQ_RE
+# and pip's parser said "looks like a filename"), so such a name is refused.
+_PYREQ_ARCHIVE_RE = re.compile(
+    r"\.(?:whl|zip|tar|tar\.gz|tgz|tar\.bz2|tbz|tar\.xz|txz|tlz|tar\.lz|tar\.lzma)$",
+    re.IGNORECASE)
+_PYENV_JOBS: dict = {}           # env folder key -> job id of an install still running
+_PYENV_LOCK = threading.Lock()
+
+# Run by the ENV's python (-I): which requested specs are satisfied, read
+# from the installed metadata with pip's own vendored 'packaging'. An extra
+# counts only when the dependencies it adds are installed too.
+_PYENV_CHECK = r'''
+import json, sys
+from importlib import metadata
+try:
+    from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.utils import canonicalize_name
+except Exception:
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+def version(name):
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return None
+
+def satisfied(req, depth=0):
+    v = version(req.name)
+    if v is None or (req.specifier and not req.specifier.contains(v, prereleases=True)):
+        return False, v
+    if req.extras and depth < 3:
+        for dep in metadata.requires(req.name) or []:
+            d = Requirement(dep)
+            if d.marker is None or d.marker.evaluate({"extra": ""}):
+                continue
+            if any(d.marker.evaluate({"extra": e}) for e in req.extras):
+                if not satisfied(d, depth + 1)[0]:
+                    return False, v
+    return True, v
+
+out = {}
+for spec in sys.argv[1:]:
+    req = Requirement(spec)
+    ok, v = satisfied(req)
+    out[spec] = {"name": canonicalize_name(req.name), "version": v, "satisfied": ok}
+print(json.dumps({"python": sys.version.split()[0], "packages": out}))
+'''
+
+# Run by the BASE interpreter (-I) as the install job: make the environment
+# when it is missing, then pip install the specs into IT (its own python
+# -m pip, so nothing can land in another environment).
+_PYENV_DRIVER = r'''
+import os, subprocess, sys, venv
+env_dir, args = sys.argv[1], sys.argv[2:]
+py = os.path.join(env_dir, "Scripts", "python.exe")
+if not os.path.isfile(py):
+    print("Creating the environment " + env_dir, flush=True)
+    venv.EnvBuilder(with_pip=True).create(env_dir)
+upgrade = args[:1] == ["--upgrade"]
+specs = args[1:] if upgrade else args
+if specs:
+    cmd = [py, "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
+           "--prefer-binary"] + (["--upgrade"] if upgrade else []) + specs
+    print("pip install " + " ".join(specs), flush=True)
+    sys.exit(subprocess.call(cmd))
+'''
+
+
+def _pyenv_name(env) -> str:
+    """The environment's folder name: [A-Za-z0-9_.-] only — what
+    VkPythonExe(env) derives from the same text, so a body asking for the
+    name it was told finds this folder."""
+    name = _PYENV_STRIP_RE.sub("", str(env or "").strip())
+    if not name or set(name) <= {"."}:
+        raise VoiceKitError("env is a short name made of letters, digits, '_', '-' and '.' "
+                            "(e.g. 'pdf') — it names the folder tools\\python\\<env>.")
+    if len(name) > 64:
+        raise VoiceKitError("env is at most 64 characters.")
+    return name
+
+
+def _pyenv_dir(name: str) -> Path:
+    return REPO_ROOT / "tools" / "python" / name
+
+
+def _pyenv_specs(packages) -> list[str]:
+    """The requirement specs, validated: plain names with optional [extras]
+    and version specifiers. Everything else pip accepts — a URL, a path, a
+    VCS link, an option — is refused: this tool installs from the package
+    index, nothing more."""
+    if packages is None:
+        return []
+    if isinstance(packages, str):
+        packages = [packages]
+    if not isinstance(packages, (list, tuple)):
+        raise VoiceKitError("packages is a list of requirement specs, e.g. ['pypdf', "
+                            "'openpyxl>=3.1'].")
+    if len(packages) > PYENV_MAX_PACKAGES:
+        raise VoiceKitError(f"At most {PYENV_MAX_PACKAGES} packages per call.")
+    out: list[str] = []
+    for p in packages:
+        s = str(p if p is not None else "").strip()
+        if not s:
+            continue
+        if s.startswith("-"):
+            raise VoiceKitError(f"'{s}' looks like a pip option — only package specs are "
+                                f"taken ('name', 'name[extra]', 'name>=1.2').")
+        name_part = re.match(_PYREQ_NAME, s)
+        if (len(s) > 120 or not _PYREQ_RE.match(s)
+                or (name_part and _PYREQ_ARCHIVE_RE.search(name_part.group(0)))):
+            raise VoiceKitError(
+                f"'{s[:120]}' isn't a plain package spec. Allowed: a name from the package "
+                f"index with optional [extras] and version specifiers — 'pypdf', "
+                f"'pypdf==5.1.0', 'requests[socks]>=2.31,<3'. URLs, file paths, archive "
+                f"file names (.whl, .zip, .tar.gz), VCS links and environment markers are "
+                f"refused.")
+        s = re.sub(r"[ \t]+", "", s)
+        if s.lower() not in (o.lower() for o in out):
+            out.append(s)
+    return out
+
+
+def _base_python() -> str:
+    """The interpreter the server's own Python was made from — never the
+    server's venv python itself (sys._base_executable; measured 2026-10-14:
+    from mcp\\.venv it is the base install's python.exe)."""
+    import sys
+    for cand in (getattr(sys, "_base_executable", ""), str(Path(sys.base_prefix) / "python.exe"),
+                 sys.executable):
+        if cand and Path(cand).is_file():
+            return str(cand)
+    raise VoiceKitError("Couldn't find the Python interpreter this server runs on.")
+
+
+def _pyenv_check_s() -> int:
+    """How long one package check may take: PYENV_CHECK_TIMEOUT_S, but at
+    most a third of max_wait_s(), so a call's check + install wait + check
+    stays inside the cap whatever [MCP] MaxWaitSeconds says (code review
+    2026-10-14: two fixed 15 s checks around a wait floored at 1 s ran a call
+    to ~31 s under a 10 s cap)."""
+    return max(1, min(PYENV_CHECK_TIMEOUT_S, max_wait_s() // 3))
+
+
+def _pyenv_check(py: Path, specs: list[str], timeout_s: int | None = None) -> dict:
+    """{python, packages: {spec: {name, version, satisfied}}} from the env."""
+    with tempfile.TemporaryDirectory(prefix="vk-pyenv-", ignore_cleanup_errors=True) as d:
+        so, se = Path(d) / "out.txt", Path(d) / "err.txt"
+        r = _run_bounded([str(py), "-I", "-c", _PYENV_CHECK, *specs],
+                         timeout_s or _pyenv_check_s(),
+                         cwd=d, out_path=so, err_path=se, env=_pyenv_child_env(),
+                         label="ensure_python_env check")
+        if r["cancelled"]:
+            raise VoiceKitError("The request was cancelled.")
+        text = so.read_bytes().decode("utf-8", "replace").strip()
+        if r["exit_code"] != 0 or not text:
+            err = se.read_bytes().decode("utf-8", "replace").strip()[-600:]
+            raise VoiceKitError(
+                f"Couldn't read what is installed in {py.parent.parent} "
+                + ("(the check timed out)" if r["timed_out"] else f"(exit {r['exit_code']})")
+                + (f": {err}" if err else "") + " — a broken environment can be deleted "
+                  "(its folder) and made again with ensure_python_env.")
+        try:
+            return json.loads(text.splitlines()[-1])
+        except ValueError:
+            raise VoiceKitError(f"The environment check printed something unexpected: "
+                                f"{text[-300:]}") from None
+
+
+def _pyenv_child_env() -> dict:
+    """The server's environment minus whatever would point a child at
+    ANOTHER Python (the server's own venv above all)."""
+    return _child_env({"PYTHONPATH": None, "PYTHONHOME": None, "VIRTUAL_ENV": None,
+                       "PYTHONSTARTUP": None, "PIP_REQUIRE_VIRTUALENV": None,
+                       "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1"})
+
+
+def _pyenv_usage(name: str, py: Path) -> str:
+    return (f'py := VkPythonExe("{name}")   ; "" when the environment is missing\n'
+            f'if (py = "")\n'
+            f'    throw Error("Python environment \'{name}\' is missing - run '
+            f'ensure_python_env")\n'
+            f'code := RunWait(\'"\' py \'" "\' A_ScriptDir \'\\..\\..\\tools\\my_script.py" '
+            f'"\' inFile \'"\', , "Hide")')
+
+
+def ensure_python_env(env: str, packages: list | None = None, upgrade: bool = False,
+                      wait_s: int | None = None) -> dict:
+    """Make sure the virtual environment <root>\\tools\\python\\<env>\\ exists
+    and has the given packages; return its python path, the installed
+    versions of the requested packages, and how a body uses it.
+
+    Read-only when the environment already satisfies every spec (and
+    upgrade is False): one bounded check, no pip. Otherwise one background
+    job creates the environment if needed and runs pip install; the call
+    waits for it up to the cap and, if it is still going, returns its
+    job_id (read_job / stop_job) instead of killing a half-done install."""
+    t0 = time.monotonic()
+    name = _pyenv_name(env)
+    specs = _pyenv_specs(packages)
+    env_dir = _pyenv_dir(name)
+    py = env_dir / "Scripts" / "python.exe"
+    out: dict = {"env": name, "folder": str(env_dir), "python": str(py)}
+    if name != str(env or "").strip():
+        out["env_note"] = (f"The name was cleaned to '{name}' (letters, digits, '_', '-', '.'); "
+                           f"VkPythonExe cleans it the same way.")
+    # One decision at a time: two calls for one environment must not both
+    # start a pip (the lock is held through the check and the job's start,
+    # never through the wait).
+    with _PYENV_LOCK:
+        done, jid, wait, capped = _pyenv_start(out, name, specs, env_dir, py, upgrade,
+                                               wait_s, t0)
+    if done is not None:
+        return done
+    return _await_python_env(out, name, specs, env_dir, py, jid, wait, capped)
+
+
+def _pyenv_start(out, name, specs, env_dir, py, upgrade, wait_s, t0) -> tuple:
+    """(final answer, None, 0, '') when there is nothing to install (or an
+    install is already running), else (None, job id, seconds to wait, cap
+    note) for the job it started. Called under _PYENV_LOCK."""
+    running = _PYENV_JOBS.get(_path_key(env_dir))
+    if running and not _job_running(running):
+        _PYENV_JOBS.pop(_path_key(env_dir), None)
+        running = None
+    if not running:
+        running = _pyenv_job_on_disk(env_dir)
+    if running:
+        out.update(ok=False, state="installing", job_id=running,
+                   note=(f"Job {running} is still setting this environment up. read_job("
+                         f"'{running}') shows its progress; call ensure_python_env again once "
+                         f"it has exited (then it only checks)."))
+        return out, None, 0, ""
+    check_s = _pyenv_check_s()
+    if py.is_file() and not upgrade:
+        check = _pyenv_check(py, specs, check_s)
+        if all(v.get("satisfied") for v in check["packages"].values()):
+            return _pyenv_report(out, name, py, specs, check, changed=False), None, 0, ""
+    # Something to do: one job makes the environment (if missing) and installs.
+    # The WHOLE call stays inside max_wait_s(): the wait is what is left after
+    # the time already spent (the check above) and the check that follows it;
+    # unset or 0 = as long as that allows. It may be 0 — the job is then
+    # handed back at once.
+    longer = "it carries on as a background job — poll read_job, then call again"
+    left = max(0, int(max_wait_s() - (time.monotonic() - t0)) - check_s)
+    if _as_int(wait_s, 0) > 0:
+        wait, capped = _cap_wait(wait_s, "wait_s", 0, longer, reserve=check_s)
+        wait = min(wait, left)
+    else:
+        wait, capped = left, ""
+    argv = ["-I", "-c", _PYENV_DRIVER, str(env_dir)] + (["--upgrade"] if upgrade else []) + specs
+    env_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        job = _start_job(_base_python(), argv, str(env_dir.parent), _pyenv_child_env(), None,
+                         PYENV_LIFETIME_S, meta_extra={"pyenv": _path_key(env_dir)})
+    except OSError as e:
+        raise VoiceKitError(f"Couldn't start Python to set up the environment: {e}") from None
+    _PYENV_JOBS[_path_key(env_dir)] = job["job_id"]
+    return None, job["job_id"], wait, capped
+
+
+def _pyenv_job_on_disk(env_dir: Path) -> str:
+    """The id of a still-running install job for this environment that THIS
+    server's memory doesn't know — one started before a server restart, or
+    by another server instance (a second MCP client): jobs outlive both
+    (review 2026-10-14: a second pip would otherwise start into the same
+    folder). Read from the job's meta.json ('pyenv'); '' when there is none."""
+    key = _path_key(env_dir)
+    for jid in _job_ids():
+        meta = _read_json(_jobs_dir() / jid / "meta.json") or {}
+        if meta.get("pyenv") == key and _job_running(jid):
+            return jid
+    return ""
+
+
+def _await_python_env(out, name, specs, env_dir, py, jid, wait, capped) -> dict:
+    """Wait (up to `wait` s) for the install job, then report what is there."""
+    entry = _JOBS.get(jid)
+    deadline = time.monotonic() + wait
+    rc = None
+    while entry is not None:
+        rc = entry["tree"].proc.poll()
+        if rc is not None or time.monotonic() >= deadline:
+            break
+        if request_cancelled():
+            stop_job(jid)
+            with _PYENV_LOCK:
+                _PYENV_JOBS.pop(_path_key(env_dir), None)
+            raise VoiceKitError("The request was cancelled, so the install job was stopped.")
+        try:
+            entry["tree"].proc.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            pass
+    if capped:
+        out["wait_capped"] = capped
+    if rc is None:
+        out.update(ok=False, state="installing", job_id=jid,
+                   note=(f"Still installing after {wait} s; it carries on as background job "
+                         f"{jid}. read_job('{jid}') shows pip's progress and stop_job('{jid}') "
+                         f"cancels it. Call ensure_python_env again with the same arguments "
+                         f"once it has exited — then it only checks."))
+        return out
+    with _PYENV_LOCK:
+        _PYENV_JOBS.pop(_path_key(env_dir), None)
+    d = _jobs_dir() / jid
+    tail = "\n".join(t for t in (_tail_lines(d / "stdout.txt", 25)[0],
+                                 _tail_lines(d / "stderr.txt", 25)[0]) if t)
+    if rc != 0 or not py.is_file():
+        out.update(ok=False, state="failed", exit_code=rc, job_id=jid, output_tail=tail,
+                   note=("Setting up the environment failed — output_tail is the end of "
+                         "pip's output (a misspelt package, no network, or a package with no "
+                         "build for this Python are the usual causes). Nothing else changed."))
+        if py.is_file():
+            out["installed"] = _pyenv_installed(_pyenv_check(py, specs))
+        return out
+    check = _pyenv_check(py, specs)
+    rep = _pyenv_report(out, name, py, specs, check, changed=True)
+    rep["job_id"] = jid
+    if tail and not rep["ok"]:
+        rep["output_tail"] = tail
+    return rep
+
+
+def _pyenv_installed(check: dict) -> list[str]:
+    return [f"{v['name']}=={v['version']}" for v in check.get("packages", {}).values()
+            if v.get("version")]
+
+
+def _pyenv_report(out: dict, name: str, py: Path, specs: list, check: dict,
+                  changed: bool) -> dict:
+    missing = [s for s, v in check.get("packages", {}).items() if not v.get("satisfied")]
+    out.update(ok=not missing, state="ready" if not missing else "incomplete",
+               changed=changed, python_version=check.get("python", ""),
+               installed=_pyenv_installed(check), how_to_use=_pyenv_usage(name, py))
+    if missing:
+        out["missing"] = missing
+        out["note"] = (f"pip finished, but {', '.join(missing)} still isn't satisfied — "
+                       f"check the spelling and version, or call again with upgrade=True.")
+    else:
+        out["note"] = ((f"Set up: " if changed else "Already in place (nothing was run but a "
+                        "check): ")
+                       + f"a body runs this environment's python through "
+                         f"VkPythonExe(\"{name}\") (lib\\_Common.ahk; \"\" when it is missing) — "
+                         f"see how_to_use. To try a script from here: run_process(exe='{py}', "
+                         f"args=[...]).")
+    return out
+
+
 # --- list_processes ----------------------------------------------------------
 def _voicekit_tags(rows: list) -> dict:
     """pid -> what VoiceKit knows the process to be."""
@@ -8462,6 +9603,769 @@ def list_processes(name: str | None = None, include_command_line: bool = True,
     return out
 
 
+# --- run_ahk_snippet(include_module=...): a module's definitions only --------
+# 2026-10-14 feedback ("Karbon File"): to try ONE function of a 1,500-line
+# body read-only, the agent FileRead the body, cut it at a comment marker,
+# wrote a temp file and #Included that — about 15 times. Including the whole
+# body would run its startup code (BodySingleInstance, then the automation
+# itself, on the user's live page), so there is deliberately no such mode:
+# include_module always includes the DEFINITIONS (functions and classes) and
+# blanks everything else, line for line, so an error's line number is the
+# real file's. The scanner below reads AutoHotkey v2 well enough for real
+# module code — quoted strings with backtick escapes, ';' comments (at a
+# line start or after whitespace), /* */ blocks, continuation sections,
+# bracket continuation, leading-operator continuation lines, fat-arrow
+# one-liners, hotkeys/hotstrings with braced blocks — and the tests in
+# test_conformance.py (test_snippet_module_definitions_*) pin each shape.
+_SNIP_DEF_START_RE = re.compile(r"^[ \t]*([A-Za-z_]\w*)\(")
+_SNIP_CLASS_RE = re.compile(r"^[ \t]*class[ \t]+([A-Za-z_]\w*)\b", re.IGNORECASE)
+# :options:abbreviation::replacement
+_SNIP_HOTSTRING_RE = re.compile(r"^[ \t]*:([^:\r\n]*):(.+?)::(.*)$")
+# KeyName:: / ~^!a:: / a & b:: / F1 up:: — no quote, paren or space in the key
+_SNIP_HOTKEY_RE = re.compile(
+    r"^[ \t]*([^\s:\"'(][^\s\"'(]*?(?:[ \t]+&[ \t]+[^\s\"'(]+?)?(?:[ \t]+up)?)::(.*)$",
+    re.IGNORECASE)
+_SNIP_DIRECTIVE_RE = re.compile(r"^[ \t]*#([A-Za-z]\w*)")
+_SNIP_LABEL_RE = re.compile(r"^[ \t]*[A-Za-z_]\w*:[ \t]*(?:[ \t];.*)?$")
+# A line that continues the one above (v2: it starts with ',' or an
+# expression operator other than ++ / --). Hotkeys and hotstrings are ruled
+# out before this is asked; '/*' / '*/' are comment markers, not operators.
+_SNIP_CONT_LINE_RE = re.compile(
+    r"^(?:,|\.(?![.=])|\+(?!\+)|-(?!-)|\*(?!/)|/(?!\*)|&&|\|\||\?\?|\?|:(?!:)|==?|<|>|!=|"
+    r"~=|&|\||\^|(?:and|or|is|in|contains)\b)", re.IGNORECASE)
+_SNIP_ASSIGN_RE = re.compile(
+    r"(?<![\w.%])([A-Za-z_]\w*)[ \t]*(?::=|\+=|-=|\*=|//=|/=|\.=|\|=|&=|\^=|>>>=|>>=|<<=|\?\?=)")
+_SNIP_MAX_NAMES = 200       # functions / classes / unset globals listed in the reply
+
+
+def _ahk_scan(code: str, quote: str = "") -> tuple[int, str, int]:
+    """(bracket depth change, quote still open at the end, '{' opened) for
+    one line of AutoHotkey code: quotes with '`' escapes, a ';' comment at
+    the start or after whitespace ends the line. `quote` is a string carried
+    open from the line above (it continues into a continuation section)."""
+    depth = opened = 0
+    j = 0
+    while j < len(code):
+        ch = code[j]
+        if quote:
+            if ch == "`":
+                j += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == ";" and (j == 0 or code[j - 1] in " \t"):
+            break
+        elif ch in "([{":
+            depth += 1
+            opened += ch == "{"
+        elif ch in ")]}":
+            depth -= 1
+        j += 1
+    return depth, quote, opened
+
+
+def _ahk_code_only(code: str) -> str:
+    """One line with its quoted strings emptied and its comment cut — what
+    the assignment scan reads, so a ':=' inside a string never counts."""
+    out, quote, j = [], "", 0
+    while j < len(code):
+        ch = code[j]
+        if quote:
+            if ch == "`":
+                j += 2
+                continue
+            if ch == quote:
+                quote = ""
+                out.append(ch)
+        elif ch in "\"'":
+            quote = ch
+            out.append(ch)
+        elif ch == ";" and (j == 0 or code[j - 1] in " \t"):
+            break
+        else:
+            out.append(ch)
+        j += 1
+    return "".join(out)
+
+
+def _ahk_is_cont_section(line: str) -> bool:
+    """A continuation section opens with a line starting '(' that has no ')'
+    on it (a line like '(a + b).Call()' is an expression)."""
+    s = line.strip()
+    return s.startswith("(") and ")" not in s
+
+
+def _ahk_is_hotkey_line(s: str) -> bool:
+    return bool(_SNIP_HOTSTRING_RE.match(s) or
+                (not s.startswith(":") and _SNIP_HOTKEY_RE.match(s)))
+
+
+def _ahk_next_code_line(lines: list, k: int) -> int:
+    """Index of the first line after k that isn't blank or a ';' comment, or -1."""
+    for j in range(k + 1, len(lines)):
+        s = lines[j].strip()
+        if s and not s.startswith(";"):
+            return j
+    return -1
+
+
+def _ahk_def_kind(lines: list, i: int):
+    """(kind, last line, code after the parameter list) when lines[i] starts
+    a function definition — kind 'braced' or 'arrow' — else None (a call).
+    The parameter list may wrap; the '{' may sit on a later line."""
+    m = _SNIP_DEF_START_RE.match(lines[i])
+    if not m or m.group(1).lower() in _AHK_KEYWORDS:
+        return None
+    depth, quote, k = 0, "", i
+    line = lines[i].rstrip("\r")
+    j = m.end() - 1
+    while True:
+        if j >= len(line):
+            if quote or k - i >= _DEF_MAX_SIG_LINES or k + 1 >= len(lines):
+                return None
+            k += 1
+            line, j = lines[k].rstrip("\r"), 0
+            continue
+        ch = line[j]
+        if quote:
+            if ch == "`":
+                j += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == ";" and (j == 0 or line[j - 1] in " \t"):
+            j = len(line)
+            continue
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    rest = line[j + 1:]
+    head = _ahk_strip_comment(rest).strip()
+    if head.startswith("=>"):
+        return "arrow", k, rest
+    if head.startswith("{"):
+        return "braced", k, rest
+    if head == "":
+        nxt = _ahk_next_code_line(lines, k)
+        if nxt >= 0 and lines[nxt].strip().startswith("{"):
+            return "braced", k, rest
+    return None
+
+
+def _ahk_definitions_only(text: str) -> dict:
+    """A module's source with ONLY its function and class definitions left:
+    every other line — top-level statements (blocks included), hotkeys and
+    hotstrings with their blocks, labels, directives — becomes an empty line,
+    so the copy has the same line numbers as the file. #Include lines are
+    left as written and listed in `includes` (line indexes) for the caller
+    to resolve. Returns {lines, functions [(name, line)], classes [(name,
+    line)], includes, dropped (code lines blanked), assigned (names
+    top-level code assigns, in order)}."""
+    lines = text.split("\n")
+    n = len(lines)
+    out = [""] * n
+    functions: list = []
+    classes: list = []
+    includes: list = []
+    assigned: list = []
+    comment_idx: set = set()
+    cont_idx: set = set()  # continuation-section lines (opener, text, closer)
+    hotkey_idx: set = set()    # hotkey / hotstring lines (their '::' part)
+    mode = None            # None (between statements) | "def" | "top"
+    top_kind = ""          # "stmt" | "hotkey" (a hotkey's block is a function: locals)
+    depth, quote = 0, ""
+    in_block = in_cont = False
+    awaiting = False       # a definition whose '{' is still to come
+    arrow = False
+    need_more = False      # 'F() =>' with its expression on the next code line
+    hotkey_pending = False
+
+    def note_assignments(code: str) -> None:
+        c = _ahk_code_only(code)
+        g = re.match(r"^[ \t]*global[ \t]+(.*)$", c, re.IGNORECASE)
+        names = []
+        if g:
+            names += re.findall(r"(?:^|,)[ \t]*([A-Za-z_]\w*)", g.group(1))
+        names += _SNIP_ASSIGN_RE.findall(c)
+        f = re.match(r"^[ \t]*for[ \t]+([\w \t,]+?)[ \t]+in\b", c, re.IGNORECASE)
+        if f:
+            names += re.findall(r"[A-Za-z_]\w*", f.group(1))
+        for nm in names:
+            if nm.lower() not in _AHK_KEYWORDS and nm not in assigned:
+                assigned.append(nm)
+
+    def ends_here(i: int) -> bool:
+        nonlocal quote, depth, awaiting, need_more
+        if need_more:
+            return False
+        nxt = _ahk_next_code_line(lines, i)
+        nline = lines[nxt] if nxt >= 0 else ""
+        if quote:
+            if nxt >= 0 and _ahk_is_cont_section(nline):
+                return False            # the string goes on in a continuation section
+            quote = ""                  # unterminated: AutoHotkey refuses it anyway
+        if awaiting:
+            if nxt >= 0 and nline.strip().startswith("{"):
+                return False
+            awaiting = False            # no '{' coming after all: don't swallow the file
+        if depth > 0:
+            return False
+        depth = 0
+        if mode == "def" and not arrow:
+            return True                 # a braced body closed
+        if nxt >= 0:
+            s = nline.strip()
+            if _ahk_is_cont_section(nline):
+                return False
+            if not _ahk_is_hotkey_line(s) and _SNIP_CONT_LINE_RE.match(s):
+                return False
+        return True
+
+    i = 0
+    while i < n:
+        raw = lines[i]
+        line = raw.rstrip("\r")
+        s = line.strip()
+        keep = mode == "def"
+        if in_block:
+            if keep:
+                out[i] = raw
+            comment_idx.add(i)
+            if s.startswith("*/") or s.endswith("*/"):
+                in_block = False
+            i += 1
+            continue
+        if in_cont:
+            if keep:
+                out[i] = raw
+            cont_idx.add(i)
+            if s.startswith(")"):
+                in_cont = False
+                d, quote, opened = _ahk_scan(line[line.index(")") + 1:], quote)
+                depth += d
+                if opened:
+                    awaiting = False
+                if mode and ends_here(i):
+                    mode, arrow = None, False
+            i += 1
+            continue
+        if not quote and s.startswith("/*"):
+            if keep:
+                out[i] = raw
+            comment_idx.add(i)
+            in_block = not (len(s) >= 4 and s.endswith("*/"))
+            i += 1
+            continue
+        if _ahk_is_cont_section(line):
+            if keep:
+                out[i] = raw
+            cont_idx.add(i)
+            in_cont = True
+            if mode is None:            # a section with nothing before it (a hotstring's text)
+                mode, top_kind = "top", "stmt"
+                hotkey_pending = False
+            i += 1
+            continue
+
+        if mode is None:
+            if not s or s.startswith(";"):
+                i += 1
+                continue
+            hs = _SNIP_HOTSTRING_RE.match(line)
+            hk = None if s.startswith(":") else _SNIP_HOTKEY_RE.match(line)
+            if hs or hk:
+                hotkey_idx.add(i)
+                if hs:
+                    act = _ahk_strip_comment(hs.group(3)).strip()
+                    literal = "x" not in hs.group(1).lower()   # replacement TEXT, not code
+                else:
+                    act = _ahk_strip_comment(hk.group(2)).strip()
+                    literal = bool(re.fullmatch(r"[^\s(\"'{]+", act))   # a remap: a::b
+                if act == "":
+                    hotkey_pending = True       # its '{' block (or a stacked hotkey) follows
+                    i += 1
+                    continue
+                hotkey_pending = False
+                if literal:
+                    i += 1
+                    continue
+                mode, top_kind = "top", "hotkey"
+                depth, quote, _o = _ahk_scan(act, "")
+                if ends_here(i):
+                    mode = None
+                i += 1
+                continue
+            dm = _SNIP_DIRECTIVE_RE.match(line)
+            if dm:
+                hotkey_pending = False
+                if dm.group(1).lower() in ("include", "includeagain"):
+                    out[i] = raw
+                    includes.append(i)
+                i += 1
+                continue
+            if _SNIP_LABEL_RE.match(line) and not s.lower().startswith(("default:", "case ")):
+                i += 1
+                continue
+            cm = _SNIP_CLASS_RE.match(line)
+            if cm:
+                hotkey_pending = False
+                classes.append((cm.group(1), i + 1))
+                mode, arrow, awaiting = "def", False, True
+                depth, quote, opened = _ahk_scan(line, "")
+                if opened:
+                    awaiting = False
+                out[i] = raw
+                if ends_here(i):
+                    mode = None
+                i += 1
+                continue
+            dk = _ahk_def_kind(lines, i)
+            if dk:
+                hotkey_pending = False
+                kind, last, rest = dk
+                functions.append((_SNIP_DEF_START_RE.match(line).group(1), i + 1))
+                for j in range(i, last + 1):
+                    out[j] = lines[j]
+                mode, arrow = "def", kind == "arrow"
+                body = rest.lstrip()
+                if arrow:
+                    body = body[2:]
+                depth, quote, opened = _ahk_scan(body, "")
+                awaiting = (not arrow) and not opened
+                # 'F(x) =>' with the expression on the next line: that line
+                # belongs to the definition whatever it starts with.
+                need_more = arrow and not _ahk_strip_comment(body).strip()
+                if ends_here(last):
+                    mode, arrow = None, False
+                i = last + 1
+                continue
+            # Anything else is a top-level statement: blanked to its end.
+            mode = "top"
+            top_kind = "hotkey" if hotkey_pending and s.startswith("{") else "stmt"
+            hotkey_pending = False
+            if top_kind == "stmt":
+                note_assignments(line)
+            depth, quote, opened = _ahk_scan(line, "")
+            if ends_here(i):
+                mode = None
+            i += 1
+            continue
+
+        # Inside a definition (kept) or a top-level statement (blanked).
+        if keep:
+            out[i] = raw
+        elif top_kind == "stmt" and s and not s.startswith(";"):
+            note_assignments(line)
+        if s and not s.startswith(";"):
+            d, quote, opened = _ahk_scan(line, quote)
+            depth += d
+            need_more = False
+            if opened:
+                awaiting = False
+            if ends_here(i):
+                mode, arrow = None, False
+        i += 1
+
+    defined = {nm.lower() for nm, _ in functions + classes}
+    dropped = sum(1 for j in range(n)
+                  if not out[j] and lines[j].strip() and j not in comment_idx
+                  and not lines[j].strip().startswith(";"))
+    return {"lines": out, "functions": functions, "classes": classes,
+            "includes": includes, "dropped": dropped,
+            "assigned": [a for a in assigned if a.lower() not in defined],
+            "comment_idx": comment_idx, "cont_idx": cont_idx, "hotkey_idx": hotkey_idx}
+
+
+def _path_key(p) -> str:
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+def _include_chain_files(roots) -> set:
+    """Every file the given scripts pull in through #Include, themselves
+    included, as _path_key()s."""
+    seen: set = set()
+    todo = [Path(r) for r in roots]
+    while todo and len(seen) < 64:
+        f = todo.pop(0)
+        k = _path_key(f)
+        if k in seen:
+            continue
+        seen.add(k)
+        for spec in _ahk_file_defs(f)[1]:
+            t = _resolve_include(spec, f, f)
+            if t is not None:
+                todo.append(t)
+    return seen
+
+
+# The script's own built-in variables. In the snippet they would name the
+# snippet's temp files, so a module function that builds a path from them
+# (a client-folder list next to the body, a tools\*.py) quietly read the
+# wrong folder, and a helper #Including "%A_ScriptDir%\..." failed to load
+# (review of the 2026-10-14 build, measured). The copies get the REAL
+# values instead: as string literals in code, as text in a directive.
+_SCRIPT_VARS = ("A_ScriptDir", "A_ScriptFullPath", "A_ScriptName", "A_LineFile")
+_SCRIPT_VAR_RE = re.compile(r"(?<![\w.&%])A_(?:ScriptDir|ScriptFullPath|ScriptName|LineFile)\b",
+                            re.IGNORECASE)
+_SCRIPT_VAR_PCT_RE = re.compile(r"%(A_(?:ScriptDir|ScriptFullPath|ScriptName|LineFile))%",
+                                re.IGNORECASE)
+_SNIP_WORD_RE = re.compile(r"\w+")
+
+
+def _ahk_subst_script_vars(line: str, values: dict) -> tuple[str, list]:
+    """(line, names replaced) with every A_ScriptDir-type variable in CODE
+    replaced by values[name.lower()] (an AutoHotkey string literal). Quoted
+    strings, a ';' comment, a property (obj.A_ScriptDir), a reference
+    (&A_ScriptDir), a double-deref (%...%) and an object-literal key
+    ({A_ScriptDir: 1}) are left alone."""
+    out, names, quote, j, n = [], [], "", 0, len(line)
+    while j < n:
+        ch = line[j]
+        if quote:
+            if ch == "`":
+                out.append(line[j:j + 2])
+                j += 2
+                continue
+            if ch == quote:
+                quote = ""
+            out.append(ch)
+            j += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch == ";" and (j == 0 or line[j - 1] in " \t"):
+            out.append(line[j:])
+            break
+        elif ch.isalnum() or ch == "_":
+            w = _SNIP_WORD_RE.match(line, j).group(0)
+            lw = w.lower()
+            if lw in values and not (j and line[j - 1] in ".&%"):
+                prev = line[:j].rstrip()[-1:]
+                nxt = line[j + len(w):].lstrip()
+                if not (prev in ("{", ",") and nxt.startswith(":") and not nxt.startswith(":=")):
+                    out.append(values[lw])
+                    names.append(w)
+                    j += len(w)
+                    continue
+            out.append(w)
+            j += len(w)
+            continue
+        out.append(ch)
+        j += 1
+    return "".join(out), names
+
+
+def _ahk_script_var_mentions(line: str) -> int:
+    return len(_SCRIPT_VAR_RE.findall(_ahk_code_only(line)))
+
+
+def _ahk_static_inits(lines: list, skip: set) -> list:
+    """[(class, line)] for every class-level `static x := ...` / `static
+    __New(` in kept class code — AutoHotkey runs those when the script LOADS
+    (measured by the 2026-10-14 review: an unreferenced class's static
+    initializer still ran), so 'definitions only' doesn't mean 'nothing
+    ran'. Static LOCALS inside a method run at its first call and aren't
+    listed."""
+    found, stack, names = [], [], []
+    pending = ""
+    for i, raw in enumerate(lines):
+        if not raw.strip() or i in skip:
+            continue
+        code = _ahk_code_only(raw.rstrip("\r"))
+        cm = _SNIP_CLASS_RE.match(code)
+        if stack and stack[-1] == "class" and re.match(
+                r"^[ \t]*static[ \t]+(?:[A-Za-z_]\w*[ \t]*:=|__New[ \t]*\()", code, re.I):
+            found.append((names[-1] if names else "?", i + 1))
+        if cm:
+            pending = cm.group(1)
+        for ch in code:
+            if ch == "{":
+                if pending:
+                    stack.append("class")
+                    names.append(pending)
+                    pending = ""
+                else:
+                    stack.append("other")
+            elif ch == "}" and stack:
+                if stack.pop() == "class" and names:
+                    names.pop()
+    return found
+
+
+def _snip_include_spec(raw: str, cur: Path, inc_dir: Path, ctx: dict) -> dict:
+    """One #Include line resolved the way AutoHotkey would for the REAL
+    script: {kind: 'lib' | 'unresolved' | 'raw' | 'dir' | 'file', path, again,
+    star_i, spec, script_var}. %A_LineFile% is `cur`; %A_ScriptDir% /
+    %A_ScriptFullPath% / %A_ScriptName% the real script's; a relative path
+    is taken from inc_dir. Another variable (%A_AppData%...) means the same
+    in the snippet, so that line is kept as written ('raw')."""
+    line = raw.rstrip("\r")
+    m = _AHK_INCLUDE_RE.match(line)
+    if not m:
+        return {"kind": "unresolved", "spec": line.strip()}
+    spec = m.group(1).strip()
+    r = {"spec": spec,
+         "again": bool(re.match(r"^[ \t]*#IncludeAgain\b", line, re.IGNORECASE)),
+         "star_i": bool(re.search(r"#Include(?:Again)?[ \t]+\*i[ \t]", line, re.IGNORECASE)),
+         "script_var": bool(re.search(r"%A_Script(?:Dir|FullPath|Name)%", spec, re.I))}
+    if spec.startswith("<"):                        # a function library: AutoHotkey finds it
+        return dict(r, kind="lib")
+    vals = {"a_linefile": str(cur), "a_scriptdir": str(ctx["script_dir"]),
+            "a_scriptfullpath": str(ctx["script_full"]),
+            "a_scriptname": ctx["script_full"].name}
+    s = _SCRIPT_VAR_PCT_RE.sub(lambda mm: vals[mm.group(1).lower()], spec)
+    if "%" in s:
+        return dict(r, kind="raw", resolved=s)
+    p = Path(s)
+    if not p.is_absolute():
+        p = inc_dir / p
+    p = Path(os.path.normpath(str(p)))
+    return dict(r, kind="dir" if p.is_dir() else "file", path=p)
+
+
+def _snip_include_line(r: dict, target: Path) -> str:
+    return (f"#Include{'Again' if r['again'] else ''} {'*i ' if r['star_i'] else ''}"
+            f"\"{target}\"")
+
+
+def _snip_helper(p: Path, ctx: dict, depth: int = 1) -> Path:
+    """The file to #Include for a helper the module includes: the helper
+    itself, or — when it names the script (an #Include or a directive with
+    %A_ScriptDir%, code using A_ScriptDir / A_ScriptFullPath / A_ScriptName)
+    or includes a file that had to be copied — a copy beside the module's
+    with the real values written in (its A_LineFile too, since the copy
+    moved). Included WHOLE either way: a helper's top-level code runs."""
+    key = _path_key(p)
+    if key in ctx["memo"]:
+        return ctx["memo"][key]
+    ctx["memo"][key] = p                            # a cycle includes the original
+    if depth > 8 or not p.is_file():
+        return p
+    try:
+        text = _read_text_any(p)
+    except OSError:
+        return p
+    if text.startswith("﻿"):
+        text = text[1:]
+    parsed = _ahk_definitions_only(text)
+    src = text.split("\n")
+    new = list(src)
+    needs = False
+    inc_dir = p.parent
+    incs = set(parsed["includes"])
+    for idx in parsed["includes"]:
+        r = _snip_include_spec(src[idx], p, inc_dir, ctx)
+        if r["kind"] == "dir":
+            inc_dir = r["path"]
+            new[idx] = ""
+            needs = needs or r["script_var"]
+        elif r["kind"] == "raw" and r["script_var"]:
+            new[idx] = _snip_include_line(r, r["resolved"])
+            needs = True
+        elif r["kind"] == "file":
+            if _path_key(r["path"]) in ctx["prelude"]:
+                new[idx] = ""
+            else:
+                t = _snip_helper(r["path"], ctx, depth + 1)
+                new[idx] = _snip_include_line(r, t)
+                needs = needs or r["script_var"] or t != r["path"]
+    vals = dict(ctx["values"], a_linefile=ahk_str_lit(str(p)))
+    pct = dict(ctx["pct"], a_linefile=str(p))
+    replaced, unreplaced = [], []
+    skip = parsed["comment_idx"] | parsed["cont_idx"] | parsed["hotkey_idx"]
+    for i, line in enumerate(src):
+        if i in incs or not line.strip():
+            continue
+        if i in skip:
+            if i not in parsed["comment_idx"] and _SCRIPT_VAR_RE.search(line):
+                unreplaced.append(i + 1)
+            continue
+        cur = line
+        if line.lstrip().startswith("#"):
+            cur = _SCRIPT_VAR_PCT_RE.sub(lambda mm: pct[mm.group(1).lower()], cur)
+            if re.search(r"%A_Script(?:Dir|FullPath|Name)%", line, re.I):
+                needs = True
+        cur, names = _ahk_subst_script_vars(cur, vals)
+        if cur != line:
+            new[i] = cur
+            replaced.append(i + 1)
+            needs = needs or any(nm.lower() != "a_linefile" for nm in names)
+    rel = _vk_rel(p)
+    ctx["not_replaced"] += [f"{rel} line {n}" for n in unreplaced]
+    if not needs:
+        return p
+    ctx["replaced"] += [f"{rel} line {n}" for n in replaced]
+    copy = ctx["copy_dir"] / f"inc{len(ctx['copies']) + 1}" / p.name
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    copy.write_text("\n".join(new), encoding="utf-8-sig", newline="")
+    ctx["memo"][key] = copy
+    ctx["copies"].append((copy, p))
+    ctx["rewritten"].append(rel)
+    return copy
+
+
+def _snippet_module_copy(name: str, dest: Path) -> tuple[Path, Path, dict, list]:
+    """(copy, real file, report, [(helper copy, real helper)]) for
+    run_ahk_snippet's include_module: the
+    module's body (isolated) or module file (in-process) reduced to its
+    definitions by _ahk_definitions_only, written into `dest` under the real
+    file's name. Its #Include lines are made absolute — %A_ScriptDir% is the
+    body's folder (VoiceKit's for an in-process module, whose script is
+    VoiceKit.ahk), %A_LineFile% the file itself, a relative path is taken
+    from the file's folder (measured 2026-10-14: AutoHotkey 2.0.26 resolves a
+    nested relative #Include from the INCLUDING file's folder) or from the
+    folder a directory #Include set — and one the snippet prelude already
+    includes is dropped (AutoHotkey dedupes two spellings of one path, also
+    measured, but a junction or 8.3 name would not dedupe: two copies of
+    _Common.ahk would define everything twice). A_ScriptDir / A_ScriptFullPath
+    / A_ScriptName / A_LineFile in the kept code get the REAL script's values
+    (_ahk_subst_script_vars), and an included helper that names the script is
+    included as a rewritten copy (_snip_helper)."""
+    phrase, base, module = _require_module(name, "included")
+    body = REPO_ROOT / _body_rel(base)
+    isolated = body.exists()
+    src = body if isolated else module
+    # The name as it is on disk: 'IncProbeZz' typed as one word comes back
+    # from clean_phrase as 'Incprobezz', and NTFS opens it either way — but
+    # an error report should name the file the way the user sees it.
+    try:
+        src = next((src.parent / f for f in os.listdir(src.parent)
+                    if f.lower() == src.name.lower()), src)
+    except OSError:
+        pass
+    text = _read_text_any(src)
+    if text.startswith("﻿"):
+        text = text[1:]
+    parsed = _ahk_definitions_only(text)
+    lines = parsed["lines"]
+    prelude = _include_chain_files([REPO_ROOT / "lib" / f for f in
+                                    ("_Common.ahk", "Browser.ahk", "ExplorerSel.ahk")])
+    script_full = src if isolated else REPO_ROOT / "VoiceKit.ahk"
+    copy_dir = dest / "module"
+    copy_dir.mkdir(parents=True, exist_ok=True)
+    pct = {"a_scriptdir": str(script_full.parent), "a_scriptfullpath": str(script_full),
+           "a_scriptname": script_full.name}
+    ctx = {"script_dir": script_full.parent, "script_full": script_full, "prelude": prelude,
+           "copy_dir": copy_dir, "memo": {}, "copies": [], "rewritten": [], "replaced": [],
+           "not_replaced": [], "pct": pct,
+           "values": {k: ahk_str_lit(v) for k, v in pct.items()}}
+    inc_dir = src.parent
+    already, kept, unresolved = [], [], []
+    for idx in parsed["includes"]:
+        r = _snip_include_spec(lines[idx], src, inc_dir, ctx)
+        if r["kind"] == "unresolved":
+            lines[idx] = ""
+            unresolved.append(f"line {idx + 1}")
+        elif r["kind"] in ("lib", "raw"):           # AutoHotkey resolves these the same here
+            if r["kind"] == "raw" and r["script_var"]:
+                lines[idx] = _snip_include_line(r, r["resolved"])
+            kept.append(r["spec"])
+        elif r["kind"] == "dir":                    # sets the folder later includes use
+            inc_dir = r["path"]
+            lines[idx] = ""
+        elif _path_key(r["path"]) in prelude:
+            lines[idx] = ""
+            already.append(_vk_rel(r["path"]))
+        else:
+            lines[idx] = _snip_include_line(r, _snip_helper(r["path"], ctx))
+            kept.append(_vk_rel(r["path"]))
+    # The module's own code: A_ScriptDir & co. as the real script's values.
+    vals = dict(ctx["values"], a_linefile=ahk_str_lit(str(src)))
+    incs = set(parsed["includes"])
+    rel = _vk_rel(src)
+    mod_replaced, mod_not = [], []
+    for i, line in enumerate(lines):
+        if not line.strip() or i in incs or i in parsed["comment_idx"]:
+            continue
+        if i in parsed["cont_idx"]:
+            if _SCRIPT_VAR_RE.search(line):
+                mod_not.append(f"{rel} line {i + 1}")
+            continue
+        new, names = _ahk_subst_script_vars(line, vals)
+        if names:
+            lines[i] = new
+            mod_replaced.append(f"{rel} line {i + 1}")
+        if _ahk_script_var_mentions(line) > len(names):
+            mod_not.append(f"{rel} line {i + 1}")
+    statics = _ahk_static_inits(lines, parsed["comment_idx"] | parsed["cont_idx"])
+    copy = copy_dir / src.name
+    copy.write_text("\n".join(lines), encoding="utf-8-sig", newline="")
+    fns = [nm for nm, _ in parsed["functions"]]
+    cls = [nm for nm, _ in parsed["classes"]]
+    unset = parsed["assigned"]
+    rep = {"name": phrase, "base": base, "file": str(src), "isolated": isolated,
+           "functions": fns[:_SNIP_MAX_NAMES], "classes": cls[:_SNIP_MAX_NAMES],
+           "top_level_lines_dropped": parsed["dropped"],
+           "unset_globals": unset[:_SNIP_MAX_NAMES]}
+    for key, full in (("functions", fns), ("classes", cls), ("unset_globals", unset)):
+        if len(full) > _SNIP_MAX_NAMES:
+            rep[f"{key}_more"] = len(full) - _SNIP_MAX_NAMES
+    if already:
+        rep["includes_already_in_snippet"] = already
+    if kept:
+        rep["includes"] = kept
+    if unresolved:
+        rep["includes_dropped"] = unresolved
+    if ctx["rewritten"]:
+        rep["includes_rewritten"] = ctx["rewritten"]
+    replaced = mod_replaced + ctx["replaced"]
+    not_replaced = mod_not + ctx["not_replaced"]
+    for key, full in (("script_vars_replaced", replaced),
+                      ("script_vars_not_replaced", not_replaced)):
+        if full:
+            rep[key] = full[:50]
+            if len(full) > 50:
+                rep[f"{key}_more"] = len(full) - 50
+    if statics:
+        rep["static_initializers"] = [f"{c} line {ln}" for c, ln in statics][:50]
+    note = (f"Only the definitions of {src.name} were included ({len(fns)} function(s), "
+            f"{len(cls)} class(es)): its {parsed['dropped']} line(s) of top-level code — "
+            f"startup statements, hotkeys/hotstrings and their blocks, labels, directives — "
+            f"became blank lines, so error line numbers are the real file's and its startup "
+            f"statements didn't run.")
+    if statics:
+        note += (" Class static initializers DO run when the script loads "
+                 "(static_initializers) — they belong to the class.")
+    if unset:
+        note += (" Globals its top-level code assigns are UNSET here (unset_globals): "
+                 "assign the ones a function reads at the top of your snippet first.")
+    if kept:
+        note += (" Files it #Includes (includes) are included whole — their own "
+                 "top-level code runs.")
+    if replaced:
+        note += (f" A_ScriptDir / A_ScriptFullPath / A_ScriptName / A_LineFile in its code "
+                 f"(script_vars_replaced) were given the real {'body' if isolated else 'script (VoiceKit.ahk)'}'s "
+                 f"values, so a path built from them points where the real one does — a "
+                 f"function that writes beside the body writes THERE, and an error's quoted "
+                 f"line shows the path in place of the name.")
+    if ctx["rewritten"]:
+        note += (" Included files that use those variables were copied with the real "
+                 "values written in (includes_rewritten); errors still name the real files.")
+    if not_replaced:
+        note += (" Where they couldn't be replaced (script_vars_not_replaced: a "
+                 "continuation section, a hotkey line, a property or object key) they name "
+                 "the snippet's temp copy.")
+    note += (" A_WorkingDir is the snippet's temp folder, and VoiceKit's own library "
+             "functions see the snippet, not the body, as the running script.")
+    if unresolved:
+        note += (" Some #Include lines couldn't be resolved and were left out "
+                 "(includes_dropped).")
+    if not isolated:
+        note += (" It runs inside VoiceKit (isolate=False): names it uses from "
+                 "lib\\Theme.ahk or other modules aren't here.")
+    if not fns and not cls:
+        note += " It defines no functions or classes, so nothing of it is callable."
+    rep["note"] = note
+    return copy, src, rep, ctx["copies"]
+
+
 # The prelude every snippet runs behind. Placeholders (__OUT__ / __ERR__ /
 # __PRELUDE_LINES__) are substituted per run — none of them changes the line
 # count, so __PRELUDE_LINES__ can be computed from this very text.
@@ -8558,7 +10462,7 @@ _SNIPPET_PRELUDE = (
 )
 
 
-def run_ahk_snippet(code: str, timeout_s: int = 15) -> dict:
+def run_ahk_snippet(code: str, timeout_s: int = 15, include_module: str | None = None) -> dict:
     """Run a one-off AutoHotkey v2 snippet in its own throwaway process.
 
     The Tab Probe case from the scrape feedback: a 25-second diagnostic
@@ -8590,7 +10494,17 @@ def run_ahk_snippet(code: str, timeout_s: int = 15) -> dict:
     Privacy tokens (<dir#..>/<file#..>, WP9) in the code are expanded to the
     real names locally, but only inside quoted string literals (escaped for
     AHK; that literal's %USERPROFILE% / %TEMP% expand too) — a token
-    anywhere else is refused. The code stays in the temp folder only."""
+    anywhere else is refused. The code stays in the temp folder only.
+
+    include_module (2026-10-14 feedback): a hotkey module's DEFINITIONS are
+    included too — the isolated body, or the in-process module file —
+    reduced by _snippet_module_copy to its functions and classes, line for
+    line, so a function can be tried without its startup code running. There
+    is no whole-file mode on purpose: that would run the automation itself.
+    The reply's `included_module` says what came in, which globals are unset
+    and which class static initializers still ran; A_ScriptDir & co. in the
+    module's code are the real body's; an error inside the module names the
+    REAL file and line."""
     if not (code or "").strip():
         raise VoiceKitError("No code to run.")
     tokens = _input_tokens(code)          # list_processes masks them later too
@@ -8603,8 +10517,18 @@ def run_ahk_snippet(code: str, timeout_s: int = 15) -> dict:
         out_file = Path(d) / "snippet-out.txt"
         err_file = Path(d) / "snippet-err.txt"
         script = Path(d) / "snippet.ahk"
-        n_prelude = _SNIPPET_PRELUDE.count("\n")
-        prelude = (_SNIPPET_PRELUDE
+        template = _SNIPPET_PRELUDE
+        mod_copy = mod_src = None
+        mod_report: dict = {}
+        copies: list = []
+        if (include_module or "").strip():
+            mod_copy, mod_src, mod_report, copies = _snippet_module_copy(include_module,
+                                                                         Path(d))
+            copies = [(mod_copy, mod_src)] + copies
+            # Part of the prelude: the snippet's own line numbers stay its own.
+            template += f'#Include "{mod_copy}"\n'
+        n_prelude = template.count("\n")
+        prelude = (template
                    .replace("__COMMON__", str(REPO_ROOT / "lib" / "_Common.ahk"))
                    .replace("__BROWSER__", str(REPO_ROOT / "lib" / "Browser.ahk"))
                    .replace("__EXPLORERSEL__", str(REPO_ROOT / "lib" / "ExplorerSel.ahk"))
@@ -8657,8 +10581,15 @@ def run_ahk_snippet(code: str, timeout_s: int = 15) -> dict:
             # The throwaway file's full temp path is noise (it is gone when
             # this returns) and carries the Windows user name.
             errors = errors.replace(str(script), script.name)
+        for c_path, c_real in copies:
+            # A copy has the real file's line numbers: an error in it is
+            # reported against the REAL file, which is the one to edit.
+            errors = errors.replace(str(c_path), str(c_real))
+            output = output.replace(str(c_path), str(c_real))
         result = {"exit_code": exit_code, "output": output, "errors": errors,
                   "timed_out": timed_out}
+        if mod_report:
+            result["included_module"] = mod_report
         if r["killed"]:
             result["killed"] = r["killed"]
         if r["left_running"]:

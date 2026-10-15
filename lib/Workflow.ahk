@@ -1931,8 +1931,9 @@ WfUiaFieldValue(hwnd, name) {
 ;     OR by the text before it — `after "Insurance"` (WfFillAfterFind):
 ;     the label then never has to match the box's own name.
 ;  2. Refuses a DISABLED box, before anything is typed.
-;  3. CLICKS it for real (UiaClickEl: scroll-into-view rescue, fail
-;     loudly with no rectangle). Only when there is nowhere to click
+;  3. CLICKS it for real (UiaClickEl: only on its visible part, scroll-
+;     into-view rescue, refuses when hidden or covered). Only when there
+;     is nowhere visible to click (never when something covers it)
 ;     does it set the value through UIA's ValuePattern instead — a
 ;     rescue, not the default: a set skips the app's own keyboard and
 ;     validation handlers, which matters in form software.
@@ -2137,19 +2138,27 @@ WfFillUia(el, value, box, r) {
     if !UiaEnabled(el)
         return (r.err := "The " box " is disabled — nothing was typed.", r)
     pw := UiaIsPassword(el)
-    if UiaClickEl(el, WfClickJitter(), "Left", 1, &why) {
+    ; why never names other windows or programs (safe for the run record);
+    ; detail does, so it goes to the LOCAL popup only.
+    if UiaClickEl(el, WfClickJitter(), "Left", 1, &why, &cdetail) {
         gate := WfFillFocusGate(el)
         if !gate.ok
             return WfFillGateFail(box, gate.desc, r)
         WfFillType(value)
-    } else if UiaSetValue(el, value) {
+    } else if (InStr(why, "nowhere visible to click") = 1 && UiaSetValue(el, value)) {
         ; Nowhere to click (virtualized / collapsed) but the box takes a value
         ; directly: set it, and let the readback decide whether that counted.
+        ; Only for THAT refusal: a box something else COVERS ("something
+        ; else is in the way" — a pinned header, a dialog) is a page the user
+        ; can't see the box on, and setting it behind their back would hide
+        ; the very problem the refusal names (2026-10-14).
         r.notes.Push("the " box " had nowhere to click, so its value was set "
             . "directly through UI Automation — no keystrokes reached the app")
         Sleep(200)
-    } else
+    } else {
+        r.detail := cdetail
         return (r.err := "Couldn't click the " box ": " why, r)
+    }
     if pw {
         r.notes.Push("the " box " is a password box — filled, not verified (a password box can't be read back)")
         Sleep(150)

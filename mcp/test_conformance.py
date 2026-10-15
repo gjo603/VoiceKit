@@ -393,6 +393,118 @@ def test_dump_uia_tree_says_when_the_walk_was_cut():
         vk._run_uia_probe = orig
 
 
+def test_dump_uia_tree_root_positions_visible_only():
+    """2026-10-14 feedback: dump_uia_tree could only start from a window, so
+    one panel's subtree with positions meant a hand-rolled walk every time.
+    root_id / root_name / positions / visible_only reach the probe in its
+    argument order (window, max_depth, max_lines, name_filter, root_id,
+    root_name, positions 0|1, visible_only 0|1); the probe's root= header
+    comes back as 'root'; and the note speaks of the subtree — and never
+    calls an empty visible_only dump "not there" (offscreen elements were
+    walked, only hidden from the listing). A fake probe drives it."""
+    sent = []
+
+    def fake(header: str, tree: str = ""):
+        def run(args, timeout=30):
+            sent.append(args)
+            return header + "\n\n" + tree
+        return run
+
+    orig = vk._run_uia_probe
+    try:
+        base = ("window_title=Karbon\nvisited={v}\ncut_at_depth={c}\nbudget_hit=0\ntime_hit=0\n"
+                "lines_hit=0\nfingerprint=0badf00d\nlines={n}{root}")
+        root = '\nroot=Pane "Triage" <id=triage-panel>'
+        vk._run_uia_probe = fake(base.format(v=40, c=0, n=1, root=root),
+                                 'Pane "Triage" @10,20 300x400')
+        r = vk.dump_uia_tree("ahk_exe chrome.exe", root_id="triage-panel", positions=True,
+                             visible_only=True)
+        assert sent[-1] == ["tree", "ahk_exe chrome.exe", 8, 300, "", "triage-panel", "", 1, 1], \
+            sent[-1]
+        assert r["root"] == 'Pane "Triage" <id=triage-panel>' and "note" not in r, r
+        vk.dump_uia_tree("x", root_name="Inbox")
+        assert sent[-1][5:] == ["", "Inbox", 0, 0], sent[-1]
+        vk.dump_uia_tree("x")                     # no root: no 'root', defaults sent
+        assert sent[-1][5:] == ["", "", 0, 0], sent[-1]
+
+        # A subtree walk that matched nothing: "under <root>", not "in the tree".
+        vk._run_uia_probe = fake(base.format(v=40, c=0, n=0, root=root))
+        r = vk.dump_uia_tree("x", root_id="triage-panel", name_filter="Download")
+        assert "isn't under Pane \"Triage\" <id=triage-panel> right now" in r["note"], r["note"]
+        # visible_only with nothing listed: maybe scrolled away — never "not there".
+        r = vk.dump_uia_tree("x", root_id="triage-panel", name_filter="Download",
+                             visible_only=True)
+        assert "matched nothing VISIBLE" in r["note"] and "scrolled out of view" in r["note"], r
+        assert "isn't under" not in r["note"], r["note"]
+        r = vk.dump_uia_tree("x", root_id="triage-panel", visible_only=True)
+        assert r["note"].startswith("Nothing was listed (visible_only)"), r["note"]
+        # ...and with a cut walk, INCOMPLETE wins.
+        vk._run_uia_probe = fake(base.format(v=40, c=3, n=0, root=root))
+        r = vk.dump_uia_tree("x", root_id="triage-panel", visible_only=True)
+        assert "INCOMPLETE" in r["note"], r["note"]
+
+        # A root the probe can't find is its error= answer, raised as is.
+        vk._run_uia_probe = fake("error=No element with AutomationId 'nope' in that window: "
+                                 "no match after 3000 ms")
+        _raises(lambda: vk.dump_uia_tree("x", root_id="nope"), "AutomationId 'nope'",
+                exc=vk.VoiceKitError)
+        # A probe that ignored the root (no root= line) must not pass its
+        # whole-window dump off as the subtree.
+        vk._run_uia_probe = fake(base.format(v=40, c=0, n=1, root=""), 'Window "w"')
+        _raises(lambda: vk.dump_uia_tree("x", root_name="Inbox"), "whole window",
+                exc=vk.VoiceKitError)
+        _raises(lambda: vk.dump_uia_tree("x", root_id="a\nb"), "one line",
+                exc=vk.VoiceKitError)
+    finally:
+        vk._run_uia_probe = orig
+
+
+def test_dump_uia_tree_subtree_of_a_real_window():
+    """The same against the real probe (mcp\\uia_probe.ahk, the UIA agent's
+    side of the contract) and a throwaway window: a dump rooted at a named
+    control, with positions on every line, visible_only keeping an on-screen
+    control, and a missing root an error that names it."""
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "target.ahk"
+        target.write_text(
+            '#Requires AutoHotkey v2.0\n'
+            '#SingleInstance Off\n'
+            'g := Gui("+AlwaysOnTop", "VKConformanceUiaRoot_ZZ")\n'
+            'g.AddText("w220", "Root Label Zz")\n'
+            'g.AddButton("w220", "Root Button Zz")\n'
+            # Outside the window's own box (it is shown 260 wide): in the
+            # tree, with a rectangle, but nothing of it can be seen.
+            'g.AddButton("x600 y10 w100", "Clipped Button Zz")\n'
+            'g.Show("x0 y0 w260 h120 NoActivate")\n'
+            'SetTimer(() => ExitApp(0), -60000)\n', encoding="utf-8")
+        p = subprocess.Popen([vk.AHK_EXE, "/ErrorStdOut", str(target)])
+        try:
+            got = vk.dump_uia_tree("VKConformanceUiaRoot_ZZ", root_name="Root Button Zz",
+                                   positions=True)
+            assert "Root Button Zz" in got.get("root", ""), got
+            lines = got["tree"].split("\n")
+            assert lines and "Root Button Zz" in lines[0], got
+            assert "Root Label Zz" not in got["tree"], "a subtree dump stays in the subtree"
+            assert all(re.search(r" @(-?\d+,-?\d+ \d+x\d+|none)$", ln) for ln in lines), lines
+            # visible_only filters LINES: the clipped button is in a plain dump
+            # and gone from a visible_only one, while the walk itself — node
+            # count and fingerprint — is the same (review 2026-10-14: the old
+            # check passed with the flag ignored).
+            plain = vk.dump_uia_tree("VKConformanceUiaRoot_ZZ")
+            vis = vk.dump_uia_tree("VKConformanceUiaRoot_ZZ", visible_only=True)
+            assert "Clipped Button Zz" in plain["tree"], plain
+            assert "Root Button Zz" in vis["tree"], vis
+            assert "Clipped Button Zz" not in vis["tree"], vis
+            assert vis["nodes"] == plain["nodes"] and vis["fingerprint"] == plain["fingerprint"] \
+                and plain["fingerprint"], (plain, vis)
+            _raises(lambda: vk.dump_uia_tree("VKConformanceUiaRoot_ZZ",
+                                             root_name="No Such Root Zz"),
+                    "No Such Root Zz", exc=vk.VoiceKitError)
+        finally:
+            p.terminate()
+            p.wait(timeout=10)
+
+
 def test_uia_probe_focus_report_parses():
     """inspect_focus returns a parseable report about the REAL desktop (it is
     read-only, so running it here is safe). Whatever happens to hold focus
@@ -1351,7 +1463,7 @@ def test_edit_hotkey_module_splices_and_rolls_back():
                                   'TrayTip("two")', 'TrayTip("two"')
             assert False, "a splice that kills the parse must be refused"
         except vk.VoiceKitError as e:
-            assert "rolled back" in str(e)
+            assert "nothing was written" in str(e), e
         assert vk.read_hotkey_module("Edit Probe Zz")["body"] == after, \
             "the file must be exactly as it was before the bad edit"
 
@@ -1453,6 +1565,413 @@ def test_update_hotkey_module_replaces_verbatim_and_guards():
         assert 'MsgBox("cc")' in vk.read_hotkey_module("Inline Upd Zz")["body"]
 
 
+def test_edit_batches_apply_together_with_one_load_check():
+    """Karbon File feedback item 4a: a change that only loads once every part
+    is in (a call plus the function it calls) used to need careful
+    sequencing — the half-way file failed its check (or hung 20 s on a
+    warning dialog). edits=[...] applies every splice to an in-memory copy,
+    then one check, one write; a failing splice names itself and changes
+    nothing; the reply's undo is replayed before it is offered."""
+    body = 'Go()\nGo() {\n    TrayTip("go")\n}'
+    call = ('TrayTip("go")', 'TrayTip("go")\n    Later(1)')
+    func = ("Go() {", "Later(x) {\n    return x\n}\nGo() {")
+    with _sandbox(reload=lambda: True) as d:
+        made = vk.create_hotkey_module("Batch Probe Zz", body)
+        assert made["voice_pairing"][-1] == vk.VOICE_PHRASE_LATER, made["voice_pairing"]
+        assert "show voice shortcuts" in vk.VOICE_PHRASE_LATER
+        before = vk.read_hotkey_module("Batch Probe Zz")["body"]
+
+        # The half-way state alone: refused FAST, with the warning text and
+        # a hint pointing at edits=[...] (it used to hang 20 s on a dialog).
+        t0 = time.monotonic()
+        e = _refused(lambda: vk.edit_hotkey_module("Batch Probe Zz", *call),
+                     "==> Warning:", "Later", "edits=[", "nothing was written")
+        assert time.monotonic() - t0 < 8, "a warning must fail the check at once"
+        assert vk.VALIDATE_BLOCKED not in e, e
+        assert vk.read_hotkey_module("Batch Probe Zz")["body"] == before
+
+        # Both together: one call, applied.
+        got = vk.edit_hotkey_module("Batch Probe Zz", edits=[
+            {"old_string": call[0], "new_string": call[1]},
+            {"old_string": func[0], "new_string": func[1]}])
+        after = vk.read_hotkey_module("Batch Probe Zz")["body"]
+        assert "Later(1)" in after and "Later(x) {" in after, after
+        assert got["edits_applied"] == 2 and got["body_sha256"] == vk._text_sha256(after)
+        # The offered undo is the reversed, swapped list — and it really undoes.
+        assert got["undo_edits"] == [{"old_string": func[1], "new_string": func[0]},
+                                     {"old_string": call[1], "new_string": call[0]}], got
+        vk.edit_hotkey_module("Batch Probe Zz", edits=got["undo_edits"])
+        assert vk.read_hotkey_module("Batch Probe Zz")["body"] == before
+
+        # A splice that misses names itself; nothing changes.
+        _refused(lambda: vk.edit_hotkey_module("Batch Probe Zz", edits=[
+            {"old_string": call[0], "new_string": call[1]},
+            {"old_string": "NoSuchText()", "new_string": "x"}]),
+            "Edit 2 of 2", "as edit 1 left it", "doesn't appear", "Nothing was changed")
+        assert vk.read_hotkey_module("Batch Probe Zz")["body"] == before
+        # Later edits see what earlier ones did: edit 2 matches edit 1's text.
+        vk.edit_hotkey_module("Batch Probe Zz", edits=[
+            {"old_string": 'TrayTip("go")', "new_string": 'TrayTip("g1")'},
+            {"old_string": 'TrayTip("g1")', "new_string": 'TrayTip("g2")'}])
+        assert 'TrayTip("g2")' in vk.read_hotkey_module("Batch Probe Zz")["body"]
+
+        # Form errors: both forms, neither, an empty list, a malformed item.
+        _refused(lambda: vk.edit_hotkey_module("Batch Probe Zz", "a", "b",
+                                               edits=[{"old_string": "a", "new_string": "b"}]),
+                 "not both")
+        _refused(lambda: vk.edit_hotkey_module("Batch Probe Zz"), "old_string and new_string")
+        _refused(lambda: vk.edit_hotkey_module("Batch Probe Zz", edits=[]), "non-empty")
+        _refused(lambda: vk.edit_hotkey_module("Batch Probe Zz", edits=[{"old_string": "x"}]),
+                 "Edit 1 of 1", "both text")
+
+        # An undo that couldn't match exactly once is not promised: a
+        # deletion (empty new_string) has nothing to find again.
+        got = vk.edit_hotkey_module("Batch Probe Zz", 'TrayTip("g2")\n', "")
+        assert "undo_edits" not in got and "No exact inverse" in got["undo"], got
+        assert got["undo"].startswith("No exact inverse")
+        got = vk.edit_hotkey_module("Batch Probe Zz", "Go()\nGo() {", "Go()\nGo() {\n    x := 1")
+        assert got["undo"] == ("Call edit_hotkey_module again with old_string and "
+                               "new_string swapped."), got
+
+        # edit_macro takes the same batch.
+        mac = d / "macros" / "BatchMacZz.ahk"
+        mac.write_bytes(b'#Requires AutoHotkey v2.0\nGo()\nGo() {\n    TrayTip("go")\n}\n')
+        _refused(lambda: vk.edit_macro("Batch Mac Zz", *call), "==> Warning:", "edits=[")
+        got = vk.edit_macro("Batch Mac Zz", edits=[
+            {"old_string": call[0], "new_string": call[1]},
+            {"old_string": func[0], "new_string": func[1]}])
+        src = vk.read_macro_source("Batch Mac Zz")["source"]
+        assert got["edits_applied"] == 2 and "Later(x) {" in src
+        assert got["source_sha256"] == vk._text_sha256(src)
+        vk.edit_macro("Batch Mac Zz", edits=got["undo_edits"])
+        assert "Later" not in vk.read_macro_source("Batch Mac Zz")["source"]
+
+
+def test_validate_fails_fast_on_a_load_warning_and_parks_its_module():
+    """Karbon File feedback item 4b: AutoHotkey v2 shows DEFAULT load
+    warnings as a dialog even under /validate, so a check of a file that
+    used a never-assigned name hung its full bound and blamed #Warn. With
+    lib\\ValidateWarnings.ahk passed by /include the warning comes back as
+    text at once and fails the check; a file with its own #Warn keeps the old
+    behaviour (its directive wins); the master's preflight parks a module
+    whose warning fails it exactly like a load error."""
+    with _sandbox() as d:
+        hk = d / "hotkeys"
+        f = d / "fx_unassigned.ahk"
+        f.write_text("#Requires AutoHotkey v2.0\nx := 1\nMsgBox(neverAssignedW)\n", encoding="utf-8")
+        t0 = time.monotonic()
+        ok, err = vk.validate_ahk(str(f))
+        assert time.monotonic() - t0 < 8, "a warning must not wait out the bound"
+        assert not ok and f"{f} (3) : ==> Warning:" in err and "neverAssignedW" in err, err
+        assert not err.startswith(vk.VALIDATE_BLOCKED), err
+        hinted = vk._explain_ahk_error(err)
+        assert "Hint:" in hinted and "edits=[" in hinted, hinted
+        # Its own #Warn decides: here, warnings off — the check passes.
+        f.write_text("#Requires AutoHotkey v2.0\n#Warn All, Off\nMsgBox(neverAssignedW)\n",
+                     encoding="utf-8")
+        assert vk.validate_ahk(str(f)) == (True, "")
+        # Load errors are unchanged (exit 2, text first).
+        f.write_text('#Requires AutoHotkey v2.0\nMsgBox("a"\n', encoding="utf-8")
+        ok, err = vk.validate_ahk(str(f))
+        assert not ok and err.startswith(f"{f} (2) : ==> "), err
+        # _error_module reads a warning line like a load error.
+        line = "C:\\VK\\hotkeys\\Foo.ahk (12) : ==> Warning: This global variable appears..."
+        assert vk._error_module(line) == "hotkeys\\Foo.ahk"
+
+        (d / "VoiceKit.ahk").write_text(
+            '#Requires AutoHotkey v2.0\n#Include "%A_ScriptDir%\\hotkeys\\_index.ahk"\n',
+            encoding="utf-8")
+        (hk / "Keep.ahk").write_text("keepProbe := 1\n", encoding="utf-8")
+        (hk / "Unassigned.ahk").write_text("unProbe := neverAssignedW2\n", encoding="utf-8")
+        (hk / "_index.ahk").write_text(
+            "#Requires AutoHotkey v2.0\n"
+            '#Include "%A_ScriptDir%\\hotkeys\\Keep.ahk"\n'
+            '#Include "%A_ScriptDir%\\hotkeys\\Unassigned.ahk"\n', encoding="utf-8")
+        reasons: dict = {}
+        t0 = time.monotonic()
+        ok, parked, err = vk.master_preflight(reasons)
+        assert ok and parked == ["hotkeys\\Unassigned.ahk"], (ok, parked, err)
+        assert time.monotonic() - t0 < 15, "parking a warning must not wait out the bound"
+        assert "==> Warning:" in reasons["hotkeys\\Unassigned.ahk"], reasons
+        txt = (hk / "_index.ahk").read_text(encoding="utf-8-sig")
+        assert '; #Include "%A_ScriptDir%\\hotkeys\\Unassigned.ahk"' in txt, txt
+        assert '\n#Include "%A_ScriptDir%\\hotkeys\\Keep.ahk"' in txt, txt
+
+
+def test_inprocess_module_checked_alone_may_call_what_the_master_defines():
+    """An in-process module (isolate=False) is load-checked ON ITS OWN, but
+    runs inside VoiceKit.ahk beside lib\\_Common.ahk — a call to Notify there
+    reads as a never-assigned variable when the file is checked alone
+    (measured on a real module). With load warnings now failing the check,
+    a warning about a name the master's include chain defines is let
+    through (the master reload checks it in context); any other name still
+    fails, at once, with the warning text."""
+    with _sandbox(reload=lambda: True) as d:
+        (d / "VoiceKit.ahk").write_text(
+            '#Requires AutoHotkey v2.0\n#Include "%A_ScriptDir%\\lib\\_Common.ahk"\n'
+            '#Include "%A_ScriptDir%\\hotkeys\\_index.ahk"\n', encoding="utf-8")
+        assert "notify" in vk._master_provided()
+        got = vk.create_hotkey_module("Inproc Notify Zz", 'Notify("hi")', isolate=False)
+        assert got["isolated"] is False, got
+        got = vk.edit_hotkey_module("Inproc Notify Zz", 'Notify("hi")',
+                                    'Notify("hi")\n    EnsureDir(A_Temp)')
+        assert got["edited"] is True
+        t0 = time.monotonic()
+        e = _refused(lambda: vk.edit_hotkey_module("Inproc Notify Zz", 'Notify("hi")',
+                                                   'Notify("hi")\n    NoSuchHelperZz(1)'),
+                     "==> Warning:", "NoSuchHelperZz", "nothing was written")
+        assert time.monotonic() - t0 < 8
+        # The Notify warning that came with it is the master's name, not the
+        # problem: left out of the text, and the Hint names the real one.
+        assert "Specifically: Notify" not in e, e
+        assert "Hint: nothing defines or assigns 'NoSuchHelperZz'" in e, e
+        cur = vk.read_hotkey_module("Inproc Notify Zz")["body"]
+        vk.update_hotkey_module("Inproc Notify Zz", cur.replace('Notify("hi")', 'Notify("ho")'))
+        # The chain holds THIS module as it is on disk: renaming a function it
+        # still calls must be refused here, not pass on the stale definition
+        # (and then park + roll back + reload twice at the master reload).
+        key = vk.read_hotkey_module("Inproc Notify Zz")["bridge_key"][-1].lower()
+        vk.update_hotkey_module(
+            "Inproc Notify Zz",
+            f"#Requires AutoHotkey v2.0\nInprocHelperZz() {{\n    Notify(\"x\")\n}}\n"
+            f"^!+{key}:: {{\n    InprocHelperZz()\n}}\n")
+        assert "inprochelperzz" in vk._master_provided()
+        target = d / "hotkeys" / "InprocNotifyZz.ahk"
+        assert "inprochelperzz" not in vk._master_provided(exclude=target)
+        before = target.read_bytes()
+        e = _refused(lambda: vk.edit_hotkey_module("Inproc Notify Zz", "InprocHelperZz() {",
+                                                   "InprocHelperRenamedZz() {"),
+                     "InprocHelperZz", "nothing was written")
+        assert target.read_bytes() == before, e
+        # The same names in a file checked as itself (no master around it) fail.
+        f = d / "fx_alone.ahk"
+        f.write_text("#Requires AutoHotkey v2.0\nF() {\n  Notify(1)\n}\n", encoding="utf-8")
+        assert not vk.validate_ahk(str(f))[0]
+        assert vk.validate_ahk(str(f), provided=vk._master_provided())[0]
+
+
+def test_live_edits_check_a_copy_and_move_it_into_place():
+    """Karbon File feedback item 6: an edit used to write the module in place
+    and THEN load-check it — a press during the check ran the unchecked file
+    (a user got 'local variable not assigned' between two splices). Now the
+    copy beside it (not .ahk, so no scanner sees it) is checked and moved
+    over the file only once it passed; the error names the real file at the
+    line the real file has; no copy is ever left behind."""
+    seen = []
+    real_validate = vk.validate_ahk
+
+    def spy(path, *a, **k):
+        p = Path(path)
+        seen.append((p, live.read_bytes() if live.exists() else None))
+        return real_validate(path, *a, **k)
+
+    with _sandbox(reload=lambda: True) as d:
+        vk.create_hotkey_module("Swap Probe Zz", 'TrayTip("one")')
+        live = d / "hotkeys" / "bodies" / "SwapProbeZz.body.ahk"
+        before = live.read_bytes()
+        with _patched(validate_ahk=spy):
+            vk.edit_hotkey_module("Swap Probe Zz", 'TrayTip("one")', 'TrayTip("two")')
+        (checked, during), = seen
+        assert checked.parent == live.parent and checked.name.endswith(".vkcheck.tmp"), checked
+        assert checked.name.startswith(live.name) and checked.suffix != ".ahk"
+        assert during == before, "the live file must be untouched while its copy is checked"
+        assert b'TrayTip("two")' in live.read_bytes()
+
+        # A breaking edit: the error names the REAL file at the real line,
+        # the copy's name never appears, and the file is byte-identical.
+        good = live.read_bytes()
+        n = live.read_text(encoding="utf-8-sig").split("\n").index('TrayTip("two")') + 1
+        e = _refused(lambda: vk.edit_hotkey_module("Swap Probe Zz", 'TrayTip("two")',
+                                                   'TrayTip("two"'),
+                     f"{live} ({n}) : ==>", "nothing was written")
+        assert ".vkcheck" not in e, e
+        assert live.read_bytes() == good
+        # The hints still work on a copy: they read the failing line from the
+        # copy the error names (the real file still holds the old text).
+        e = _refused(lambda: vk.edit_hotkey_module("Swap Probe Zz", 'TrayTip("two")',
+                                                   'TrayTip("say ""hi""")'),
+                     "nothing was written", vk._QUOTE_HINT)
+        assert ".vkcheck" not in e, e
+
+        # Someone else's write landing DURING the load check (two sessions are
+        # two server processes): re-read before the rename, refused, theirs kept.
+        def racing(path, *a, **k):
+            if ".vkcheck" in str(path):
+                live.write_bytes(live.read_bytes().replace(b'TrayTip("two")', b'TrayTip("x")'))
+            return real_validate(path, *a, **k)
+        with _patched(validate_ahk=racing):
+            _refused(lambda: vk.edit_hotkey_module("Swap Probe Zz", 'TrayTip("two")',
+                                                   'TrayTip("mine")'),
+                     "changed while this change was being load-checked", "Nothing was changed",
+                     "read_hotkey_module")
+        assert b'TrayTip("x")' in live.read_bytes() and b"mine" not in live.read_bytes()
+        live.write_bytes(good)
+
+        # A create REPLACE rewrites a live module too: launcher and body are
+        # checked as copies, the live files untouched until both passed.
+        launcher = d / "hotkeys" / "SwapProbeZz.ahk"
+        lb = launcher.read_bytes()
+        seen.clear()
+        with _patched(validate_ahk=spy):
+            rep = vk.create_hotkey_module("Swap Probe Zz", 'TrayTip("five")')
+        assert len(seen) == 2 and all(p.name.endswith(".vkcheck.tmp") and during == good
+                                      for p, during in seen), seen
+        assert rep["body_sha256"] == vk.read_hotkey_module("Swap Probe Zz")["body_sha256"]
+        _refused(lambda: vk.create_hotkey_module("Swap Probe Zz", 'TrayTip("six"'),
+                 "nothing was changed")
+        assert launcher.read_bytes() == lb and b'TrayTip("five")' in live.read_bytes()
+
+        # update_hotkey_module / update_macro / edit_macro go the same way.
+        mac = d / "macros" / "SwapMacZz.ahk"
+        mac.write_bytes(b'#Requires AutoHotkey v2.0\nTrayTip("one")\n')
+        seen.clear()
+        live = mac
+        with _patched(validate_ahk=spy):
+            vk.update_macro("Swap Mac Zz", '#Requires AutoHotkey v2.0\nTrayTip("two")\n')
+            vk.edit_macro("Swap Mac Zz", 'TrayTip("two")', 'TrayTip("three")')
+            live = d / "hotkeys" / "bodies" / "SwapProbeZz.body.ahk"
+            cur = vk.read_hotkey_module("Swap Probe Zz")["body"]
+            vk.update_hotkey_module("Swap Probe Zz", cur.replace("five", "four"))
+        assert b"four" in live.read_bytes()
+        assert len(seen) == 3 and all(p.name.endswith(".vkcheck.tmp") for p, _ in seen), seen
+        assert seen[0][1] == b'#Requires AutoHotkey v2.0\nTrayTip("one")\n'
+        e = _refused(lambda: vk.update_macro("Swap Mac Zz", '#Requires AutoHotkey v2.0\nx := (\n'),
+                     str(mac), "left exactly as it was")
+        assert ".vkcheck" not in e, e
+        leftovers = [p for p in d.rglob("*") if ".vkcheck" in p.name]
+        assert not leftovers, leftovers
+
+    # A workflow replace too (steps file + stub): both written as copies, the
+    # stub's copy checked, and only then both moved into place.
+    wf_libs = ("_Common.ahk", "Workflow.ahk", "Acc.ahk", "UIA.ahk", "Clip.ahk", "ExplorerSel.ahk")
+    with _sandbox(libs=wf_libs) as d, _patched(make_shortcut=lambda *a, **k: None):
+        vk.create_workflow("Swap Flow Zz", [("wait", "100", "", "")])
+        live = d / "workflows" / "SwapFlowZz.steps.txt"
+        stub = d / "macros" / "SwapFlowZz.ahk"
+        sb = live.read_bytes()
+        seen.clear()
+        with _patched(validate_ahk=spy):
+            vk.create_workflow("Swap Flow Zz", [("wait", "200", "", "")])
+        (checked, during), = seen
+        assert checked.parent == stub.parent and checked.name.startswith(stub.name), seen
+        assert checked.name.endswith(".vkcheck.tmp") and during == sb, seen
+        assert "200" in live.read_text(encoding="utf-8-sig")
+        assert not [p for p in d.rglob("*") if ".vkcheck" in p.name]
+
+
+def test_expected_sha256_refuses_a_file_changed_since_it_was_read():
+    """Karbon File feedback item 5: two sessions editing one module collided
+    unnoticed. The read tools return the hash every edit already returned
+    (LF, no BOM, UTF-8 — so a CRLF re-save keeps it), and edit/update take it
+    back as expected_sha256: a mismatch refuses with nothing changed."""
+    with _sandbox(reload=lambda: True) as d:
+        vk.create_hotkey_module("Sha Probe Zz", 'TrayTip("one")')
+        r = vk.read_hotkey_module("Sha Probe Zz")
+        assert r["body_sha256"] == vk._text_sha256(r["body"])
+        got = vk.edit_hotkey_module("Sha Probe Zz", 'TrayTip("one")', 'TrayTip("two")',
+                                    expected_sha256=r["body_sha256"])
+        assert got["body_sha256"] == vk.read_hotkey_module("Sha Probe Zz")["body_sha256"]
+        live = d / "hotkeys" / "bodies" / "ShaProbeZz.body.ahk"
+        # Someone else edits it (and saves CRLF — the hash ignores that).
+        live.write_bytes(live.read_bytes().replace(b'TrayTip("two")', b'TrayTip("theirs")')
+                         .replace(b"\n", b"\r\n"))
+        theirs = live.read_bytes()
+        for call in (
+                lambda: vk.edit_hotkey_module("Sha Probe Zz", 'TrayTip("theirs")', "x := 1",
+                                              expected_sha256=got["body_sha256"]),
+                lambda: vk.update_hotkey_module("Sha Probe Zz", 'TrayTip("mine")',
+                                                expected_sha256=got["body_sha256"].upper())):
+            _refused(call, "changed since you read it", "Nothing was changed",
+                     "read_hotkey_module")
+            assert live.read_bytes() == theirs
+        fresh = vk.read_hotkey_module("Sha Probe Zz")["body_sha256"]
+        assert fresh == vk._text_sha256(theirs.decode("utf-8-sig"))
+        up = vk.update_hotkey_module("Sha Probe Zz", vk.read_hotkey_module("Sha Probe Zz")["body"]
+                                     .replace("theirs", "mine"), expected_sha256=fresh)
+        assert up["body_sha256"] == vk.read_hotkey_module("Sha Probe Zz")["body_sha256"]
+
+        mac = d / "macros" / "ShaMacZz.ahk"
+        mac.write_bytes(b'#Requires AutoHotkey v2.0\r\nTrayTip("one")\r\n')
+        h = vk.read_macro_source("Sha Mac Zz")["source_sha256"]
+        assert h == vk._text_sha256('#Requires AutoHotkey v2.0\nTrayTip("one")\n')
+        e1 = vk.edit_macro("Sha Mac Zz", 'TrayTip("one")', 'TrayTip("two")', expected_sha256=h)
+        _refused(lambda: vk.update_macro("Sha Mac Zz", 'TrayTip("x")', expected_sha256=h),
+                 "changed since you read it", "read_macro_source")
+        u = vk.update_macro("Sha Mac Zz", '#Requires AutoHotkey v2.0\nTrayTip("3")\n',
+                            expected_sha256=e1["source_sha256"])
+        assert u["source_sha256"] == vk.read_macro_source("Sha Mac Zz")["source_sha256"]
+        _refused(lambda: vk.edit_macro("Sha Mac Zz", 'TrayTip("3")', 'TrayTip("4")',
+                                       expected_sha256=e1["source_sha256"]),
+                 "changed since you read it")
+        # Omitted (or blank) means "don't check" — today's behaviour.
+        vk.edit_macro("Sha Mac Zz", 'TrayTip("3")', 'TrayTip("4")', expected_sha256="")
+
+        # The creates return the same hash, so a first edit needs no read.
+        c = vk.create_launch_macro("Sha New Zz", ahk_body='TrayTip("n")')
+        assert c["source_sha256"] == vk.read_macro_source("Sha New Zz")["source_sha256"]
+        vk.edit_macro("Sha New Zz", 'TrayTip("n")', 'TrayTip("m")',
+                      expected_sha256=c["source_sha256"])
+        c = vk.create_hotkey_module("Sha New Hk Zz", 'TrayTip("n")', isolate=False)
+        assert c["body_sha256"] == vk.read_hotkey_module("Sha New Hk Zz")["body_sha256"]
+
+
+def test_saved_code_refuses_a_string_assigned_to_base():
+    """Karbon File feedback item 11: `obj.base := "text"` passes the load
+    check and fails at run time (measured: TypeError 'Expected an Object but
+    got a String.'; an object literal's `base: "x"` -> ValueError 'Invalid
+    base.'). Code the MCP saves is checked for it statically; an object on
+    the right, a Map key, a comment or a string mentioning it are fine, and
+    an edit is never blocked by such a line it didn't write."""
+    flagged = ['o.base := "text"', "o.Base := 5", 'cfg.base:=""',
+               'o := {kind: "x", base: "y"}', "o := {base: 3}", '    base: "x",',
+               'x := 1, o.base := "t"  ; trailing']
+    clean = ["o.base := proto", "o.base := {}", 'm["base"] := "fine"', '; o.base := "x"',
+             's := "o.base := 1"', "o := {base: proto}", "x := c ? base : 1",
+             '/*\no.base := "x"\n*/', "o.baseName := 'x'", "o.base := Object()",
+             # A continuation section is text (a browser body's JS/JSON).
+             "js := \"\n(\nconst cfg = {\n  base: 'https://x',\n};\n)\"",
+             "html := \"\n( Join`n\n  {base: 1}\n)\""]
+    for c in flagged:
+        assert vk._base_assignments(c), c
+    for c in clean:
+        assert not vk._base_assignments(c), c
+    # ... but code after the section's ')' is code again.
+    assert vk._base_assignments("t := \"\n(\nbase: 1\n)\"\no.base := 2") == [(5, "o.base := 2")]
+    with _sandbox(reload=lambda: True) as d:
+        _refused(lambda: vk.create_hotkey_module("Base Probe Zz", 'x := 1\no := {}\no.base := "t"'),
+                 "line 3 of ahk_body", "prototype", "Nothing was changed")
+        assert not (d / "hotkeys" / "BaseProbeZz.ahk").exists()
+        _refused(lambda: vk.create_launch_macro("Base Mac Zz", ahk_body='o := {base: "x"}'),
+                 "line 1 of ahk_body", "Invalid base.")
+        assert not (d / "macros" / "BaseMacZz.ahk").exists()
+        vk.create_hotkey_module("Base Probe Zz", 'o := {}\nTrayTip("one")')
+        e = _refused(lambda: vk.edit_hotkey_module("Base Probe Zz", 'TrayTip("one")',
+                                                   'o.base := "t"'),
+                     "assigns a value to 'base'", 'o.base := "t"')
+        cur = vk.read_hotkey_module("Base Probe Zz")["body"]
+        _refused(lambda: vk.update_hotkey_module("Base Probe Zz", cur + 'o.base := "u"\n'),
+                 "of code")
+        # A file that already has such a line can still be edited elsewhere.
+        mac = d / "macros" / "BaseOldZz.ahk"
+        mac.write_bytes(b'#Requires AutoHotkey v2.0\nf() {\n  o := {}\n  o.base := "t"\n}\n'
+                        b'TrayTip("one")\n')
+        vk.edit_macro("Base Old Zz", 'TrayTip("one")', 'TrayTip("two")')
+        _refused(lambda: vk.edit_macro("Base Old Zz", 'TrayTip("two")',
+                                       'TrayTip("two")\nf2() {\n  p := {}\n  p.base := 1\n}'),
+                 "line 9 of BaseOldZz.ahk")
+        _refused(lambda: vk.update_macro("Base Old Zz", '#Requires AutoHotkey v2.0\no := {base: 1}'),
+                 "line 2 of ahk_source")
+    # A snippet that does it gets a Hint naming base as the prototype.
+    out = vk._explain_ahk_error("UNCAUGHT TypeError: Expected an Object but got a String. "
+                                "— snippet line 2", code='o := {}\no.base := "t"')
+    assert "Hint:" in out and "prototype" in out, out
+    out = vk._explain_ahk_error("UNCAUGHT TypeError: Expected an Object but got a String. "
+                                "— snippet line 1", code='x := StrLen(5).y')
+    assert "prototype" not in out, out
+    r = vk.run_ahk_snippet('o := {}\no.base := "t"', 20)
+    assert r["exit_code"] == 3 and "prototype" in (r.get("errors") or ""), r
+
+
 def test_run_ahk_snippet_runs_and_reports():
     """run_ahk_snippet: one-off code in a throwaway process, reporting through
     the Out() file channel (GUI-subsystem stdout is not trustworthy). Uses the
@@ -1536,6 +2055,345 @@ def test_run_ahk_snippet_out_serializes_objects():
     assert lines[1] == "[1, 2, three]", got
     assert lines[2] == "Map{a: 1}", got
     assert lines[3] == "3.5", got
+
+
+# A module written to trip a naive cutter: strings and continuation sections
+# holding braces, parens and quotes, a call that looks like a definition, a
+# definition whose '{' sits below a comment, wrapped parameter lists, an
+# object-literal default, fat arrows continued on the next line, a nested
+# function inside a TOP-LEVEL block, hotkeys (one-line, braced, stacked
+# above a block, remaps) and hotstrings (text, a section of text, X), labels,
+# directives and block comments at the top level.
+_MODULE_TRICKY = r'''#Requires AutoHotkey v2.0
+#SingleInstance Force
+#Include "%A_ScriptDir%\..\..\lib\_Common.ahk"
+BodySingleInstance("Karbon")
+global CFG := Map("a", 1), Other := 2
+count := 0, total := "x := 1"
+msg := "
+(
+  a line with ( and { and "quotes
+  KF_Fake() {
+)"
+Persistent()
+if !FileExist("x") {
+    made := 1
+    Foo() {      ; nested function in a block - top level code
+    }
+}
+/*
+Commented() {
+}
+*/
+^!k:: {
+    local1 := 1
+    KF_Go()
+}
+F2::KF_Go()
+a::b
+::btw::by the way (
+:X:qq::KF_Go()
+Label1:
+KF_Go(x := "a;b", y := {k: 1}) {   ; a def with an object default
+    s := "brace } in string"
+    t := 'it''s'
+    return x
+}
+KF_Arrow(a, b) => a
+    + b
+KF_Arrow2(a) =>
+    a * 2
+KF_Wrap(a,
+        b := ")")
+{
+    return a b
+}
+class KF_Thing extends Object {
+    static v := "{"
+    M() => 1
+}
+class KF_Next
+{
+    x := 1
+}
+KF_Fn() {
+    x := "
+    (
+    } not a brace ) really
+    )"
+    return x
+}
+#HotIf WinActive("ahk_exe chrome.exe")
+^!j::
+^!l::
+{
+    Nested() {
+        return 1
+    }
+}
+#HotIf
+::sig::
+(
+Best regards,
+  Gav (the "boss") {
+)
+Later(a)   ; a call, then a def with its brace after a comment
+KF_Late(a)
+; the brace is below
+{
+    /* a block comment inside
+    } fake */
+    return a
+}
+KF_Arr(a) => a
+    ; a comment between
+    . "x"
+items := [
+    "a",
+    "b"
+]
+ExitApp(0)
+'''
+
+
+def test_snippet_module_definitions_only_keeps_line_numbers():
+    """run_ahk_snippet(include_module=...) includes a module's DEFINITIONS
+    only (2026-10-14 feedback: a body was cut at a comment marker by hand ~15
+    times to try one function). The cutter must keep every function and
+    class whole, blank everything else line for line, and never be fooled by
+    braces in strings, continuation sections, hotkey blocks or comments."""
+    r = vk._ahk_definitions_only(_MODULE_TRICKY)
+    src = _MODULE_TRICKY.split("\n")
+    assert len(r["lines"]) == len(src), "line numbers must survive"
+    kept = {i + 1 for i, ln in enumerate(r["lines"]) if ln}
+    # Line 3: the #Include, left for the caller to resolve; 31-59: KF_Go to
+    # KF_Fn; 75-84: KF_Late (its '{' below a comment) and KF_Arr (continued
+    # past a comment line). Nothing else.
+    want = {3} | set(range(31, 60)) | set(range(75, 85))
+    assert kept == want, (sorted(kept - want), sorted(want - kept))
+    for i in kept:                                      # kept lines are verbatim
+        assert r["lines"][i - 1] == src[i - 1], i
+    assert r["functions"] == [("KF_Go", 31), ("KF_Arrow", 36), ("KF_Arrow2", 38),
+                              ("KF_Wrap", 40), ("KF_Fn", 53), ("KF_Late", 75),
+                              ("KF_Arr", 82)], r["functions"]
+    assert r["classes"] == [("KF_Thing", 45), ("KF_Next", 49)], r["classes"]
+    # Top-level code's globals (a hotkey block's locals are not among them).
+    assert r["assigned"] == ["CFG", "Other", "count", "total", "msg", "made", "items"], \
+        r["assigned"]
+    assert r["includes"] == [2], r["includes"]
+    # Every blanked code line is counted (comments and blank lines aren't).
+    code_lines = {i + 1 for i, ln in enumerate(src) if ln.strip()
+                  and not ln.strip().startswith(";")} - set(range(18, 22))
+    assert r["dropped"] == len(code_lines - kept), (r["dropped"], len(code_lines - kept))
+    # Small shapes on their own.
+    one = vk._ahk_definitions_only("F() {\n}\nG() => 1\n-1\nx := 2\n")
+    assert [bool(x) for x in one["lines"]] == [True, True, True, True, False, False], one
+    assert one["assigned"] == ["x"], one       # '-1' continued G's expression (v2's rule)
+    call = vk._ahk_definitions_only("Setup()\nRun2()\n")
+    assert call["functions"] == [] and call["dropped"] == 2, call
+    crlf = vk._ahk_definitions_only("x := 1\r\nF() {\r\n  return 1\r\n}\r\n")
+    assert crlf["lines"][1:4] == ["F() {\r", "  return 1\r", "}\r"], crlf
+
+
+def _snippet_libs():
+    return ("_Common.ahk", "Browser.ahk", "UIA.ahk", "Clip.ahk", "ExplorerSel.ahk")
+
+
+def test_run_ahk_snippet_include_module():
+    """include_module end to end, in a sandbox: the body's functions and
+    class are callable, its startup code never runs (a marker file stays
+    absent, the hotkey's block too), a global its startup would have set is
+    reported unset and works once the snippet sets it, its #Include of
+    _Common.ahk is dropped (the prelude has it) while a helper include is
+    made absolute, and an error INSIDE the module names the real file and
+    line — never the temp copy. An isolate=False module includes its module
+    file. The snippet's own line numbers still count from its first line."""
+    with _sandbox(reload=None, libs=_snippet_libs()) as d:
+        bodies = Path(d) / "hotkeys" / "bodies"
+        bodies.mkdir(parents=True)
+        (Path(d) / "hotkeys" / "IncProbeZz.ahk").write_text("; launcher\n", encoding="utf-8")
+        (bodies / "IncHelperZz.ahk").write_text('IncHelper() => "helped"\n', encoding="utf-8")
+        body = bodies / "IncProbeZz.body.ahk"
+        body.write_text(
+            '#Requires AutoHotkey v2.0\n'                                  # 1
+            '#SingleInstance Ignore\n'                                     # 2
+            '#Include "%A_ScriptDir%\\..\\..\\lib\\_Common.ahk"\n'         # 3
+            '#Include "%A_ScriptDir%\\IncHelperZz.ahk"\n'                  # 4
+            'BodySingleInstance("IncProbeZz")\n'                           # 5
+            'FileAppend("STARTUP RAN`n", A_ScriptDir "\\startup-ran.txt")\n'   # 6
+            'Cfg := Map("k", "from startup")\n'                            # 7
+            '^!F12:: {\n'                                                  # 8
+            '    FileAppend("HOTKEY`n", A_ScriptDir "\\startup-ran.txt")\n'    # 9
+            '}\n'                                                          # 10
+            'IncAdd(a, b) => a + b\n'                                      # 11
+            'IncCfg() {\n'                                                 # 12
+            '    return Cfg["k"]\n'                                        # 13
+            '}\n'                                                          # 14
+            'IncBoom() {\n'                                                # 15
+            '    x := 1\n'                                                 # 16
+            '    return x.NoSuchMethodZz()\n'                              # 17
+            '}\n'                                                          # 18
+            'class IncThing {\n'                                           # 19
+            '    static Hi() => "hi from class"\n'                         # 20
+            '}\n'                                                          # 21
+            'ExitApp(0)\n', encoding="utf-8")                              # 22
+        got = vk.run_ahk_snippet('Out(IncAdd(2, 3))\nOut(IncThing.Hi())\nOut(IncHelper())\n'
+                                 'Cfg := Map("k", "set by snippet")\nOut(IncCfg())',
+                                 include_module="Inc Probe Zz")
+        assert got["exit_code"] == 0, got
+        assert got["output"].split("\n") == ["5", "hi from class", "helped", "set by snippet"], got
+        assert not (bodies / "startup-ran.txt").exists(), "the body's startup code ran"
+        im = got["included_module"]
+        assert im["file"] == str(body) and im["isolated"] is True, im
+        assert im["functions"] == ["IncAdd", "IncCfg", "IncBoom"], im
+        assert im["classes"] == ["IncThing"] and im["unset_globals"] == ["Cfg"], im
+        assert im["includes_already_in_snippet"] == ["lib\\_Common.ahk"], im
+        assert im["includes"] == ["hotkeys\\bodies\\IncHelperZz.ahk"], im
+        # 1-2, 5-10, 22 (the dropped #Include is reported on its own, above)
+        assert im["top_level_lines_dropped"] == 9, im
+        assert "UNSET" in im["note"] and "startup statements didn't run" in im["note"], im
+        assert "static_initializers" not in im and "script_vars_replaced" not in im, im
+
+        # A runtime error inside the module: the REAL file and line.
+        boom = vk.run_ahk_snippet("IncBoom()", include_module="IncProbeZz")
+        assert boom["exit_code"] == 3, boom
+        assert f"{body} line 17" in boom["errors"], boom["errors"]
+        assert "module\\IncProbeZz" not in boom["errors"] + boom["output"], boom
+        # A function reading a global nobody set fails by name, not silently.
+        unset = vk.run_ahk_snippet("Out(IncCfg())", include_module="IncProbeZz")
+        assert unset["exit_code"] == 3 and "Cfg" in unset["errors"], unset
+
+        # The snippet's own errors still count from ITS first line.
+        own = vk.run_ahk_snippet('Out(1)\nx := (', include_module="IncProbeZz")
+        assert own["exit_code"] == 2 and "snippet line 2" in own["errors"], own
+
+        # A load error inside the module: the real file and line.
+        (Path(d) / "hotkeys" / "BadIncZz.ahk").write_text("; launcher\n", encoding="utf-8")
+        bad = bodies / "BadIncZz.body.ahk"
+        bad.write_text('x := 1\nGood() => 1\nBroken() {\n    y := "unterminated\n}\n',
+                       encoding="utf-8")
+        got = vk.run_ahk_snippet("Out(Good())", include_module="Bad Inc Zz")
+        assert got["exit_code"] == 2 and f"{bad} (4)" in got["errors"], got["errors"]
+
+        # isolate=False: the module file itself.
+        (Path(d) / "hotkeys" / "InProcZz.ahk").write_text(
+            '^!F11::InProcHello()\nInProcHello() {\n    return "hello in-process"\n}\n',
+            encoding="utf-8")
+        got = vk.run_ahk_snippet("Out(InProcHello())", include_module="In Proc Zz")
+        assert got["output"] == "hello in-process", got
+        assert got["included_module"]["isolated"] is False, got
+        assert "Theme.ahk" in got["included_module"]["note"], got
+
+        # Real code: the shipped scraper body (a few hundred lines of top-level
+        # config, hotkeys and functions) and the ToggleTimer example module (a
+        # hotkey block and nothing else) reduce to copies that LOAD.
+        for base, src, is_body in (("RefScrapeZz", "web-scrape-body.ahk", True),
+                                   ("RefTimerZz", "examples/ToggleTimer.ahk", False)):
+            text = (REAL_ROOT / "templates" / src).read_text(encoding="utf-8-sig")
+            (Path(d) / "hotkeys" / f"{base}.ahk").write_text(
+                "; launcher\n" if is_body else text, encoding="utf-8")
+            if is_body:
+                (bodies / f"{base}.body.ahk").write_text(text, encoding="utf-8")
+            got = vk.run_ahk_snippet('Out("loaded")', include_module=base)
+            assert got["exit_code"] == 0 and got["output"] == "loaded", (src, got)
+            im = got["included_module"]
+            if is_body:
+                assert len(im["functions"]) >= 3, (src, im)
+            else:
+                assert im["functions"] == [] and "defines no functions" in im["note"], im
+
+        _raises(lambda: vk.run_ahk_snippet("Out(1)", include_module="No Such Module Zz"),
+                "No hotkey module", exc=vk.VoiceKitError)
+        # Without include_module nothing changes: no included_module field.
+        assert "included_module" not in vk.run_ahk_snippet("Out(1)")
+
+
+def test_run_ahk_snippet_include_module_script_vars():
+    """The 2026-10-14 review of include_module: in the snippet, A_ScriptDir
+    & co. named the snippet's TEMP copy, so a module function reading files
+    beside the body (the feedback's 'matching client folders') read the
+    wrong folder, and a helper the body includes that itself #Includes
+    "%A_ScriptDir%\\..." failed to load (measured: exit 2, "cannot be
+    opened"). Now the kept code gets the REAL values — in code, never inside
+    a string, a comment or a continuation section — a helper naming the
+    script is included as a rewritten copy (errors still name the real
+    file), a helper that only uses A_LineFile is included as itself, and
+    class static initializers (which DO run at load, also measured) are
+    reported instead of the note claiming nothing ran."""
+    with _sandbox(reload=None, libs=_snippet_libs()) as d:
+        bodies = Path(d) / "hotkeys" / "bodies"
+        bodies.mkdir(parents=True)
+        (Path(d) / "hotkeys" / "ScriptVarZz.ahk").write_text("; launcher\n", encoding="utf-8")
+        (bodies / "SvHelperZz.ahk").write_text(
+            '#Include "%A_ScriptDir%\\SvDeepZz.ahk"\n'                      # 1
+            'SvHelperDir() => A_ScriptDir "|" A_LineFile\n'                 # 2
+            'SvHelperBoom() {\n'                                            # 3
+            '    x := 1\n'                                                  # 4
+            '    return x.NoSuchMethodZz()\n'                               # 5
+            '}\n', encoding="utf-8")
+        (bodies / "SvDeepZz.ahk").write_text('SvDeep() => "deep"\n', encoding="utf-8")
+        (bodies / "SvPlainZz.ahk").write_text('SvPlain() => A_LineFile\n', encoding="utf-8")
+        body = bodies / "ScriptVarZz.body.ahk"
+        body.write_text(
+            '#Requires AutoHotkey v2.0\n'                                   # 1
+            '#Include "%A_ScriptDir%\\SvHelperZz.ahk"\n'                    # 2
+            '#Include "SvPlainZz.ahk"\n'                                    # 3
+            'SvWhere() => A_ScriptDir\n'                                    # 4
+            'SvSelf() => A_LineFile "|" A_ScriptName "|" A_ScriptFullPath\n'   # 5
+            'SvStr() => "A_ScriptDir stays text"   ; A_ScriptDir in a comment\n'   # 6
+            'SvCont() {\n'                                                  # 7
+            '    t := "\n'                                                  # 8
+            '    (\n'                                                       # 9
+            '    A_ScriptDir in a section\n'                                # 10
+            '    )"\n'                                                      # 11
+            '    return t\n'                                                # 12
+            '}\n'                                                           # 13
+            'class SvCls {\n'                                               # 14
+            '    static Made := 1\n'                                        # 15
+            '    static __New() {\n'                                        # 16
+            '    }\n'                                                       # 17
+            '    Inst() {\n'                                                # 18
+            '        static cnt := 0\n'                                     # 19
+            '        return cnt\n'                                          # 20
+            '    }\n'                                                       # 21
+            '}\n'                                                           # 22
+            'SvBody := A_ScriptDir\n', encoding="utf-8")                    # 23
+        got = vk.run_ahk_snippet(
+            'Out(SvWhere())\nOut(SvSelf())\nOut(SvHelperDir())\nOut(SvDeep())\n'
+            'Out(SvPlain())\nOut(SvStr())\nOut(Trim(SvCont(), "`n "))\nOut(A_ScriptName)',
+            include_module="ScriptVarZz")
+        assert got["exit_code"] == 0, got
+        out = got["output"].split("\n")
+        assert out == [str(bodies),
+                       f"{body}|{body.name}|{body}",
+                       f"{bodies}|{bodies / 'SvHelperZz.ahk'}",
+                       "deep",
+                       str(bodies / "SvPlainZz.ahk"),
+                       "A_ScriptDir stays text",
+                       "A_ScriptDir in a section",
+                       "snippet.ahk"], out           # the snippet's OWN code is untouched
+        im = got["included_module"]
+        assert im["includes_rewritten"] == ["hotkeys\\bodies\\SvHelperZz.ahk"], im
+        assert im["includes"] == ["hotkeys\\bodies\\SvHelperZz.ahk",
+                                  "hotkeys\\bodies\\SvPlainZz.ahk"], im
+        assert im["script_vars_replaced"] == ["hotkeys\\bodies\\ScriptVarZz.body.ahk line 4",
+                                              "hotkeys\\bodies\\ScriptVarZz.body.ahk line 5",
+                                              "hotkeys\\bodies\\SvHelperZz.ahk line 2"], im
+        assert im["script_vars_not_replaced"] == [
+            "hotkeys\\bodies\\ScriptVarZz.body.ahk line 10"], im
+        assert im["static_initializers"] == ["SvCls line 15", "SvCls line 16"], im
+        assert "static initializers DO run" in im["note"] and "writes THERE" in im["note"], im
+        # An error inside the rewritten helper names the REAL helper and line.
+        boom = vk.run_ahk_snippet("SvHelperBoom()", include_module="ScriptVarZz")
+        assert boom["exit_code"] == 3, boom
+        assert f"{bodies / 'SvHelperZz.ahk'} line 5" in boom["errors"], boom["errors"]
+        assert "\\inc1\\" not in boom["errors"] + boom["output"], boom
+
+        # isolate=False: the script is VoiceKit.ahk at the root.
+        (Path(d) / "hotkeys" / "InDirZz.ahk").write_text(
+            'InDirWhere() => A_ScriptDir "|" A_ScriptName\n', encoding="utf-8")
+        got = vk.run_ahk_snippet("Out(InDirWhere())", include_module="InDirZz")
+        assert got["output"] == f"{Path(d)}|VoiceKit.ahk", got
 
 
 def test_mcp_cancellation_is_not_connection_fatal():
@@ -2289,6 +3147,162 @@ def test_com_servers_left_by_a_timeout_are_reported():
         assert "possibly_left_running" not in got, "only looked for after a timeout"
 
 
+def test_ensure_python_env_refuses_bad_names_and_specs():
+    """ensure_python_env (2026-10-14 feedback: a module needed pypdf and its
+    author hand-built a venv) takes plain requirement specs only — a name,
+    optional [extras], optional version specifiers. Anything else pip would
+    accept (an option, a URL, a path, a VCS link, a marker) is refused before
+    any process starts. The env name is cleaned the way VkPythonExe cleans
+    it, and a name that cleans to nothing (or to dots) is refused."""
+    assert vk._pyenv_name("pdf") == "pdf"
+    assert vk._pyenv_name(" my env/x ") == "myenvx"
+    assert vk._pyenv_name("a.b-c_1") == "a.b-c_1"
+    for bad in ("", "  ", "..", ".", "/\\", None):
+        _raises(lambda b=bad: vk._pyenv_name(b), "short name", exc=vk.VoiceKitError)
+    assert vk._pyenv_specs(["pypdf", "pypdf==5.1.0", "requests[socks, http2] >= 2.31, <3",
+                            "Foo_Bar.baz", "a~=1.0", " PyPDF "]) == \
+        ["pypdf", "pypdf==5.1.0", "requests[socks,http2]>=2.31,<3", "Foo_Bar.baz", "a~=1.0"]
+    assert vk._pyenv_specs(None) == [] and vk._pyenv_specs("pypdf") == ["pypdf"]
+    for bad in ("-r requirements.txt", "--index-url=https://evil", "-e .",
+                "git+https://github.com/x/y", "pkg @ https://x/pkg.whl", "https://x/pkg.whl",
+                "./local", "C:\\wheels\\x.whl", "pkg; python_version<'3.9'", "a b",
+                "pkg==1.0 --hash=sha256:00", "pkg[extra",
+                # pip installs a "name" ending in an archive extension as a
+                # FILE (review 2026-10-14) — refused whatever the case.
+                "evil.whl", "pkg-1.0-py3-none-any.whl", "thing.tar.gz", "x.zip", "X.ZIP",
+                "a.tgz", "a.tar", "a.tar.bz2", "a.tbz", "a.tar.xz", "a.txz", "evil.whl==1"):
+        _raises(lambda b=bad: vk._pyenv_specs([b]), "", exc=vk.VoiceKitError)
+    # ...but a dotted name that merely CONTAINS such a word is a name.
+    assert vk._pyenv_specs(["zope.interface", "backports.zoneinfo", "tarfile-x"]) == \
+        ["zope.interface", "backports.zoneinfo", "tarfile-x"]
+    _raises(lambda: vk._pyenv_specs(["p"] * (vk.PYENV_MAX_PACKAGES + 1)), "At most",
+            exc=vk.VoiceKitError)
+    # The interpreter an environment is made from is the BASE install, never
+    # the server's own venv python (measured from mcp\.venv 2026-10-14).
+    import sys
+    base = Path(vk._base_python())
+    assert base.is_file(), base
+    if sys.prefix != sys.base_prefix:                  # running in a venv (mcp\.venv)
+        assert _path_key_t(base.parent) != _path_key_t(Path(sys.prefix) / "Scripts"), base
+
+
+def _path_key_t(p) -> str:
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+_PYENV_NAMES = ["pdf", " my env/x ", "a.b-c_1", "Karbon File", "UPPER.v2", "..", ".", "",
+                "/\\", "..\\..", "a/../b", "é", "naïve", "x" * 64, "x" * 65,
+                "tab\there", "semi;colon", "-dash-", "_"]
+
+
+def test_vk_python_exe_matches_the_writer():
+    """VkPythonExe (lib\\_Common.ahk) and _pyenv_name/_pyenv_dir are a
+    mirrored pair (review 2026-10-14): a body asks for the env by the name
+    it was told and must land on the folder ensure_python_env made. Run the
+    REAL AHK function on the same names against environments made where the
+    writer would make them, and compare. A name the writer refuses has no
+    folder, so VkPythonExe must say "" for it — non-ASCII letters included
+    (both sides keep ASCII [\\w-.] only)."""
+    sep = "\x1e"
+    with _sandbox() as d:
+        want = []
+        for nm in _PYENV_NAMES:
+            try:
+                exe = vk._pyenv_dir(vk._pyenv_name(nm)) / "Scripts" / "python.exe"
+            except vk.VoiceKitError:
+                want.append("")
+                continue
+            exe.parent.mkdir(parents=True, exist_ok=True)
+            exe.write_bytes(b"")
+            want.append(_path_key_t(exe))
+        # A name the writer refuses only for its LENGTH still sanitizes to a
+        # folder name: plant that folder, so VkPythonExe must refuse the name
+        # itself rather than pass because nothing is there (code review).
+        long_exe = vk._pyenv_dir("x" * 65) / "Scripts" / "python.exe"
+        long_exe.parent.mkdir(parents=True, exist_ok=True)
+        long_exe.write_bytes(b"")
+        src, out = d / "names.txt", d / "out.txt"
+        src.write_text(sep.join(_PYENV_NAMES), encoding="utf-8", newline="")
+        _run_common_probe(
+            d,
+            's := ""\n'
+            'for v in StrSplit(FileRead(A_Args[1], "UTF-8"), Chr(30))\n'
+            '    s .= (A_Index > 1 ? Chr(30) : "") VkPythonExe(v, A_Args[3])\n'
+            'f := FileOpen(A_Args[2], "w", "UTF-8-RAW"), f.Write(s), f.Close()',
+            str(src), str(out), str(d))
+        got = out.read_text(encoding="utf-8").split(sep)
+        assert len(got) == len(want), (got, want)
+        for nm, a, p in zip(_PYENV_NAMES, got, want):
+            assert (_path_key_t(a) if a else "") == p, \
+                f"VkPythonExe drifted for {nm!r}:\n  AHK   : {a!r}\n  Python: {p!r}"
+
+
+def test_ensure_python_env_makes_reuses_and_hands_off():
+    """End to end, OFFLINE, in a sandboxed VoiceKit folder and jobs folder:
+    the first call makes tools\\python\\<env>\\ from the base interpreter
+    (pyvenv.cfg's home is the base install, not mcp\\.venv) through an
+    install job and reports 'pip' installed; the second call is read-only
+    (no job, nothing changed); an install that outlasts wait_s comes back as
+    a running job (and a second call meanwhile points at the same job)
+    instead of being killed; and a pip failure (no index allowed) is a
+    'failed' answer with pip's own words. What needs the network — a real
+    package from the index — isn't tested here."""
+    import sys
+    with _sandbox(reload=None, libs=None) as d, _jobs_sandbox() as jobs:
+        got = vk.ensure_python_env("probe", ["pip"])
+        assert got["ok"] is True and got["state"] == "ready" and got["changed"] is True, got
+        py = Path(d) / "tools" / "python" / "probe" / "Scripts" / "python.exe"
+        assert Path(got["python"]) == py and py.is_file(), got
+        assert any(s.startswith("pip==") for s in got["installed"]), got
+        assert 'VkPythonExe("probe")' in got["how_to_use"] and got.get("job_id"), got
+        cfg = (py.parent.parent / "pyvenv.cfg").read_text(encoding="utf-8")
+        home = re.search(r"(?m)^home\s*=\s*(.+)$", cfg).group(1).strip()
+        assert _path_key_t(home) == _path_key_t(Path(vk._base_python()).parent), cfg
+        assert _path_key_t(home) != _path_key_t(Path(sys.prefix) / "Scripts"), cfg
+
+        # Read-only the second time: no job is started.
+        n_jobs = len(list(jobs.iterdir()))
+        again = vk.ensure_python_env("probe", ["pip"])
+        assert again["ok"] and again["changed"] is False and "job_id" not in again, again
+        assert "nothing was run but a check" in again["note"], again
+        assert len(list(jobs.iterdir())) == n_jobs, "a satisfied environment starts no job"
+
+        # An install that outlasts the wait: handed back as a job, not killed.
+        slow = vk.ensure_python_env("slow", [], wait_s=1)
+        assert slow["state"] == "installing" and slow["ok"] is False, slow
+        jid = slow["job_id"]
+        mid = vk.ensure_python_env("slow", [])
+        assert mid["state"] == "installing" and mid["job_id"] == jid, (mid, slow)
+        # A server restart (or a second server) has no _PYENV_JOBS entry: the
+        # job's meta.json still names its environment, so no second pip starts.
+        with vk._PYENV_LOCK:
+            vk._PYENV_JOBS.clear()
+        n_jobs = len(list(jobs.iterdir()))
+        restarted = vk.ensure_python_env("slow", [])
+        assert restarted["state"] == "installing" and restarted["job_id"] == jid, restarted
+        assert len(list(jobs.iterdir())) == n_jobs, "a second install job was started"
+        st = _poll(lambda: (lambda s: s if s["state"] != "running" else None)(
+            vk.read_job(jid)), 120)
+        assert st and st["exit_code"] == 0, st
+        done = vk.ensure_python_env("slow", [])
+        assert done["ok"] and done["changed"] is False, done
+
+        # A failing pip: the answer says so with pip's own output.
+        old = os.environ.get("PIP_NO_INDEX")
+        os.environ["PIP_NO_INDEX"] = "1"           # offline and fast: no index at all
+        try:
+            bad = vk.ensure_python_env("probe", ["nosuchpackagezzq"])
+        finally:
+            if old is None:
+                os.environ.pop("PIP_NO_INDEX", None)
+            else:
+                os.environ["PIP_NO_INDEX"] = old
+        assert bad["ok"] is False and bad["state"] == "failed" and bad["exit_code"], bad
+        assert "nosuchpackagezzq" in bad["output_tail"].lower(), bad
+        assert bad["installed"] == [], bad        # only the REQUESTED packages are listed
+        assert not vk._PYENV_JOBS, vk._PYENV_JOBS
+
+
 def test_background_jobs_and_list_processes_keep_token_names_masked():
     """Review finding: a name that came in as a token was masked when the
     SAME call echoed it (privacy.take_expanded), but a background job's
@@ -2762,6 +3776,78 @@ def test_read_module_status_joins_line_and_liveness():
             assert "No hotkey module" in str(e)
 
 
+def test_module_status_says_when_a_body_sits_on_a_dialog():
+    """2026-10-14 feedback: an uncaught error in a body showed AutoHotkey's
+    error dialog, the process lived on behind it, and every later press was
+    turned away by the single-instance guard — read_module_status said only
+    "running". Now both status tools read the body's visible dialogs. Real
+    processes in a sandbox (their own throwaway windows): one body hits an
+    uncaught error with NO handler (AutoHotkey's own dialog: kind 'error',
+    the message, the failing line), one waits on a MsgBox (kind 'message'),
+    and a body with no dialog gets no 'dialog' field at all."""
+    with _sandbox(reload=None, libs=None) as d:
+        bodies = Path(d) / "hotkeys" / "bodies"
+        bodies.mkdir(parents=True)
+        scripts = {
+            "DlgErrZz": ("x := 1\n"
+                         "y := x.NoSuchMethodZz()\n"),
+            "DlgMsgZz": 'MsgBox("Waiting for you zz", "Dialog Probe Zz")\n',
+            "DlgNoneZz": 'DllCall("Sleep", "UInt", 30000)\n',
+        }
+        procs = {}
+        try:
+            for base, code in scripts.items():
+                (Path(d) / "hotkeys" / f"{base}.ahk").write_text("; launcher\n", encoding="utf-8")
+                f = bodies / f"{base}.body.ahk"
+                f.write_text("#Requires AutoHotkey v2.0\n#SingleInstance Off\n" + code,
+                             encoding="utf-8")
+                procs[base] = subprocess.Popen([vk.AHK_EXE, str(f)])
+            err = _poll(lambda: (lambda s: s if s.get("dialog") else None)(
+                vk.read_module_status("Dlg Err Zz")), 15)
+            assert err and err["running"], err
+            dlg = err["dialog"]
+            assert dlg["kind"] == "error" and dlg["pid"] == procs["DlgErrZz"].pid, dlg
+            assert dlg["title"] == "DlgErrZz.body.ahk", dlg
+            assert 'no method named "NoSuchMethodZz"' in dlg["text"], dlg
+            assert "Show call stack" not in dlg["text"], dlg
+            assert dlg["failing_line"].endswith("y := x.NoSuchMethodZz()"), dlg
+            assert {"ExitApp", "Continue"} <= set(dlg["buttons"]), dlg
+            assert err["note"].startswith("Alive, but sitting on an error dialog"), err["note"]
+            assert "stop_module ends it" in err["note"], err["note"]
+
+            msg = _poll(lambda: (lambda s: s if s.get("dialog") else None)(
+                vk.read_module_status("Dlg Msg Zz")), 15)
+            assert msg["dialog"]["kind"] == "message", msg
+            assert msg["dialog"]["text"] == "Waiting for you zz", msg
+            assert msg["dialog"]["title"] == "Dialog Probe Zz", msg
+            assert msg["note"].startswith("Alive, but sitting on a dialog"), msg["note"]
+
+            none = vk.read_module_status("Dlg None Zz")
+            assert none["running"] and "dialog" not in none, none
+            assert not none["note"].startswith("Alive, but"), none
+
+            # list_running: the same, per entry, and named in the note.
+            lr = vk.list_running()
+            by = {e["base"]: e for e in lr["running"]}
+            assert by["DlgErrZz"]["dialog"]["kind"] == "error", by
+            assert by["DlgMsgZz"]["dialog"]["kind"] == "message", by
+            assert "dialog" not in by["DlgNoneZz"], by
+            assert "Dlg Err Zz" in lr["note"] and "sitting on a dialog" in lr["note"], lr
+        finally:
+            for p in procs.values():
+                if p.poll() is None:
+                    p.kill()
+                    p.wait(timeout=10)
+    # The classifier on its own: a warning dialog, a long text capped.
+    w = vk._dialog_report("x.ahk", [], ["Warning: This local variable appears to never be "
+                                        "assigned a value.\r\n\r\nShow call stack »"],
+                          ["&ExitApp", "&Continue"])
+    assert w["kind"] == "warning" and w["text"].startswith("Warning:"), w
+    m = vk._dialog_report("t", ["a" * 5000], [], ["OK"])
+    assert m["kind"] == "message" and len(m["text"]) <= vk._DIALOG_TEXT_CAP + 4, m
+    assert vk._process_dialogs([]) == [] and vk._process_dialogs(None) == []
+
+
 def test_reference_bodies_are_readable_and_load():
     """Every shipped reference must be readable through the MCP surface AND
     actually load. A reference body carries a BODY's ..\\..\\lib\\ include
@@ -3038,8 +4124,9 @@ def test_macro_source_read_update_edit_and_kinds():
                               'TrayTip("keep me")\n')
         assert got["updated"] is True, got
         assert "previous_source" not in got, "the old source must not be echoed"
-        assert got["previous_source_sha256"] == hashlib.sha256(
-            prev.encode("utf-8")).hexdigest(), got
+        # The one content hash (_text_sha256: CRLF -> LF) — the same value
+        # read_macro_source reported as source_sha256 for that text.
+        assert got["previous_source_sha256"] == vk._text_sha256(prev), got
         assert got["previous_source_length"] == len(prev), got
         assert 'TrayTip("two")' in vk.read_macro_source("Raw Probe Zz")["source"]
         back = vk.read_macro_source("Raw Probe Zz", previous=True)
@@ -3079,7 +4166,7 @@ def test_macro_source_read_update_edit_and_kinds():
             vk.edit_macro("Raw Probe Zz", 'TrayTip("three")', 'TrayTip("three"')
             assert False, "a splice that kills the parse must be refused"
         except vk.VoiceKitError as e:
-            assert "rolled back" in str(e), e
+            assert "nothing was written" in str(e), e
         assert vk.read_macro_source("Raw Probe Zz")["source"] == after
         for bad, why in [(('TrayTip("gone")', "x"), "doesn't appear"),
                          (("TrayTip", "x"), "times"),
@@ -4075,7 +5162,7 @@ def test_rollbacks_and_backups_are_byte_exact():
             vk.edit_macro("Bytes Probe Zz", 'TrayTip("one")', 'TrayTip("one"')
             assert False
         except vk.VoiceKitError as e:
-            assert "rolled back" in str(e)
+            assert "nothing was written" in str(e), e
         assert mac.read_bytes() == raw, "a failed edit must leave the exact bytes"
 
         def raising(*a, **k):
@@ -6512,6 +7599,14 @@ def test_privacy_exempt_fields_and_logs_through_the_server():
             f"; p\ntext|{s.inv}||\n", encoding="utf-8")
         r = server._guard(vk.read_macro_source, "Raw Zz")
         assert r["source"] == vk.read_macro_source("Raw Zz")["source"] and str(s.inv) in r["source"]
+        # A batch edit's undo_edits are the caller's own splices, sent back
+        # verbatim — a masked path there would be refused as saved code.
+        g = server._guard(vk.edit_macro, "Raw Zz", edits=[
+            {"old_string": "; hand-written", "new_string": f"; from {s.inv}"},
+            {"old_string": f"; from {s.inv}", "new_string": f"; from {s.inv} (2)"}])
+        assert g["undo_edits"][1]["old_string"] == f"; from {s.inv}", g["undo_edits"]
+        server._guard(vk.edit_macro, "Raw Zz", edits=g["undo_edits"])
+        assert vk.read_macro_source("Raw Zz")["source"] == src
         w = server._guard(vk.read_workflow, "Raw Flow Zz")
         assert w["steps"][0]["a"] == str(s.inv), "read_workflow steps are exempt"
         (s.root / "logs" / "errors.log").write_text(

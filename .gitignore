@@ -6,6 +6,11 @@ logs/
 # Personal AI-action prompts — user content, like personal macros.
 prompts/
 
+# A module's own Python environments (tools\python\<env>\, 2026-10-14 — made by
+# the MCP, found by VkPythonExe in lib/_Common.ahk) and whatever helper scripts
+# a module keeps beside them: the user's data, built per machine, never shipped.
+/tools/
+
 # MCP server (optional add-on) — Python venv and caches are per-machine.
 mcp/.venv/
 __pycache__/

@@ -243,6 +243,64 @@ idxTxt := FileRead(fr "\hotkeys\_index.ahk", "UTF-8")
 Check("preflight parks a #Warn module whose warning blocks the check", r.ok = true, r.note)
 Check("...commenting out its line", InStr(idxTxt, semi ' #Include "%A_ScriptDir%\hotkeys\Warny.ahk"') > 0)
 
+; ---- 11b. a DEFAULT warning fails fast, with its text (2026-10-14) ----
+; No #Warn anywhere, and AutoHotkey still warns (an unassigned variable; a
+; call to a function that doesn't exist yet -- a half-finished edit) -- as a
+; dialog, so the check used to wait out its whole bound. lib\ValidateWarnings
+; .ahk (passed with /include) routes it to stdout: the check now fails at
+; once, naming the file, line and warning.
+unset1 := dir "\fx_unset.ahk"
+FileAppend("#Requires AutoHotkey v2.0`nMsgBox(neverAssignedZq)`n", unset1, "UTF-8")
+t0 := A_TickCount
+w := AhkValidate(unset1, 20000)
+took := A_TickCount - t0
+Check("a default-mode warning fails the check", w.ok = false, w.text)
+Check("...fast, not at the bound", took < 5000, "took=" took "ms")
+Check("...not as a timeout", w.timedOut = false)
+Check("...with the warning text, file and line",
+    InStr(w.text, "fx_unset.ahk (2) : ==> Warning:") && InStr(w.text, "neverAssignedZq"), w.text)
+half := dir "\fx_halfedit.ahk"
+FileAppend("#Requires AutoHotkey v2.0`nNotWrittenYetZq(1)`n", half, "UTF-8")
+w := AhkValidate(half, 20000)
+Check("a call to a function that isn't there yet fails fast with its warning",
+    !w.ok && !w.timedOut && InStr(w.text, "==> Warning:") && InStr(w.text, "NotWrittenYetZq"), w.text)
+; Only the types AutoHotkey enables by default: LocalSameAsGlobal is off by
+; default (no dialog at run time), so it must not start failing checks.
+lsg := dir "\fx_lsg.ahk"
+FileAppend("#Requires AutoHotkey v2.0`nzqG := 1`nF() {`n    zqG := 2`n    return zqG`n}`nF()`n", lsg, "UTF-8")
+w := AhkValidate(lsg, 20000)
+Check("a warning that is off by default doesn't fail the check", w.ok && w.text = "", w.text)
+; A file's own #Warn wins: no include, so its author's choice stands.
+own := dir "\fx_ownoff.ahk"
+FileAppend("#Requires AutoHotkey v2.0`n#Warn All, Off`nMsgBox(neverAssignedZq2)`n", own, "UTF-8")
+t0 := A_TickCount
+w := AhkValidate(own, 20000)
+Check("a file with its own '#Warn All, Off' passes, fast", w.ok && A_TickCount - t0 < 5000,
+    "ok=" w.ok " took=" (A_TickCount - t0) "ms " w.text)
+Check("AhkValidateWarnInclude: the include unless the file has its own #Warn",
+    InStr(AhkValidateWarnInclude(unset1), "\lib\ValidateWarnings.ahk") && AhkValidateWarnInclude(own) = ""
+    && AhkValidateWarnInclude(warnFx) = "")
+
+; The preflight parks a module that warns exactly as it parks a load error:
+; named from the warning line, its manifest line commented out, at once.
+FileAppend("warnlessProbe := neverAssignedZq3`n", fr "\hotkeys\Warnless.ahk", "UTF-8")
+FileAppend('#Include "%A_ScriptDir%\hotkeys\Warnless.ahk"' "`n", fr "\hotkeys\_index.ahk", "UTF-8")
+t0 := A_TickCount
+r := MasterPreflight(fr, 20000)
+took := A_TickCount - t0
+idxTxt := FileRead(fr "\hotkeys\_index.ahk", "UTF-8")
+Check("preflight parks a module whose default warning fails the check", r.ok = true, r.note)
+Check("...at once (no timeout, no retry at twice the bound)", took < 10000, "took=" took "ms")
+Check("...commenting out its line", InStr(idxTxt, semi ' #Include "%A_ScriptDir%\hotkeys\Warnless.ahk"') > 0,
+    StrReplace(idxTxt, "`n", " | "))
+Check("...and the note names it", InStr(r.note, "hotkeys\Warnless.ahk") > 0, r.note)
+Check("...and the healthy module stays on", InStr(idxTxt, "`n#Include `"%A_ScriptDir%\hotkeys\Keep.ahk`""))
+pfLog := ""
+Loop Files fr "\logs\*.*"
+    try pfLog .= FileRead(A_LoopFileFullPath, "UTF-8")
+Check("...and the log line carries the warning text", InStr(pfLog, "Warnless.ahk") && InStr(pfLog, "neverAssignedZq3"),
+    SubStr(pfLog, -300))
+
 ; ---- 12. watchdog decisions (pure) ----------------------------------
 ; Resume from sleep used to read as a crash: the watchdog's poll and the
 ; master's heartbeat both come due at wake, and a stale heartbeat alone

@@ -8,6 +8,86 @@ names).
 
 ---
 
+### 2026-10-14 — "Karbon File" feedback (a 1,500-line Chrome body built live over MCP)
+
+An agent spent two days building a hotkey module that files Karbon email
+threads (open hidden parts, download attachments, print to PDF, file into a
+client folder), with about 40 live edits made while the user kept pressing
+the key. It said most of the lost time came from #1, #2 and #4. Twelve items
+and three small notes; all built on branch `feedback-karbon-file`.
+
+- **#1 An error dialog in a body killed the hotkey silently.** AutoHotkey's
+  error dialog held the process (and its `BodySingleInstance` mutex) open, so
+  every later press was refused and the user saw "it's hung". Now, in
+  `lib\_Common.ahk`, without regenerating any body (every body calls
+  `BodySingleInstance` first, and that is where it identifies itself): an
+  uncaught error is logged as before, the body's own `OnError` handlers still
+  decide first, and if none takes it the WH_CBT hook ends the body (exit 3)
+  as AutoHotkey creates its dialog. The user instead gets a 30 s always-on-top
+  notice from a separate process (`lib\BodyErrorNotice.ahk`): which module
+  stopped, the message and line, that it's in `errors.log`, and that pressing
+  the key again retries. A final `BodyStatus` line says it stopped. The hook now recognises the error
+  dialog positively (`CREATESTRUCT.hInstance` 0, measured), so a body's own
+  MsgBox / InputBox / FileSelect / DirSelect are never mistaken for it. On
+  the MCP side, `read_module_status` and `list_running` report a live body
+  sitting on a dialog (`dialog: {title, text, kind, failing_line}`) and say
+  presses are ignored until it closes. Suite: `tests\body-error-selftest.ahk`.
+- **#2/#3 `UiaClickEl` clicked blind.** Chrome reports rectangles for
+  elements scrolled out of an inner panel or under a pinned header, and on a
+  three-monitor desk a download click landed on another monitor.
+  `UiaVisibleRect` clips only by scroll containers, the element's own
+  top-level window and a real monitor (never the desktop root, which is the
+  primary monitor's box). Its window is the nearest ancestor that is a
+  window root (`UiaClipChain`, `UiaIsWindowRoot`, `UiaNativeHwnd`), because
+  UIA lists an owned dialog under its owner (measured); a walk that stops
+  short is a refusal. `UiaClickEl` (and so `UiaInvoke`'s fallback, `UiaClickCenter`,
+  `UiaClickName`, `BrowserTypeVerified` and the `fill` step) clicks the centre
+  of the VISIBLE part. It first hit-tests that point (`UiaElementAtPoint`,
+  `UiaHitTest`). If the element is hidden or covered, it tries ScrollIntoView,
+  checks again, and then refuses without clicking. Its `&why` gives the reason
+  with no window or program names; those go in a new `&detail`.
+  It works in per-monitor-v2 DPI so mixed-scale monitors agree.
+  `UiaClickablePoint` answers the question without clicking. The `fill` step
+  no longer sets a covered box through ValuePattern: its fallback is only for
+  "nowhere visible to click".
+- **#4 Multi-step edits.** `edit_hotkey_module` / `edit_macro` take
+  `edits=[...]` (applied in order, one load check, one write; the reply
+  carries the inverse batch). Load checks no longer hang on AutoHotkey's
+  default warnings. `AhkValidate` / `validate_ahk` `/include
+  lib\ValidateWarnings.ahk` (VarUnset + Unreachable to StdOut), and any
+  `==> Warning:` now fails the check in about 0.1 s, with its text and a Hint
+  (it used to time out after 20 s). The preflight parks a module that warns.
+- **#5 Concurrent sessions.** `expected_sha256` on edit/update of modules
+  and macros. Every read, create, edit and update returns the same hash
+  (`_text_sha256`). A change that lands during the load check is refused too.
+- **#6 A press mid-edit.** Live edits and create-replaces check a non-`.ahk`
+  copy beside the file and `os.replace` it in (`_swap_validated*`). A press
+  sees the whole old file or the whole new one.
+- **#7 `run_ahk_snippet(include_module="Karbon File")`** includes only the
+  module's functions and classes. Top-level statements are blanked, so line
+  numbers match the real file. The module's own `A_ScriptDir` / `A_LineFile`
+  are the real ones, and the reply lists the names its startup code would have
+  set.
+- **#8 `dump_uia_tree`** takes `root_id` / `root_name`, `positions` and
+  `visible_only`. `UiaDumpSubtree` is the library half. The fingerprint and
+  node counts don't change with any of them.
+- **#9** `UiaFindAncestorById` / `UiaFindAncestorByName` walk up from a
+  known element.
+- **#10** `UiaName(el, true)` / `UiaStripIcons` drop private-use (icon-font)
+  characters. Dumps show them as `<U+E611>`.
+- **#11** Code saved over MCP that assigns a string or number to `.base`
+  (or an object-literal `base:`) is refused with the line number. A runtime
+  error from it gets a Hint.
+- **#12 `ensure_python_env(env, packages)`** makes a per-module virtual
+  environment at `tools\python\<env>\` (gitignored, never shipped, never
+  inside `mcp\.venv`), and `VkPythonExe(env)` finds it from a body. A long
+  install continues as a background job.
+- **Small notes.** Tool texts state the real 50 s cap (`max_wait_s`).
+  `create_hotkey_module` explains how to change the spoken phrase in Voice
+  Access, or add an alternate one ("Carbon"), without touching the key.
+
+Left out / still open: see `docs\backlog.md` (2026-10-14).
+
 ### 2026-10-12 — ProConnect-session feedback (UIA diagnosis, relative fill, module step, dry run)
 
 An agent automated a tax-preparation web app (Intuit ProConnect) in Chrome

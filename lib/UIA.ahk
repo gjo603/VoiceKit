@@ -78,6 +78,34 @@
 ;  search from the window root, or through these helpers — never a
 ;  raw ComCall(5/6) from a sub-element.
 ;
+;  !! A RECTANGLE IS NOT A PLACE YOU CAN CLICK !! (2026-10-14)
+;  Chrome reports a rectangle for an element scrolled outside an inner
+;  scroll panel, or sitting under a header pinned over the panel, and a
+;  click at that rectangle lands on whatever is really there — on a
+;  three-monitor desk, once, a different monitor. So UiaClickEl (and
+;  everything built on it) clicks only inside UiaVisibleRect — the part
+;  of the element its scrolling containers, its window and a real
+;  monitor all let through — then hit-tests that point
+;  (UiaElementAtPoint) and refuses, with &why saying what kind of
+;  thing is in the way (&detail names it), when the point belongs to
+;  something else. Never click a raw UiaRect from a module; go through
+;  UiaClickEl / UiaClickablePoint.
+;
+;  Coordinates follow the CALLING THREAD's DPI context (measured
+;  2026-10-14: UIA rectangles, MonitorGet, WindowFromPoint and
+;  MouseMove all do), so the numbers these functions take and give
+;  agree with each other and with MouseClick/MouseGetPos in the same
+;  script. AutoHotkey runs system-DPI-aware, where Windows virtualizes
+;  coordinates on a monitor whose scale differs from the main one, so
+;  UiaClickEl decides and clicks inside UiaDpiPhysical() /
+;  UiaDpiRestore() (physical pixels, nothing virtualized).
+;
+;  The click path's &why never contains an element name, a window
+;  title or a program name — the workflow engine records it, and those
+;  can name a client. &detail (UiaClickEl, UiaClickablePoint,
+;  UiaVisibleRect, UiaHitTest ...) is the same text WITH them, for a
+;  local log or Out().
+;
 ;  Elements are ComValue(13) wrappers (VT_UNKNOWN), so AHK
 ;  releases them for you when they go out of scope.
 ; ============================================================
@@ -121,7 +149,13 @@ UIA_SCOPE_SUBTREE()     => 7
 ; Pattern ids (UIA_*PatternId).
 UIA_PAT_INVOKE()     => 10000
 UIA_PAT_VALUE()      => 10002
+UIA_PAT_SCROLL()     => 10004   ; a scroll CONTAINER (what clips its content)
 UIA_PAT_SCROLLITEM() => 10017
+
+; How far UiaVisibleRect climbs looking for the top-level window. A real
+; tree is far shallower (a deep Chrome page is under 100 levels); hitting
+; this means the walk is broken, and the visible area is then unknown.
+UIA_VIS_MAX_HOPS() => 256
 
 ; How much of a subtree a text walk will look at before giving up. Same
 ; shape as Acc.ahk's AccNodeOnce limits and for the same reason: a browser's
@@ -300,23 +334,63 @@ UiaFromWindow(hwnd, &why?) {
     return ""
 }
 
-; The element under a screen point. Guarded like UiaFromWindow: if the
-; window under the point is ours, ElementFromPoint would query our own
-; provider on this blocked thread — the same deadlock through a different
-; entrance. Resolve the window first and refuse our own.
-; Returns the element, or "" (nothing there, our own window, no UIA).
-UiaFromPoint(x, y) {
-    if !UiaAvailable()
+; The element under a screen point (IUIAutomation::ElementFromPoint — the
+; POINT goes by value as one int64, y in the high half). Guarded like
+; UiaFromWindow: if the window under the point is ours, ElementFromPoint
+; would query our own provider on this blocked thread — the same deadlock
+; through a different entrance. So the window is resolved first
+; (WindowFromPoint + its process) and our own is refused. This is the hit
+; test UiaClickEl runs before every click (see UiaHitTest). A provider may
+; answer with the nearest hit-testable ANCESTOR rather than the leaf under
+; the point (Chrome does), and a point over no window answers the desktop.
+; Returns the element, or ""; `why` is "" on success, else why there is
+; none (UIA unavailable, not a point, our own window there, or the call
+; failed). x and y may be Floats (r.x + r.w / 2): they are rounded.
+UiaElementAtPoint(x, y, &why?) {
+    why := ""
+    if !UiaAvailable() {
+        why := "UI Automation is unavailable on this system"
         return ""
+    }
+    if !UiaPointArg(&x, &y) {
+        why := "not a screen point (x and y must be numbers)"
+        return ""
+    }
     pt := (y << 32) | (x & 0xFFFFFFFF)
     hwnd := DllCall("WindowFromPoint", "int64", pt, "ptr")
-    if (hwnd && !UiaOtherProcess(hwnd))
+    if (hwnd && !UiaOtherProcess(hwnd)) {
+        why := "the window at " x "," y " belongs to this script's own process — refused, because UIA against its own process deadlocks"
         return ""
+    }
     try {
         ComCall(7, UiaAuto(), "int64", pt, "ptr*", &el := 0)     ; ElementFromPoint
-        return UiaWrap(el)
+        if el
+            return UiaWrap(el)
+        why := "ElementFromPoint returned nothing at " x "," y
+    } catch as e {
+        why := "ElementFromPoint failed at " x "," y ": " UiaErrText(e)
     }
     return ""
+}
+
+; Rounds x and y to whole pixels in place — the int64 POINT packing below
+; throws on a Float (measured 2026-10-14: `r.x + r.w / 2` is a Float in v2,
+; and "Expected an Integer but got a Float" escaped a function that
+; promises never to throw).
+; Returns true when both are numbers (now Integers), false otherwise.
+UiaPointArg(&x, &y) {
+    try {
+        x := Integer(Round(x)), y := Integer(Round(y))
+        return true
+    }
+    return false
+}
+
+; The element under a screen point — UiaElementAtPoint without the &why
+; (kept for existing callers).
+; Returns the element, or "" (nothing there, our own window, no UIA).
+UiaFromPoint(x, y) {
+    return UiaElementAtPoint(x, y)
 }
 
 ; The element with keyboard focus. Same guard, third entrance: the focused
@@ -409,24 +483,95 @@ UiaSameElement(el1, el2) {
 
 ; ---- IUIAutomationElement (vtable slots) ------------------------------
 ;   3 SetFocus             5 FindFirst            6 FindAll
-;  16 GetCurrentPattern   21 get_CurrentControlType
-;  23 get_CurrentName     28 get_CurrentIsEnabled
-;  29 get_CurrentAutomationId  35 get_CurrentIsPassword
+;  16 GetCurrentPattern   20 get_CurrentProcessId
+;  21 get_CurrentControlType  23 get_CurrentName
+;  28 get_CurrentIsEnabled    29 get_CurrentAutomationId
+;  35 get_CurrentIsPassword   38 get_CurrentIsOffscreen
 ;  43 get_CurrentBoundingRectangle
+;  (20 and 38 added 2026-10-14, counted off IUIAutomationElementVtbl in
+;  UIAutomationClient.h, SDK 10.0.26100.0, and exercised by the selftest.)
 ;
 ; ---- IUIAutomationElementArray (what FindAll hands back) --------------
 ;   3 get_Length           4 GetElement
 
 ; The element's UIA Name, or "" (no element, or the read failed).
-; Returns the Name string, or "" (no element, no name, or the read failed).
-UiaName(el) {
+;
+; stripIcons := true drops icon-font characters first (UiaStripIcons):
+; 2026-10-14, a web app's "..." toggle had an accessible name that was ONE
+; private-use character (U+E611, an icon-font glyph), so every "has no
+; name" check said it had one. Default false: the name exactly as exposed.
+; Returns the Name string, or "" (no element, no name, nothing but icon
+; characters with stripIcons, or the read failed).
+UiaName(el, stripIcons := false) {
     if !el
         return ""
     try {
         ComCall(23, el, "ptr*", &b := 0)                         ; get_CurrentName
-        return UiaBStrOut(b)
+        s := UiaBStrOut(b)
+        return stripIcons ? UiaStripIcons(s) : s
     }
     return ""
+}
+
+; Private Use Area characters as one regex class: the BMP block
+; U+E000-U+F8FF and supplementary planes 15/16 (U+F0000-U+FFFFD,
+; U+100000-U+10FFFD). Icon fonts (Font Awesome, Material, a web app's own
+; glyph font) map their pictures there, and the accessibility tree hands
+; the glyph out as the element's text. Measured 2026-10-14: AutoHotkey's
+; PCRE runs in UTF mode, so the plane-15/16 ranges match a whole surrogate
+; pair (a range written as raw surrogates is a compile error there).
+; Returns the regex character class as a string.
+UiaIconCharClass() {
+    return "[\x{E000}-\x{F8FF}\x{F0000}-\x{FFFFD}\x{100000}-\x{10FFFD}]"
+}
+
+; `text` without icon-font (Private Use Area) characters, then trimmed —
+; so a name that is only an icon reads as "". What UiaName(el, true) does.
+; Returns the cleaned text, "" when nothing else was there.
+UiaStripIcons(text) {
+    return Trim(UiaIconMap(text, false))
+}
+
+; `text` with each icon-font character written out as <U+E611> — how the
+; tree dump shows them, so an icon-only name is visible and greppable
+; instead of an invisible box (the fingerprint still hashes the raw name).
+; Returns the text with every Private Use Area character replaced by its
+; <U+XXXX> form (unchanged when it has none).
+UiaShowIcons(text) {
+    return UiaIconMap(text, true)
+}
+
+; The one scan behind UiaStripIcons / UiaShowIcons: each Private Use Area
+; character dropped (show false) or written as <U+XXXX> (show true).
+; Walked code unit by code unit rather than by regex: measured 2026-10-14,
+; a LONE high surrogate (malformed UTF-16, which a provider can hand out)
+; made the regex take it AND the next real character as one plane-15/16
+; character — UiaStripIcons("a" Chr(0xDB80) "b") returned "a". Here a
+; surrogate counts as half of a pair only when the other half is really
+; there; a stray one is left as it is. The regex is the fast path: no
+; match means nothing to change.
+; Returns the mapped text (the same string when it holds no PUA character).
+UiaIconMap(text, show) {
+    try {
+        if !RegExMatch(text, UiaIconCharClass())
+            return text
+    }
+    out := "", p := StrPtr(text), n := StrLen(text), i := 0
+    while (i < n) {
+        u := NumGet(p, i * 2, "ushort"), len := 1, cp := u
+        if (u >= 0xD800 && u <= 0xDBFF && i + 1 < n) {
+            lo := NumGet(p, (i + 1) * 2, "ushort")
+            if (lo >= 0xDC00 && lo <= 0xDFFF)
+                cp := 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00), len := 2
+        }
+        if ((cp >= 0xE000 && cp <= 0xF8FF) || (cp >= 0xF0000 && cp <= 0xFFFFD)
+            || (cp >= 0x100000 && cp <= 0x10FFFD))
+            out .= show ? Format("<U+{:04X}>", cp) : ""
+        else
+            out .= SubStr(text, i + 1, len)
+        i += len
+    }
+    return out
 }
 
 ; The element's AutomationId (the app developer's id for it), or "".
@@ -471,6 +616,134 @@ UiaIsPassword(el) {
         return v != 0
     }
     return false
+}
+
+; True when the provider says the element is not on screen
+; (UIA_IsOffscreenPropertyId 30022). Chrome sets it for content clipped by
+; a scroll container; a Win32 list sets it for rows past the fold. It is
+; NOT a complete answer — measured 2026-10-14: a Win32 child control
+; clipped entirely out of its scrolling parent pane reports false (and a
+; rectangle) — which is why UiaVisibleRect also intersects the containers.
+; Returns true when the element reports itself offscreen; false when it
+; doesn't, for no element, or when the read failed.
+UiaIsOffscreen(el) {
+    if !el
+        return false
+    try {
+        ComCall(38, el, "int*", &v := 0)                         ; get_CurrentIsOffscreen
+        return v != 0
+    }
+    return false
+}
+
+; The id of the process the element belongs to — how a hit test says the
+; thing in the way is ANOTHER program's window.
+; Returns the process id, or 0 for no element or a failed read.
+UiaProcessId(el) {
+    if !el
+        return 0
+    try {
+        ComCall(20, el, "int*", &v := 0)                         ; get_CurrentProcessId
+        return v
+    }
+    return 0
+}
+
+; The element's own window handle (UIA_NativeWindowHandlePropertyId 30020)
+; — set for an element that IS a window (a top-level window, a Win32 child
+; control, Chrome's render widget), 0 for content inside one.
+; Returns the HWND, or 0 for no element, no window of its own, or a failed
+; read.
+UiaNativeHwnd(el) {
+    if !el
+        return 0
+    try {
+        ComCall(36, el, "ptr*", &h := 0)                         ; get_CurrentNativeWindowHandle
+        return h
+    }
+    return 0
+}
+
+; True when the element is a top-level window by Win32's rules: its own HWND
+; is its root (GetAncestor GA_ROOT). Unlike UiaIsTopLevel this is true for an
+; OWNED window too — a dialog, a dropdown, an autocomplete popup — which UIA
+; lists as a CHILD of its owner window, not of the desktop (review,
+; 2026-10-14: clipping by "the ancestor below the desktop root" clipped a
+; dialog's controls to its owner's box). One property read, no tree walk.
+; Returns true for a top-level window's element; false otherwise, for no
+; element, the desktop root, or on any failure.
+UiaIsWindowRoot(el) {
+    h := UiaNativeHwnd(el)
+    return h != 0 && DllCall("GetAncestor", "ptr", h, "uint", 2, "ptr") = h   ; GA_ROOT
+}
+
+; The ancestors that decide what of el can be seen, nearest-first, ending
+; with its top-level window — the nearest ancestor that UiaIsWindowRoot
+; (so an owned dialog's controls end at the dialog, not its owner). The
+; desktop root is never in it: its box is the PRIMARY monitor. A walk that
+; stops before reaching a window is a FAILURE, never taken as complete —
+; UiaParent's "" means both "the top" and "the read failed", and a broken
+; walk once read as "the last wrapper reached is the window" (review,
+; 2026-10-14). Shared by UiaVisibleRect, UiaClipAbove and UiaHitCountsFor,
+; so a click and a visibleOnly dump agree on what clips. Bounded by
+; UIA_VIS_MAX_HOPS() parent steps.
+; Returns an array of elements (empty when el is itself a window root), or
+; "" when its window can't be reached; `why` is "" or says so (no names).
+UiaClipChain(el, &why?) {
+    why := ""
+    if !el {
+        why := "no element"
+        return ""
+    }
+    chain := []
+    if UiaIsWindowRoot(el)
+        return chain
+    node := el
+    Loop UIA_VIS_MAX_HOPS() {
+        node := UiaParent(node)
+        if (node = "") {
+            why := "couldn't reach the element's window (the walk up the tree stopped short) — its visible area is unknown"
+            return ""
+        }
+        chain.Push(node)
+        if UiaIsWindowRoot(node)
+            return chain
+    }
+    why := "couldn't reach the element's window within " UIA_VIS_MAX_HOPS() " parent steps — its visible area is unknown"
+    return ""
+}
+
+; True for a scrolling container — an element with ScrollPattern (the same
+; thing as UIA_IsScrollPatternAvailablePropertyId 30034), i.e. one that
+; clips what it holds to its own box. Measured 2026-10-14: a Win32 list and
+; a child window with scroll bars both say true, a top-level window and a
+; button say false.
+; Returns true when the element has ScrollPattern; false otherwise, for no
+; element, or on any failure.
+UiaIsScrollContainer(el) {
+    if !el
+        return false
+    try {
+        ComCall(16, el, "int", UIA_PAT_SCROLL(), "ptr*", &pat := 0)   ; GetCurrentPattern
+        if pat {
+            UiaWrap(pat)                     ; released when the wrapper goes
+            return true
+        }
+    }
+    return false
+}
+
+; One line naming an element the way the tree dump does —
+;     Button "Save" <id=SaveBtn>
+; with newlines folded and icon-font characters shown as <U+E611>.
+; Returns the one-line description (Type "name", plus <id=...> when it has
+; an AutomationId), or "" for no element.
+UiaDescribe(el) {
+    if !el
+        return ""
+    name := UiaShowIcons(StrReplace(StrReplace(UiaName(el), "`r", " "), "`n", " "))
+    aid := UiaAutomationId(el)
+    return UiaControlTypeName(UiaControlType(el)) ' "' name '"' (aid != "" ? " <id=" aid ">" : "")
 }
 
 ; The element's UIA_*ControlTypeId (50004 = Edit, ...), or 0. Worth reading
@@ -1090,11 +1363,12 @@ UiaScrollIntoView(el) {
 ; `why` says which precondition failed. A dry run logs the Invoke (UiaDryRun)
 ; and returns true; the click fallback is logged by the shim's MouseClick.
 ; Returns true when pressed (or a dry run logged it), false otherwise; `why`
-; is "" on success, else what failed.
-UiaInvoke(el, &why?) {
-    why := ""
+; is "" on success, else what failed (no names or titles); `detail` is the
+; same with them (UiaClickEl's).
+UiaInvoke(el, &why?, &detail?) {
+    why := "", detail := ""
     if !el {
-        why := "no element — the find returned nothing"
+        why := detail := "no element — the find returned nothing"
         return false
     }
     try {
@@ -1107,7 +1381,7 @@ UiaInvoke(el, &why?) {
             return true
         }
     }
-    return UiaClickEl(el, 0, "Left", 1, &why)
+    return UiaClickEl(el, 0, "Left", 1, &why, &detail)
 }
 
 ; Convenience: find by name in a window and press it. The one-liner most
@@ -1115,15 +1389,16 @@ UiaInvoke(el, &why?) {
 ; True when pressed; on false, `why` names what went wrong (nothing found /
 ; nowhere to click).
 ; Returns true when pressed, false otherwise; `why` is "" on success, else
-; what went wrong (nothing found / nowhere to click).
-UiaClickName(hwnd, name, timeoutMs := 3000, &why?) {
-    why := ""
+; what went wrong (nothing found / nowhere to click); `detail` adds the names
+; a click refusal leaves out of `why` (UiaClickEl's).
+UiaClickName(hwnd, name, timeoutMs := 3000, &why?, &detail?) {
+    why := "", detail := ""
     el := UiaFind(hwnd, name, timeoutMs, 1, &fwhy)
     if !el {
-        why := UiaNotFoundText(name, fwhy)
+        why := detail := UiaNotFoundText(name, fwhy)
         return false
     }
-    return UiaInvoke(el, &why)
+    return UiaInvoke(el, &why, &detail)
 }
 
 ; The click helpers' &why for a find that came back empty: a plain miss
@@ -1137,6 +1412,315 @@ UiaNotFoundText(name, findWhy) {
     return "couldn't search the window for '" name "': " findWhy
 }
 
+; ---- what is actually visible (2026-10-14) ---------------------------
+;  A rectangle says where an element IS, not whether you can see it. From a
+;  real build (a browser module driving a triage view in Chrome): Chrome
+;  reports rectangles for elements scrolled outside an inner scroll panel
+;  and for elements under a header pinned over the panel, so a click at the
+;  rectangle landed on whatever was really there — once on a different
+;  monitor, sending a download click somewhere else entirely. The
+;  reporter's two failed fixes are the spec for what NOT to do:
+;    - intersecting EVERY ancestor's box wipes the area out, because web
+;      wrappers are often smaller than the content they hold;
+;    - climbing to the desktop root and intersecting with it wipes out
+;      anything on a secondary monitor — the root's box is the PRIMARY
+;      monitor (measured here too: the root reports 0,0 at the primary
+;      monitor's size).
+;  UiaVisibleRect intersects only what really clips: ancestors that are
+;  scroll containers, the top-level window (and stops THERE), and a real
+;  monitor — and honours IsOffscreen. What it cannot see is something drawn
+;  ON TOP (a pinned header, an overlay, another app); that is the hit
+;  test's job (UiaHitTest), and UiaClickEl runs both before every click.
+
+; The overlap of two {x, y, w, h} rectangles.
+; Returns the overlap as {x, y, w, h}, or "" when they don't overlap (or
+; either is not a rectangle).
+UiaIntersect(a, b) {
+    if (!IsObject(a) || !IsObject(b))
+        return ""
+    l := Max(a.x, b.x), t := Max(a.y, b.y)
+    r := Min(a.x + a.w, b.x + b.w), btm := Min(a.y + a.h, b.y + b.h)
+    return (r > l && btm > t) ? {x: l, y: t, w: r - l, h: btm - t} : ""
+}
+
+; The part of rectangle r that is on a real monitor — the largest piece
+; when it spans two. The virtual screen alone won't do: with monitors of
+; different sizes it is not a rectangle, and a point inside its bounds can
+; still be on no monitor at all.
+; Returns the largest on-monitor piece as {x, y, w, h}, or "" when no part
+; of r is on any monitor.
+UiaOnMonitors(r) {
+    best := "", bestArea := 0
+    if !IsObject(r)
+        return ""
+    Loop MonitorGetCount() {
+        try MonitorGet(A_Index, &ml, &mt, &mr, &mb)
+        catch
+            continue
+        piece := UiaIntersect(r, {x: ml, y: mt, w: mr - ml, h: mb - mt})
+        if (IsObject(piece) && piece.w * piece.h > bestArea)
+            best := piece, bestArea := piece.w * piece.h
+    }
+    return best
+}
+
+; The part of the element actually visible on screen: its rectangle,
+; clipped by every ancestor that is a scroll container (UiaIsScrollContainer
+; — never plain wrappers), by its own top-level window (UiaClipChain's last
+; element — an owned dialog's, not its owner's; the desktop root is never
+; used), and by the monitors (UiaOnMonitors). An element that reports
+; IsOffscreen is not visible whatever its rectangle says. Read-only;
+; bounded by UIA_VIS_MAX_HOPS() parent steps; never throws. Something drawn
+; OVER the element is not seen here — see UiaHitTest. In the calling
+; thread's DPI context, like UiaRect (see the file header). `chain` is
+; UiaClipChain(el) when the caller already has it (one walk per click).
+; Returns {x, y, w, h} in screen pixels, or ""; `why` is "" when visible,
+; else why not (no rectangle, offscreen, outside a scroll container or its
+; window, its window unreachable, on no monitor) with no names or titles;
+; `detail` is the same naming the container or window.
+UiaVisibleRect(el, &why?, &detail?, chain := "") {
+    why := "", detail := ""
+    if !el {
+        why := detail := "no element — the find returned nothing"
+        return ""
+    }
+    r := UiaRect(el)
+    if !IsObject(r) {
+        why := detail := "the element has no bounding rectangle (offscreen, collapsed or virtualized)"
+        return ""
+    }
+    if UiaIsOffscreen(el) {
+        why := detail := "the element reports itself offscreen (IsOffscreen) — scrolled out of view or hidden"
+        return ""
+    }
+    if !IsObject(chain)
+        chain := UiaClipChain(el, &cwhy)
+    if !IsObject(chain) {
+        why := detail := cwhy
+        return ""
+    }
+    n := chain.Length
+    for i, a in chain {
+        isTop := (i = n)            ; el's own top-level window
+        if (!isTop && !UiaIsScrollContainer(a))
+            continue
+        ar := UiaRect(a)
+        clipped := UiaIntersect(r, ar)
+        if !IsObject(clipped) {
+            if isTop {
+                tail := IsObject(ar) ? "" : " (the window has no rectangle — minimized or hidden?)"
+                why := "it lies outside its window" tail
+                detail := "it lies outside its window " UiaDescribe(a) tail
+            } else {
+                why := "it lies outside the visible area of the scrolling container (" UiaKind(a)
+                     . ") that holds it — scrolled out of view"
+                detail := "it lies outside the visible area of the scrolling container " UiaDescribe(a)
+                        . " — scrolled out of view"
+            }
+            return ""
+        }
+        r := clipped
+    }
+    vis := UiaOnMonitors(r)
+    if !IsObject(vis) {
+        why := detail := "it is not on any monitor (at " r.x "," r.y " " r.w "x" r.h ") — its window is off-screen"
+        return ""
+    }
+    return vis
+}
+
+; "a Pane", "an Edit" — an element's control type with its article, which
+; is all the click path's &why says about the things it names (no names or
+; titles: see the file header).
+; Returns the phrase, or "nothing" for no element.
+UiaKind(el) {
+    if !el
+        return "nothing"
+    t := UiaControlTypeName(UiaControlType(el))
+    return (InStr("AEIOU", SubStr(t, 1, 1)) ? "an " : "a ") t
+}
+
+; UiaVisibleRect, polled every 100 ms for up to timeoutMs — what a click
+; waits for after asking an element to scroll itself into view.
+; Returns the visible rectangle, or "" when there still is none at the
+; deadline; `why` / `detail` are UiaVisibleRect's from the last look.
+UiaWaitVisible(el, timeoutMs := 1200, &why?, &detail?, chain := "") {
+    deadline := A_TickCount + timeoutMs
+    loop {
+        v := UiaVisibleRect(el, &why, &detail, chain)
+        if (IsObject(v) || A_TickCount >= deadline)
+            return v
+        UiaSleep(100)
+    }
+}
+
+; Does a click at screen point x,y reach `el`? Asks what is AT the point
+; (UiaElementAtPoint) and accepts el itself, anything inside el, or an
+; ancestor UiaHitCountsFor accepts — one BELOW el's nearest scroll
+; container / Document / window (Chrome answers with the nearest
+; hit-testable ancestor; a hit on the container itself proves nothing).
+; Anything else is in the way — a header pinned over a scroll panel, an
+; overlay, another program's window. A window of THIS script at the point
+; is reported as in the way without asking UIA about it (the own-process
+; rule). Read-only. x and y may be Floats (rounded). `chain` is
+; UiaClipChain(el) when the caller already has it; otherwise it is walked
+; only when the hit is not el or inside it.
+; Returns 1 when the click would reach el, 0 when something else is there,
+; -1 when the hit test itself is unavailable; `what` says what is there (its
+; control type, and "in another program" — no names or titles) or why
+; there is no answer; `detail` names it, its window title and its program.
+UiaHitTest(el, x, y, &what?, &detail?, chain := "") {
+    what := "", detail := ""
+    if !el {
+        what := detail := "no element"
+        return -1
+    }
+    if !UiaPointArg(&x, &y) {
+        what := detail := "not a screen point (x and y must be numbers)"
+        return -1
+    }
+    pt := (y << 32) | (x & 0xFFFFFFFF)
+    hwnd := DllCall("WindowFromPoint", "int64", pt, "ptr")
+    top := hwnd ? DllCall("GetAncestor", "ptr", hwnd, "uint", 2, "ptr") : 0     ; GA_ROOT
+    title := ""
+    if top
+        try title := WinGetTitle("ahk_id " top)
+    if (hwnd && !UiaOtherProcess(hwnd)) {
+        what := "a window of this script's own process"
+        detail := what (title != "" ? ' ("' title '")' : "")
+        return 0
+    }
+    hit := UiaElementAtPoint(x, y, &hwhy)
+    if !hit {
+        what := detail := hwhy
+        return -1
+    }
+    if (UiaSameElement(hit, el) || UiaIsWithin(hit, el))
+        return 1
+    if !IsObject(chain)
+        chain := UiaClipChain(el)
+    if UiaHitCountsFor(el, hit, chain)
+        return 1
+    what := UiaKind(hit)
+    detail := UiaDescribe(hit) (title != "" ? ' in window "' title '"' : "")
+    holder := false
+    if IsObject(chain) {
+        for a in chain
+            if UiaSameElement(a, hit) {
+                holder := true
+                break
+            }
+    } else
+        holder := UiaIsWithin(el, hit)
+    if holder {
+        holds := " that holds the element (its scrolling container, page or window — the point is not on the element itself)"
+        what .= holds, detail .= holds
+    }
+    hp := UiaProcessId(hit), ep := UiaProcessId(el)
+    if (hp && ep && hp != ep) {
+        exe := ""
+        try exe := ProcessGetName(hp)
+        what .= " in another program"
+        detail .= " — another program" (exe != "" ? " (" exe ")" : "")
+    }
+    return 0
+}
+
+; Does a hit test that answered `anc` (an ancestor of el) count as a hit
+; on el? Chrome answers with the nearest hit-testable ANCESTOR of what is
+; under the point (a link's wrapper for its text), so some must — but not
+; one a click can land on WITHOUT touching el: el's nearest scroll
+; container, a Document, the top-level window, or anything above them.
+; (Review, 2026-10-14: the first version accepted any ancestor but the
+; desktop root. A header pinned over a scroll panel is often a plain
+; styled box the accessibility tree ignores, so a hit test there answers
+; with the panel or the page — an ancestor — and the click went into the
+; header. Measured on Win32: a hit over a button, an edit, a static or a
+; list-box row is the element itself; over a ListView row it is the row's
+; own Text child — both inside el, so this rule costs them nothing.)
+; The window is el's OWN top-level window (UiaClipChain's last element), so
+; an owned dialog is its own boundary. `chain` is UiaClipChain(el) when the
+; caller already has it.
+; Returns true when anc is an ancestor of el strictly below that boundary;
+; false otherwise, including for no element or an unreachable window.
+UiaHitCountsFor(el, anc, chain := "") {
+    if (!el || !anc)
+        return false
+    if !IsObject(chain)
+        chain := UiaClipChain(el)
+    if !IsObject(chain)
+        return false
+    n := chain.Length
+    for i, a in chain {
+        if (i = n)                              ; the top-level window
+            return false
+        if (UiaIsScrollContainer(a) || UiaControlType(a) = UIA_TYPE_DOCUMENT())
+            return false
+        if UiaSameElement(a, anc)
+            return true
+    }
+    return false
+}
+
+; ---- DPI: one coordinate space for the whole click (2026-10-14) ---------
+;  Measured here (one 2560x1600 monitor at 150%): a UIA rectangle,
+;  MonitorGet, WinGetPos, WindowFromPoint and MouseMove ALL follow the
+;  calling thread's DPI awareness — a DPI-unaware thread got 247,270
+;  200x60 for a button that a per-monitor-aware one saw at 371,405
+;  300x90. AutoHotkey runs system-aware, where every one of them is
+;  virtualized on a monitor whose scale differs from the main one —
+;  the reporter's three-monitor desk. Per-monitor-v2 awareness means
+;  physical pixels and no virtualization anywhere, so UiaClickEl
+;  decides and clicks inside it. Not measured: a real mixed-scale desk
+;  (none here); on a single-scale desk the numbers are identical.
+
+; Puts this thread in per-monitor-v2 DPI awareness (physical pixels, no
+; virtualization) until UiaDpiRestore(prev). Wrap a decision AND the click
+; that uses it, never one without the other:
+;     prev := UiaDpiPhysical()
+;     try p := UiaClickablePoint(el, 0, &why), (p && MouseClick(, p.x, p.y))
+;     finally UiaDpiRestore(prev)
+; Inside it, wait with UiaSleep, not Sleep (a timer that runs during a
+; Sleep would inherit the context).
+; Returns the previous context to hand to UiaDpiRestore, or 0 when Windows
+; can't switch (before Windows 10 1703 — nothing changed then).
+UiaDpiPhysical() {
+    prev := 0
+    try prev := DllCall("SetThreadDpiAwarenessContext", "ptr", -4, "ptr")   ; PER_MONITOR_AWARE_V2
+    return prev
+}
+
+; Ends a UiaDpiPhysical scope: puts back the context it returned (0 does
+; nothing).
+; Returns nothing.
+UiaDpiRestore(prev) {
+    if prev
+        try DllCall("SetThreadDpiAwarenessContext", "ptr", prev, "ptr")
+}
+
+; Sleep(ms) — in the script's OWN DPI context for its duration. Sleep lets
+; this thread's timers and hotkeys run, and inside a UiaDpiPhysical scope
+; they would otherwise inherit per-monitor awareness (their own WinMove or
+; MouseGetPos numbers would change on a mixed-scale desk). Outside a scope
+; it is a plain Sleep.
+; Returns nothing.
+UiaSleep(ms) {
+    cur := 0, own := 0
+    try {
+        cur := DllCall("GetThreadDpiAwarenessContext", "ptr")
+        own := DllCall("GetDpiAwarenessContextForProcess", "ptr", DllCall("GetCurrentProcess", "ptr"), "ptr")
+        if (cur && own && DllCall("AreDpiAwarenessContextsEqual", "ptr", cur, "ptr", own))
+            cur := 0
+    }
+    if !(cur && own) {
+        Sleep(ms)
+        return
+    }
+    DllCall("SetThreadDpiAwarenessContext", "ptr", own, "ptr")
+    try Sleep(ms)
+    finally DllCall("SetThreadDpiAwarenessContext", "ptr", cur, "ptr")
+}
+
 ; ---- clicking for real ------------------------------------------------
 ;  UiaInvoke fires InvokePattern where there is one, which is right for
 ;  buttons and links: it works even when the control is scrolled away. It is
@@ -1145,52 +1729,115 @@ UiaNotFoundText(name, findWhy) {
 ;  InvokePattern at all, so the call quietly does nothing and the keystrokes
 ;  that follow land wherever focus happened to be.
 ;
-;  These two put the pointer on the element and click it, which is what a
-;  person does and what every control responds to.
+;  These put the pointer on the element and click it, which is what a
+;  person does and what every control responds to — but only where the
+;  element can actually be seen and nothing else is in the way.
 
-; Click an element at its centre, optionally jittered by up to jitterPx
-; pixels (clamped inside the rect, so a jittered click can never miss).
-; Restores the caller's CoordMode.
-;
-; FAILS LOUDLY when there is nowhere to click (2026-08-03 feedback: a click
-; on a rect-less element "worked" — no error — and went nowhere, which cost
-; a real session most of an hour). No rectangle is how offscreen and
-; VIRTUALIZED elements present, so before refusing this asks the element to
-; scroll itself into view (ScrollItemPattern) and re-reads the rectangle —
-; that rescues the plain scrolled-away case. On false, `why` names the
-; reason, so a module can Out()/log it instead of shrugging. True once the
-; click is sent.
-; Returns true once the click is sent; false for no element or no rectangle;
-; `why` is "" on success, else the reason.
-UiaClickEl(el, jitterPx := 0, button := "Left", count := 1, &why?) {
-    why := ""
+; Where a click on el should land, decided WITHOUT clicking — the whole of
+; UiaClickEl's safety check, on its own so a module (or a test) can ask
+; first. In order:
+;   1. the visible part (UiaVisibleRect). None — no rectangle, IsOffscreen,
+;      outside a scroll container or the window, on no monitor — asks the
+;      element to UiaScrollIntoView, waits up to 1.2 s and looks again;
+;   2. the centre of that VISIBLE part, jittered by up to jitterPx and
+;      clamped to a third of it (UiaJitteredCenter), so it cannot leave it;
+;   3. a hit test there (UiaHitTest). Something else in the way gets ONE
+;      ScrollIntoView retry (if the element hasn't been scrolled yet), then
+;      a refusal. A hit test that is unavailable does not block.
+; Not purely a read: the ScrollIntoView rescue really scrolls the target
+; app (deliberately, also under a dry run — see UiaDryRun). The point is in
+; the calling thread's DPI context; UiaClickEl asks inside UiaDpiPhysical.
+; A refusal's `why` starts with one of three fixed phrases a caller may
+; test: "no element", "nowhere visible to click" (hidden, scrolled away,
+; off-screen) or "something else is in the way" (covered).
+; Returns {x, y} (screen pixels), or "" when there is nowhere safe to
+; click; `why` is "" on success, else the reason (no names or titles);
+; `detail` is the reason naming what is in the way.
+UiaClickablePoint(el, jitterPx := 0, &why?, &detail?) {
+    why := "", detail := ""
     if !el {
-        why := "no element — the find returned nothing"
-        return false
+        why := detail := "no element — the find returned nothing"
+        return ""
     }
-    r := UiaRect(el)
-    if !IsObject(r) {
+    scrolled := false
+    ; One walk up the tree for the whole decision (scrolling doesn't change
+    ; what holds the element). "" when it failed: each step then walks again
+    ; and reports why.
+    chain := UiaClipChain(el)
+    v := UiaVisibleRect(el, &vwhy, &vdet, chain)
+    if !IsObject(v) {
         scrolled := UiaScrollIntoView(el)
-        if scrolled {
-            deadline := A_TickCount + 1200
-            while (!IsObject(r) && A_TickCount < deadline) {
-                Sleep(100)
-                r := UiaRect(el)
-            }
-        }
-        if !IsObject(r) {
-            why := "element has no bounding rectangle (offscreen or virtualized"
-            why .= scrolled ? " even after ScrollIntoView)" : "; it cannot scroll itself into view)"
-            why .= " — a mouse click has nowhere to land"
-            return false
+        if scrolled
+            v := UiaWaitVisible(el, 1200, &vwhy, &vdet, chain)
+        if !IsObject(v) {
+            tail := (scrolled ? " — even after ScrollIntoView" : " — and it cannot scroll itself into view (no ScrollItemPattern)")
+                  . " — a mouse click has nowhere to land"
+            why := "nowhere visible to click: " vwhy tail
+            detail := "nowhere visible to click: " vdet tail
+            return ""
         }
     }
-    p := UiaJitteredCenter(r, jitterPx)
-    prev := A_CoordModeMouse
-    CoordMode("Mouse", "Screen")
-    try MouseClick(button, p.x, p.y, count)
-    finally CoordMode("Mouse", prev)
-    return true
+    p := UiaJitteredCenter(v, jitterPx)
+    hit := UiaHitTest(el, p.x, p.y, &what, &wdet, chain)
+    if (hit = 0 && !scrolled && UiaScrollIntoView(el)) {
+        scrolled := true
+        UiaSleep(300)                       ; let a scroll animation settle
+        v := UiaWaitVisible(el, 1200, &vwhy, &vdet, chain)
+        if !IsObject(v) {
+            at := "something else is in the way at " p.x "," p.y
+            tail := " — not clicking"
+            why := at " (" what "), and after ScrollIntoView it is not visible at all: " vwhy tail
+            detail := at " (" wdet "), and after ScrollIntoView it is not visible at all: " vdet tail
+            return ""
+        }
+        p := UiaJitteredCenter(v, jitterPx)
+        hit := UiaHitTest(el, p.x, p.y, &what, &wdet, chain)
+    }
+    if (hit = 0) {
+        at := "something else is in the way at " p.x "," p.y ": "
+        tail := (scrolled ? " (still, after ScrollIntoView)" : "")
+              . " — not clicking (a header pinned over the content, an overlay, a dialog or another window covers the element)"
+        why := at what tail
+        detail := at wdet tail
+        return ""
+    }
+    return p
+}
+
+; Click an element at the centre of its VISIBLE part, optionally jittered
+; by up to jitterPx pixels (clamped inside that part, so a jittered click
+; can never leave it). Restores the caller's CoordMode and DPI context.
+;
+; FAILS LOUDLY rather than clicking blind. 2026-08-03: a click on a
+; rect-less element "worked" — no error — and went nowhere, which cost a
+; real session most of an hour. 2026-10-14: a click on an element Chrome
+; still gave a rectangle for, but which was scrolled out of its panel,
+; landed on another monitor. So nothing is clicked until UiaClickablePoint
+; has found a visible point that a hit test says reaches the element (with
+; a ScrollIntoView rescue for the scrolled-away case); on false, `why`
+; says why — fit for a run record (no names or titles; it starts with one
+; of UiaClickablePoint's fixed phrases) — and `detail` names what is in
+; the way, so a module can Out()/log it instead of shrugging. The decision
+; and the click run inside UiaDpiPhysical, so both use physical pixels on
+; any desk. Under a dry run the click itself is DryRunShim's MouseClick
+; (logged, not sent); the checks before it read the target and may scroll
+; it (ScrollIntoView stays live), and a hidden or covered target is
+; refused exactly as on a real run.
+; Returns true once the click is sent; false when nothing was clicked (no
+; element, nothing visible, or something else in the way); `why` is "" on
+; success, else the reason; `detail` is the reason with names.
+UiaClickEl(el, jitterPx := 0, button := "Left", count := 1, &why?, &detail?) {
+    prev := UiaDpiPhysical()
+    try {
+        p := UiaClickablePoint(el, jitterPx, &why, &detail)
+        if !IsObject(p)
+            return false
+        cm := A_CoordModeMouse
+        CoordMode("Mouse", "Screen")
+        try MouseClick(button, p.x, p.y, count)
+        finally CoordMode("Mouse", cm)
+        return true
+    } finally UiaDpiRestore(prev)
 }
 
 ; Where a click on rect r ({x, y, w, h} — UiaRect's shape, and Acc.ahk's)
@@ -1212,15 +1859,16 @@ UiaJitteredCenter(r, jitterPx := 0) {
 ; matters when a workflow hits the same site in a loop. True once clicked;
 ; on false, `why` names what went wrong (nothing found / nowhere to click).
 ; Returns true once clicked, false otherwise; `why` is "" on success, else
-; what went wrong (nothing found / nowhere to click).
-UiaClickCenter(hwnd, name, timeoutMs := 3000, jitterPx := 0, &why?) {
-    why := ""
+; what went wrong (nothing found / nowhere to click); `detail` adds the
+; names a click refusal leaves out of `why` (UiaClickEl's).
+UiaClickCenter(hwnd, name, timeoutMs := 3000, jitterPx := 0, &why?, &detail?) {
+    why := "", detail := ""
     el := UiaFind(hwnd, name, timeoutMs, 1, &fwhy)
     if !el {
-        why := UiaNotFoundText(name, fwhy)
+        why := detail := UiaNotFoundText(name, fwhy)
         return false
     }
-    return UiaClickEl(el, jitterPx, "Left", 1, &why)
+    return UiaClickEl(el, jitterPx, "Left", 1, &why, &detail)
 }
 
 ; A random offset in [-maxPx, +maxPx], never more than a third of the extent
@@ -1371,6 +2019,62 @@ UiaWalkerStep(slot, el) {
     return ""
 }
 
+; The nearest ANCESTOR of el (el itself excluded) with this AutomationId,
+; found by walking UP — one parent step and one property read a level. The
+; fast way to the container of an element you already hold (2026-10-14: a
+; window-wide UiaFindById on a big Chrome page regularly ran past a 400 ms
+; timeout although the id was there; walking up from a known element was
+; instant). Stops below the desktop root and after maxHops levels.
+; Returns the ancestor, or ""; `why` is "" on a hit, else why not (no
+; element, reached the top of its window, or maxHops spent).
+UiaFindAncestorById(el, automationId, maxHops := 64, &why?) {
+    return UiaFindAncestorWhere(el, (a) => UiaAutomationId(a) == automationId,
+        "with AutomationId '" automationId "'", maxHops, &why)
+}
+
+; The nearest ANCESTOR of el (el itself excluded) with this exact Name and,
+; when controlType is not 0, this UIA_*ControlTypeId — UiaFindAncestorById
+; for the many web elements that have no id. Same walk, same bounds.
+; Returns the ancestor, or ""; `why` is "" on a hit, else why not (no
+; element, reached the top of its window, or maxHops spent).
+UiaFindAncestorByName(el, name, controlType := 0, maxHops := 64, &why?) {
+    test(a) {
+        if (UiaName(a) !== name)
+            return false
+        return controlType = 0 || UiaControlType(a) = controlType
+    }
+    return UiaFindAncestorWhere(el, test,
+        "named '" name "'" (controlType ? " of type " UiaControlTypeName(controlType) : ""), maxHops, &why)
+}
+
+; Shared upward walk: the first ancestor for which pred(ancestor) is true,
+; never the desktop root (an element with no parent) and never el itself.
+; what describes the target for the &why ("with AutomationId 'x'").
+; Returns the ancestor, or ""; `why` is "" on a hit, else why not.
+UiaFindAncestorWhere(el, pred, what, maxHops := 64, &why?) {
+    why := ""
+    if !el {
+        why := "no start element (the find that should have produced it returned nothing)"
+        return ""
+    }
+    node := UiaParent(el), hops := 0
+    while (node != "") {
+        up := UiaParent(node)
+        if (up = "")                        ; node is the desktop root
+            break
+        if (hops >= maxHops) {
+            why := "no ancestor " what " within " maxHops " levels (stopped there — raise maxHops)"
+            return ""
+        }
+        hops += 1
+        if pred(node)
+            return node
+        node := up
+    }
+    why := "no ancestor " what " — walked up to the top of the element's window"
+    return ""
+}
+
 ; Readable name for a UIA_*ControlTypeId — "Button", "Edit", ... An unknown
 ; id comes back as its bare number, still greppable. Ids verified against
 ; UIAutomationClient.h (Windows SDK 10.0.26100.0).
@@ -1400,7 +2104,30 @@ UiaControlTypeName(typeId) {
 ; depth stays visible in the indent. Bounded four ways — maxDepth, maxLines
 ; of output, UIA_NODE_BUDGET() visited nodes and UIA_DUMP_TIME_MS() —
 ; because a diagnostic must never become the stall it is diagnosing. ""
-; when UIA can't see the window (stats.why says why).
+; when UIA can't see the window (stats.why says why). An icon-font
+; character in a name shows as <U+E611> (UiaShowIcons); nameFilter matches
+; the raw name or that shown form. To dump ONE part of the window, start
+; from an element instead: UiaDumpSubtree, which this delegates to.
+;
+; Two more LINE filters/decorations (2026-10-14, from a real build that
+; kept hand-rolling subtree walks to see positions):
+;   positions    true appends " @x,y wxh" (screen pixels) to every line, or
+;                " @none" when the element has no rectangle
+;   visibleOnly  true keeps only elements that can be seen: a rectangle,
+;                not IsOffscreen, and some of it inside every scroll
+;                container above it, its window and a monitor — the rule
+;                UiaVisibleRect applies, carried down the walk instead of
+;                re-climbing for every node. Something drawn OVER an element
+;                does not hide it here (only a hit test can tell).
+; Like nameFilter, neither changes WHICH nodes are walked: the counts and
+; the fingerprint below are the same with them on or off. They do add
+; reads, so they can change how FAR a time-capped walk gets: positions
+; reads one rectangle per printed line; visibleOnly reads a rectangle,
+; IsOffscreen and the monitors per matching line and, while lines can
+; still be printed, a ScrollPattern check per node that has children.
+; Both stop once maxLines is reached. On a big browser page that can be
+; enough to hit UIA_DUMP_TIME_MS() where a plain dump finished (timeHit,
+; and then no fingerprint) — compare fingerprints between plain dumps.
 ;
 ; An outline that is cut short must SAY so (2026-10-12 feedback: a dump
 ; capped at depth 25 showed a form's fields as empty groups, a filter for a
@@ -1418,8 +2145,10 @@ UiaControlTypeName(typeId) {
 ;                value means the content changed even when the window title
 ;                did not. The same for a filtered and an unfiltered dump of
 ;                one unchanged page at one maxDepth — the walk never depends
-;                on nameFilter or maxLines (it keeps going past maxLines, so
-;                the counts above are true for the whole walk).
+;                on nameFilter, maxLines, positions or visibleOnly (it keeps
+;                going past maxLines, so the counts above are true for the
+;                whole walk). It hashes the RAW name (icon characters as
+;                themselves, not their <U+...> form).
 ;                Only comparable for a walk that ENDED ON ITS OWN: "" when
 ;                timeHit (where a slow provider stops the walk varies from
 ;                call to call, so two dumps of one unchanged page would
@@ -1432,20 +2161,41 @@ UiaControlTypeName(typeId) {
 ; cross-process calls a node — up to UIA_DUMP_TIME_MS() on a browser page),
 ; not just the first maxLines nodes. Lower maxDepth for a quick look.
 ; Returns the outline text, or "" when UIA can't read the window (stats.why
-; says why), nothing matched nameFilter, or maxLines <= 0; `stats` is always
+; says why), nothing matched the filters, or maxLines <= 0; `stats` is always
 ; filled in (fields above).
-UiaDumpTree(hwnd, maxDepth := 8, nameFilter := "", maxLines := 300, &stats?) {
-    stats := {visited: 0, cutAtDepth: 0, budgetHit: false, timeHit: false,
-              linesHit: false, fingerprint: "", why: ""}
+UiaDumpTree(hwnd, maxDepth := 8, nameFilter := "", maxLines := 300, &stats?, positions := false, visibleOnly := false) {
     root := UiaFromWindow(hwnd, &w)
     if !root {
+        UiaDumpSubtree("", maxDepth, nameFilter, maxLines, &stats)
         stats.why := w
+        return ""
+    }
+    return UiaDumpSubtree(root, maxDepth, nameFilter, maxLines, &stats, positions, visibleOnly)
+}
+
+; UiaDumpTree from any element: el is depth 0 and only its subtree is
+; walked — one panel of a big page instead of the whole window, with the
+; same filters, bounds and stats (fingerprint included: a subtree dump
+; started at a window's root element gives the window dump's fingerprint).
+; Get el from a find (UiaFindById, UiaFind, UiaFindAncestorById ...).
+; Returns the outline text, or "" when there is no start element
+; (stats.why says so), nothing matched the filters, or maxLines <= 0;
+; `stats` is always filled in (UiaDumpTree's fields).
+UiaDumpSubtree(el, maxDepth := 8, nameFilter := "", maxLines := 300, &stats?, positions := false, visibleOnly := false) {
+    stats := {visited: 0, cutAtDepth: 0, budgetHit: false, timeHit: false,
+              linesHit: false, fingerprint: "", why: ""}
+    if !el {
+        stats.why := "no start element (the find that should have produced it returned nothing)"
         return ""
     }
     st := {budget: UIA_NODE_BUDGET(), deadline: A_TickCount + UIA_DUMP_TIME_MS(),
            crc: 0, lines: [], maxDepth: maxDepth, nameFilter: nameFilter,
-           maxLines: maxLines, stats: stats}
-    UiaDumpTreeWalk(root, 0, st)
+           maxLines: maxLines, stats: stats, positions: positions, visibleOnly: visibleOnly}
+    ; What the start element's own ancestors let through — only needed when
+    ; visibility decides lines. A top-level start (a window root) is its
+    ; own window: its box clips its children (UiaDumpChildClip).
+    clip := visibleOnly ? UiaClipAbove(el) : ""
+    UiaDumpTreeWalk(el, 0, st, clip, visibleOnly && UiaIsWindowRoot(el))
     ; A time-cut walk stops wherever the provider's speed left it — not
     ; reproducible, so no fingerprint rather than a misleading one.
     stats.fingerprint := stats.timeHit ? "" : Format("{:08x}", st.crc)
@@ -1467,10 +2217,52 @@ UiaTreeFingerprint(hwnd, maxDepth := 8, &stats?) {
     return stats.fingerprint
 }
 
+; The area el's ancestors let through — the intersection of every scroll
+; container above it and its own top-level window (UiaClipChain, the same
+; walk UiaVisibleRect clips by), i.e. UiaVisibleRect's clipping without
+; el's own box. For the tree dump's visibleOnly, which then narrows it on
+; the way down instead of climbing again for every node.
+; Returns {x, y, w, h}; "" when nothing above el clips it (el is a window
+; root) or its window can't be reached (nothing is hidden on a guess);
+; "none" when the ancestors let nothing through.
+UiaClipAbove(el) {
+    chain := UiaClipChain(el)
+    if !IsObject(chain)
+        return ""
+    clip := ""
+    n := chain.Length
+    for i, a in chain {
+        if (i != n && !UiaIsScrollContainer(a))
+            continue
+        ar := UiaRect(a)
+        if !IsObject(ar)
+            return "none"
+        clip := (clip = "") ? ar : UiaIntersect(clip, ar)
+        if !IsObject(clip)
+            return "none"
+    }
+    return clip
+}
+
+; The clip a node hands its children in a visibleOnly dump: its own clip,
+; narrowed by its box when it is a scroll container (or the window root
+; the dump started at). clip is a rect, "" (unclipped) or "none".
+; Returns the children's clip: a rect, "" or "none".
+UiaDumpChildClip(node, clip, isTop) {
+    if (clip = "none" || !(isTop || UiaIsScrollContainer(node)))
+        return clip
+    r := UiaRect(node)
+    if !IsObject(r)
+        return "none"
+    c := (clip = "") ? r : UiaIntersect(clip, r)
+    return IsObject(c) ? c : "none"
+}
+
 ; Recursive worker. `st` carries the walk's shared state: the node budget,
-; the deadline, the running CRC, the output lines and the caller's stats.
+; the deadline, the running CRC, the output lines, the options and the
+; caller's stats; clip / isTop are what visibleOnly needs (UiaDumpChildClip).
 ; Returns nothing: it adds to st's lines, CRC and stats.
-UiaDumpTreeWalk(el, depth, st) {
+UiaDumpTreeWalk(el, depth, st, clip := "", isTop := false) {
     s := st.stats
     if (A_TickCount > st.deadline) {
         s.timeHit := true
@@ -1486,17 +2278,30 @@ UiaDumpTreeWalk(el, depth, st) {
     name := StrReplace(StrReplace(UiaName(el), "`r", " "), "`n", " ")
     tid := UiaControlType(el)
     aid := UiaAutomationId(el)
-    st.crc := UiaCrc32(depth "`t" tid "`t" name "`t" aid "`n", st.crc)
-    if (st.maxLines > 0 && (st.nameFilter = "" || InStr(name, st.nameFilter))) {
-        if (st.lines.Length < st.maxLines) {
+    st.crc := UiaCrc32(depth "`t" tid "`t" name "`t" aid "`n", st.crc)   ; the RAW name
+    shown := UiaShowIcons(name)
+    ; Once a line has been dropped at maxLines (linesHit) nothing more can be
+    ; printed, so the per-line reads below stop too (review, 2026-10-14: they
+    ; ran for every node of the walk, which on a big page roughly doubled
+    ; its cost and could push it into the time cap).
+    if (st.maxLines > 0 && !s.linesHit
+        && (st.nameFilter = "" || InStr(name, st.nameFilter) || InStr(shown, st.nameFilter))) {
+        r := (st.positions || st.visibleOnly) ? UiaRect(el) : ""
+        keep := true
+        if st.visibleOnly
+            keep := IsObject(r) && clip != "none" && !UiaIsOffscreen(el)
+                 && IsObject(UiaOnMonitors(clip = "" ? r : UiaIntersect(r, clip)))
+        if (keep && st.lines.Length < st.maxLines) {
             line := ""
             Loop depth
                 line .= "  "
-            line .= UiaControlTypeName(tid) ' "' name '"'
+            line .= UiaControlTypeName(tid) ' "' shown '"'
             if (aid != "")
                 line .= " <id=" aid ">"
+            if st.positions
+                line .= IsObject(r) ? " @" r.x "," r.y " " r.w "x" r.h : " @none"
             st.lines.Push(line)
-        } else {
+        } else if keep {                    ; an invisible element is no dropped line
             s.linesHit := true
         }
     }
@@ -1506,8 +2311,15 @@ UiaDumpTreeWalk(el, depth, st) {
             s.cutAtDepth += 1
         return
     }
+    if (child != "" && st.visibleOnly && !s.linesHit)
+        clip := UiaDumpChildClip(el, clip, isTop)
     while (child != "") {
-        UiaDumpTreeWalk(child, depth + 1, st)
+        ; An owned window (a dialog, a dropdown) is listed under its owner
+        ; but is not clipped by it: it starts its own clip.
+        if (st.visibleOnly && UiaIsWindowRoot(child))
+            UiaDumpTreeWalk(child, depth + 1, st, "", true)
+        else
+            UiaDumpTreeWalk(child, depth + 1, st, clip)
         if (s.budgetHit || s.timeHit)
             return
         child := UiaNextSibling(child)

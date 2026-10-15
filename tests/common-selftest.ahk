@@ -409,6 +409,27 @@ r := SeedUserFiles(nd)
 Check("a root without defaults is left alone", !r.created.Length && !r.merged.Length
     && !FileExist(nd "\hotkeys\_index.ahk") && !FileExist(nd "\bridge-map.txt"))
 
+; ---------- 13c. VkPythonExe: a module's own Python environment -------------
+; <root>\tools\python\<env>\Scripts\python.exe (made by the MCP), or "".
+; Only existence is checked, so an empty stand-in file does for python.exe.
+pyRoot := box "\pyroot"
+DirCreate(pyRoot "\tools\python\karbon\Scripts")
+Put(pyRoot "\tools\python\karbon\Scripts\python.exe", "")
+DirCreate(pyRoot "\tools\Scripts")                       ; where ".." would lead
+Put(pyRoot "\tools\Scripts\python.exe", "")
+DirCreate(pyRoot "\tools\python\dirlike\Scripts\python.exe")
+Check("VkPythonExe finds an environment's python.exe",
+    VkPythonExe("karbon", pyRoot) = VkLongPath(pyRoot "\tools\python\karbon\Scripts\python.exe"),
+    VkPythonExe("karbon", pyRoot))
+Check("...and returns '' for one that doesn't exist", VkPythonExe("nope", pyRoot) = "")
+Check("...keeping only [\w\-.] of the name", VkPythonExe("kar bon/", pyRoot) != "")
+Check("...so a name can't climb out of tools\python\",
+    VkPythonExe("..", pyRoot) = "" && VkPythonExe("../..", pyRoot) = "" && VkPythonExe(".", pyRoot) = ""
+    && VkPythonExe("..\..", pyRoot) = "")
+Check("...an empty name is no environment", VkPythonExe("", pyRoot) = "" && VkPythonExe("!!", pyRoot) = "")
+Check("...a folder named python.exe is not one", VkPythonExe("dirlike", pyRoot) = "")
+Check("...and the default root is the install's", VkPythonExe("zz-no-such-env-zq") = "")
+
 ; ---------- 14. ThemeShowModal --------------------------------------------
 WS_DISABLED := 0x8000000
 owner := Gui("+AlwaysOnTop", "vk common-selftest owner")

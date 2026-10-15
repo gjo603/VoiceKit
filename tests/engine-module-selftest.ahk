@@ -44,6 +44,7 @@ FileAppend("; sandbox bridge map`n"
     . "Ctrl+Alt+Shift+Q|mod stopped|hotkeys\ModStopped.ahk|2026-10-12`n"
     . "Ctrl+Alt+Shift+S|mod testmode|hotkeys\ModTestMode.ahk|2026-10-12`n"
     . "Ctrl+Alt+Shift+T|mod testcrash|hotkeys\ModTestCrash.ahk|2026-10-12`n"
+    . "Ctrl+Alt+Shift+U|mod box crash|hotkeys\ModBoxCrash.ahk|2026-10-14`n"
     . "; Ctrl+Alt+Shift+O|mod parked|hotkeys\ModParked.ahk|2026-10-12`n",
     sbox "\bridge-map.txt", "UTF-8")
 head := "#Requires AutoHotkey v2.0`n#SingleInstance Ignore`n"
@@ -65,30 +66,37 @@ MakeBody("ModTyper", 'if !VkDryRun() || Send.IsBuiltIn {`n'
     . '    FileAppend("LIVE", A_ScriptDir "\..\..\typer.live", "UTF-8")`n    ExitApp(1)`n}`n'
     . 'FileAppend("reached", A_ScriptDir "\..\..\typer.reached", "UTF-8")`n'
     . 'Send("hello{Enter}")`nFileAppend("ran", A_ScriptDir "\..\..\typer.marker", "UTF-8")`nExitApp(0)')
-; Its own OnError handler shows a MsgBox and returns 1 (handled). The
+; Its own OnError handler shows a MsgBox and returns `ret` (1 = handled). The
 ; handler's MsgBox must NOT be taken for AutoHotkey's error dialog. Nothing
 ; reaches the screen: the body's own CBT hook (installed after, so called
 ; first) passes the creation down the chain to VkModuleCbt -- which would
 ; end the process right there if it mistook the MsgBox -- and then vetoes it.
-MakeBody("ModHandledBox", 'OnError(Handler)`n'
-    . 'Handler(e, m) {`n'
-    . '    hk := DllCall("SetWindowsHookExW", "Int", 5, "Ptr", CallbackCreate(Veto, "F", 3), "Ptr", 0, "UInt", DllCall("GetCurrentThreadId", "UInt"), "Ptr")`n'
-    . '    try MsgBox("Could not finish: " e.Message)`n'
-    . '    DllCall("UnhookWindowsHookEx", "Ptr", hk)`n'
-    . '    FileAppend("survived", A_ScriptDir "\..\..\box.marker", "UTF-8")`n'
-    . '    return 1`n}`n'
-    . 'Veto(n, w, l) {`n'
-    . '    r := DllCall("CallNextHookEx", "Ptr", 0, "Int", n, "Ptr", w, "Ptr", l, "Ptr")`n'
-    . '    if (n = 3) {`n'
-    . '        cls := Buffer(64, 0)`n'
-    . '        DllCall("GetClassNameW", "Ptr", w, "Ptr", cls, "Int", 32)`n'
-    . '        if (StrGet(cls) = "#32770") {`n'
-    . '            FileAppend("vetoed ", A_ScriptDir "\..\..\box.marker", "UTF-8")`n'
-    . '            return 1`n'
-    . '        }`n'
-    . '    }`n'
-    . '    return r`n}`n'
-    . 'x := 1`nx.NoSuchMethod()`nExitApp(0)')
+BoxBody(base, marker, ret) {
+    MakeBody(base, 'OnError(Handler)`n'
+        . 'Handler(e, m) {`n'
+        . '    hk := DllCall("SetWindowsHookExW", "Int", 5, "Ptr", CallbackCreate(Veto, "F", 3), "Ptr", 0, "UInt", DllCall("GetCurrentThreadId", "UInt"), "Ptr")`n'
+        . '    try MsgBox("Could not finish: " e.Message)`n'
+        . '    DllCall("UnhookWindowsHookEx", "Ptr", hk)`n'
+        . '    FileAppend("survived", A_ScriptDir "\..\..\' marker '", "UTF-8")`n'
+        . '    return ' ret '`n}`n'
+        . 'Veto(n, w, l) {`n'
+        . '    r := DllCall("CallNextHookEx", "Ptr", 0, "Int", n, "Ptr", w, "Ptr", l, "Ptr")`n'
+        . '    if (n = 3) {`n'
+        . '        cls := Buffer(64, 0)`n'
+        . '        DllCall("GetClassNameW", "Ptr", w, "Ptr", cls, "Int", 32)`n'
+        . '        if (StrGet(cls) = "#32770") {`n'
+        . '            FileAppend("vetoed ", A_ScriptDir "\..\..\' marker '", "UTF-8")`n'
+        . '            return 1`n'
+        . '        }`n'
+        . '    }`n'
+        . '    return r`n}`n'
+        . 'x := 1`nx.NoSuchMethod()`nExitApp(0)')
+}
+BoxBody("ModHandledBox", "box.marker", 1)
+; ...and one whose handler shows its MsgBox, then does NOT handle the error:
+; AutoHotkey's dialog comes after it and must still end the body (2026-10-14:
+; the one-shot unpend timer ran inside the handler's MsgBox and let it show).
+BoxBody("ModBoxCrash", "boxcrash.marker", 0)
 ; Stops cooperatively the way the template does (a stop request -> ExitApp()).
 MakeBody("ModStopped", 'FileAppend("", BodyStopFile("ModStopped"))`n'
     . 'if BodyStopRequested("ModStopped")`n    ExitApp()`nExitApp(0)')
@@ -119,7 +127,7 @@ for c in ch
     lst .= c.module " "
 Check("the Studio's choices are the isolated modules, in map order",
     Trim(lst) = "ModOk ModFail ModCrash ModSlow ModHandled ModBadLoad ModTyper ModHandledBox "
-    . "ModStopped ModTestMode ModTestCrash", lst)
+    . "ModStopped ModTestMode ModTestCrash ModBoxCrash", lst)
 
 ; ---------- 2. seconds + description --------------------------------------
 Check("seconds: blank -> 60", WfModuleSecs("") = 60)
@@ -187,6 +195,17 @@ Check("a handler that shows its OWN MsgBox isn't killed as if it were the error 
     r.ok && r.code = 0, r.reason " code=" r.code " marker=" bm)
 Check("...its MsgBox was created (then vetoed by the body itself) and the handler finished",
     bm = "vetoed survived", bm)
+t0 := A_TickCount
+r := WfModuleRun("mod box crash", 20)
+bm := ""
+try bm := FileRead(sbox "\boxcrash.marker", "UTF-8")
+Check("a handler that shows its own MsgBox and then doesn't handle the error: exit 3, at once",
+    !r.ok && r.code = 3 && A_TickCount - t0 < 10000, r.reason " code=" r.code " " (A_TickCount - t0) " ms")
+Check("...after the handler finished", bm = "vetoed survived", bm)
+; The key-press path (VkBodyErrorEnd: final status + timed notice) is not
+; the module step's: the engine reports the failure itself.
+Check("a module step's crash leaves no 'stopped by an error' status (that's the key-press path)",
+    BodyStatusRead("ModCrash", sbox) = "" && BodyStatusRead("ModBoxCrash", sbox) = "")
 
 ; ---------- 5b. a cooperative stop is not success --------------------------
 r := WfModuleRun("mod stopped", 20)
@@ -340,6 +359,7 @@ Check("under a test-run host, the body is in test mode (VkTestMode, scoped to it
 Check("...the module step still succeeds", hp.Length >= 1 && hp[1] = "1", hout)
 Check("...a crashing body ends with exit 3", hp.Length >= 2 && hp[2] = "3", hout)
 Check("...and stays out of the user's errors.log", !InStr(elog, "NoSuchMethodZz"), elog)
+Check("...and gets no key-press notice or status (TestShim reports it)", BodyStatusRead("ModTestCrash", sbox) = "")
 Check("...its error lands in the shared test log, tagged with the BODY's script",
     InStr(tl, '"kind":"error"') && InStr(tl, "NoSuchMethodZz") && InStr(tl, "ModTestCrash.body.ahk"), tl)
 Check("...and the host's own run variables are restored",

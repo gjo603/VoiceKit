@@ -9,6 +9,38 @@ starting points taken from CLAUDE.md — verify against current code before buil
 
 ## Open
 
+### 2026-10-14 — "Karbon File" feedback (a 1,500-line Chrome body built live over MCP)
+
+All twelve items are built on branch `feedback-karbon-file` (what shipped:
+`docs\CHANGELOG.md`, 2026-10-14). Still open:
+
+1. **Confirm the click safety net on live Chrome.** It is proven only on
+   throwaway Win32 windows, on one monitor. Not yet measured:
+   - Do Chrome's inner scroll panels and the Document expose ScrollPattern?
+   - Does IsOffscreen follow clipping?
+   - What does ElementFromPoint return over a styled box the tree ignores? A
+     hit that comes back as the panel or the Document itself is now refused:
+     a false refusal, never a wrong click, but it could refuse clicks that
+     used to work.
+   - Does ScrollIntoView clear a pinned header?
+   - Does a real mixed-scale three-monitor desk now line up?
+   Try it with the Karbon body.
+2. **The engine's own click / dblclick / rclick steps and `WfFillAcc` still
+   click the full-rect centre** (`WfFindElement` -> `WfClickPoint`). The
+   UIA half could ask `UiaClickablePoint` inside
+   `UiaDpiPhysical`/`UiaDpiRestore`. This changes what a saved workflow's
+   click does, so measure it first on recorded workflows.
+3. **Smaller follow-ups:**
+   - The lint checks only `base`; no other reserved property names were
+     surveyed.
+   - `ensure_python_env` was tested offline only (no real index install, no
+     upgrade path).
+   - The body-error notice's 30 s auto-close and always-on-top placement are
+     not measured, because tests never show it.
+   - Errors in hotkey threads and Critical threads of a body are untested.
+   - `AhkValidate` has no `provided` tolerance for an in-process module that
+     calls a library function. Nothing on the AHK side checks one today.
+
 ### 2026-10-12 — ProConnect-session feedback (an agent automated a tax web app in Chrome)
 
 Nine items, all built on branch `feedback-quiet-harness`; what shipped and

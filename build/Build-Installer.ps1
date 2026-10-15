@@ -92,6 +92,10 @@ foreach ($live in 'hotkeys\_index.ahk', 'bridge-map.txt', 'hotkeys\Snippets.ahk'
 # ship the folder even if something in it were ever force-tracked.
 $stagedLogs = Join-Path $stage 'logs'
 if (Test-Path -LiteralPath $stagedLogs) { Remove-Item -LiteralPath $stagedLogs -Recurse -Force }
+# tools\ holds each module's own Python environment (tools\python\<env>\,
+# VkPythonExe) -- per machine and gitignored, so never staged; same belt.
+$stagedTools = Join-Path $stage 'tools'
+if (Test-Path -LiteralPath $stagedTools) { Remove-Item -LiteralPath $stagedTools -Recurse -Force }
 
 # --- stamp the version into the staged copy ---
 # An installed copy has no .git, so the MCP server (health / server_info /
@@ -122,6 +126,7 @@ foreach ($must in 'VoiceKit.ahk', 'VoiceKitLauncher.ahk', 'AutoHotkey64.exe',
                   'lib\Clip.ahk', 'lib\ExplorerSel.ahk', 'lib\Workflow.ahk', 'lib\Browser.ahk',
                   'lib\LoopRunner.ahk', 'lib\WorkflowLoop.ahk', 'lib\TestShim.ahk', 'lib\DryRunShim.ahk',
                   'lib\AI.ahk', 'lib\Json.ahk', 'lib\Theme.ahk',
+                  'lib\ValidateWarnings.ahk', 'lib\BodyErrorNotice.ahk',
                   'macros\VoiceKitHome.ahk', 'macros\AskAI.ahk', 'macros\NewAutomation.ahk',
                   'macros\WorkflowStudio.ahk', 'macros\RecordMySteps.ahk', 'macros\SplitPages.ahk',
                   'hotkeys\_index.default.ahk', 'bridge-map.default.txt', 'hotkeys\Snippets.default.ahk',

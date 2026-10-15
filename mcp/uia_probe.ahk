@@ -6,13 +6,23 @@
 ;
 ; Usage:
 ;   AutoHotkey64.exe uia_probe.ahk <outfile> focus
-;   AutoHotkey64.exe uia_probe.ahk <outfile> tree <window> [maxDepth] [maxLines] [nameFilter]
+;   AutoHotkey64.exe uia_probe.ahk <outfile> tree <window> [maxDepth] [maxLines]
+;       [nameFilter] [rootId] [rootName] [positions 0|1] [visibleOnly 0|1]
 ;
 ; <window> is an AutoHotkey WinTitle ("ahk_exe chrome.exe", a title
 ; substring, ...); empty means the active window. Output is UTF-8 key=value
 ; lines; tree mode follows the header with a blank line and the indented
 ; tree. A report starting "error=" is an ANSWER, not a crash — the exit code
 ; is 0 unless the invocation itself was malformed.
+;
+; The four trailing tree arguments (2026-10-14) are optional and positional
+; — a missing or empty one means the old behaviour. rootId / rootName start
+; the dump at the first element with that AutomationId / Name (both = an
+; element with both; neither = the window), and the header then carries
+; root=<the element, as a dump line names it>; a root that can't be found
+; is an error= answer with the find's reason. positions=1 appends
+; " @x,y wxh" to every line; visibleOnly=1 keeps only visible elements
+; (lib\UIA.ahk UiaDumpSubtree).
 #Include "%A_ScriptDir%\..\lib\UIA.ahk"
 
 #SingleInstance Off
@@ -82,6 +92,10 @@ if (mode = "tree") {
         try maxLines := Max(1, Integer(A_Args[5]))
     if (A_Args.Length >= 6)
         nameFilter := A_Args[6]
+    rootId := A_Args.Length >= 7 ? A_Args[7] : ""
+    rootName := A_Args.Length >= 8 ? A_Args[8] : ""
+    positions := A_Args.Length >= 9 && A_Args[9] = "1"
+    visibleOnly := A_Args.Length >= 10 && A_Args[10] = "1"
 
     ; Retry briefly: the caller may have just launched the window.
     hwnd := 0
@@ -95,7 +109,24 @@ if (mode = "tree") {
     if !hwnd
         Report("error=Window not found: " (crit = "" ? "(active window)" : OneLine(crit)))
 
-    tree := UiaDumpTree(hwnd, maxDepth, nameFilter, maxLines, &stats)
+    rootLine := ""
+    if (rootId != "" || rootName != "") {
+        what := rootId != "" && rootName != "" ? "AutomationId '" rootId "' and Name '" rootName "'"
+              : rootId != "" ? "AutomationId '" rootId "'" : "Name '" rootName "'"
+        if (rootId != "" && rootName != "")
+            start := UiaFindCond(hwnd, UiaAndCondition(UiaPropCondition(UIA_PROP_AUTOMATIONID(), rootId),
+                                 UiaPropCondition(UIA_PROP_NAME(), rootName)), 3000, 1, &fwhy)
+        else if (rootId != "")
+            start := UiaFindById(hwnd, rootId, 3000, 1, &fwhy)
+        else
+            start := UiaFind(hwnd, rootName, 3000, 1, &fwhy)
+        if !start
+            Report("error=No element with " OneLine(what) " in that window: " OneLine(fwhy))
+        rootLine := OneLine(UiaDescribe(start))
+        tree := UiaDumpSubtree(start, maxDepth, nameFilter, maxLines, &stats, positions, visibleOnly)
+    } else {
+        tree := UiaDumpTree(hwnd, maxDepth, nameFilter, maxLines, &stats, positions, visibleOnly)
+    }
     ; Nothing visited = the window itself couldn't be read (a filter that
     ; matched nothing still visits nodes, and is an answer, not an error).
     if (stats.visited = 0)
@@ -105,6 +136,8 @@ if (mode = "tree") {
     try out .= "window_title=" OneLine(WinGetTitle(hwnd)) "`n"
     try out .= "window_class=" WinGetClass(hwnd) "`n"
     try out .= "window_exe=" WinGetProcessName(hwnd) "`n"
+    if (rootLine != "")
+        out .= "root=" rootLine "`n"
     ; How complete the walk was, and what it saw (see UiaDumpTree): the
     ; writer turns these into the note that says a short answer was cut.
     out .= "max_depth=" maxDepth "`n"

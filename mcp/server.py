@@ -561,7 +561,7 @@ def create_launch_macro(
     automations (no code); use `ahk_body` for custom steps. The generated script
     is load-checked; if it fails, nothing is kept. No Voice Access setup needed.
     An existing name is refused — update_macro / edit_macro change an existing
-    macro's code.
+    macro's code (returns source_sha256, their expected_sha256).
 
     A script that acts on the file(s) the user selected in File Explorer should
     take them like this, so it can be tested on a fixture through
@@ -595,8 +595,36 @@ def read_macro_source(
     macro used to mean a human opening the file and pasting its 250 lines into
     chat; this is that, as one call. Read before update_macro / edit_macro so
     you change what's there instead of rewriting from memory. Also returns
-    'kind' and the header-comment 'description' when the script carries one."""
+    'kind', the header-comment 'description' when the script carries one, and
+    source_sha256 — pass it as expected_sha256 to edit_macro / update_macro
+    to have them refuse if someone else changed the file in between."""
     return _guard(vk.read_macro_source, name, previous)
+
+
+class SpliceEdit(BaseModel):
+    """One exact-match splice of an edits=[...] batch."""
+    old_string: str = Field(description="Exact text to find — must match exactly once in "
+                                        "the code as the earlier edits of this list left it.")
+    new_string: str = Field(description="The replacement text.")
+
+
+def _edits_arg(edits):
+    """edits as plain dicts for the writer (None stays None)."""
+    return None if edits is None else [e.model_dump() if isinstance(e, BaseModel) else e
+                                       for e in edits]
+
+
+_EDITS_TEXT = ("Several splices in ONE call, applied in order to the current code — each must "
+               "match exactly once in the code as the earlier ones left it — then one load "
+               "check and one write. Use it for any change that only loads once every part "
+               "is in (a new function and its callers): sent one call at a time, the first "
+               "half fails its check. Pass this OR old_string/new_string, not both. A failure "
+               "names the edit ('Edit 3 of 5: ...') and changes nothing.")
+_SHA_TEXT = ("Optional: the hash you last saw (from the read tool or your last edit/update). "
+             "If the file has changed since — another session edited it — the call is "
+             "refused and nothing changes; read again and redo the change.")
+_SPLICE_OLD = ("Exact text to find in the current code. Must match exactly once — include "
+               "enough surrounding lines to be unique. Whitespace must match exactly.")
 
 
 @mcp.tool
@@ -605,33 +633,39 @@ def update_macro(
     ahk_source: Annotated[str, "The complete new AutoHotkey v2 source for the file. Keep "
                           "its #Include lines; a name its includes define (e.g. Notify "
                           "from lib\\_Common.ahk) can't be a top-level variable."],
+    expected_sha256: Annotated[Optional[str], "read_macro_source's source_sha256. " + _SHA_TEXT] = None,
 ) -> dict:
     """Replace an existing macro's source in full — the write half of the
     read/patch loop (read_macro_source is the read half; for one-function
     fixes prefer edit_macro, which sends only the changed lines). The new
-    source is load-checked and the file rolled back untouched on failure; the
-    overwritten source is banked (one step deep) and retrievable via
-    read_macro_source(name, previous=True), so an unwanted overwrite stays
-    undoable. Refused for VoiceKit's own tools and for generated workflow
-    stubs (their steps file is canonical — use create_workflow)."""
-    return _guard(vk.update_macro, name, ahk_source)
+    source is load-checked as a copy before it replaces the file, so a failure
+    leaves it untouched; the overwritten source is banked (one step deep) and
+    retrievable via read_macro_source(name, previous=True), so an unwanted
+    overwrite stays undoable. Returns the new source_sha256. Refused for
+    VoiceKit's own tools and for generated workflow stubs (their steps file
+    is canonical — use create_workflow)."""
+    return _guard(vk.update_macro, name, ahk_source, expected_sha256=expected_sha256)
 
 
 @mcp.tool
 def edit_macro(
     name: Annotated[str, "The macro to edit, e.g. 'Split Pages'."],
-    old_string: Annotated[str, "Exact text to find in the macro's current source. Must "
-                          "match exactly once — include enough surrounding lines to be "
-                          "unique. Whitespace must match exactly."],
-    new_string: Annotated[str, "The replacement text."],
+    old_string: Annotated[Optional[str], _SPLICE_OLD] = None,
+    new_string: Annotated[Optional[str], "The replacement text."] = None,
+    edits: Annotated[Optional[list[SpliceEdit]], _EDITS_TEXT] = None,
+    expected_sha256: Annotated[Optional[str], "read_macro_source's source_sha256. " + _SHA_TEXT] = None,
 ) -> dict:
     """Splice-edit a macro in place — same semantics as a file Edit tool, and
     the cheap way to apply a patch: a session that diagnosed a one-function
     bug used to end with 'here's the fix, please apply it by hand'. Read the
-    current source with read_macro_source first, then splice. The edited file
-    is load-checked and rolled back if it wouldn't parse. Undo = call again
-    with the two strings swapped. Live on the macro's next run."""
-    return _guard(vk.edit_macro, name, old_string, new_string)
+    current source with read_macro_source first, then splice — one change
+    (old_string/new_string) or several at once (edits=[...]). The edited text
+    is load-checked as a copy before it replaces the file, so a change that
+    wouldn't load is never written. Returns the new source_sha256. Undo =
+    call again with the two strings swapped (a batch: edits=undo_edits, from
+    the reply). Live on the macro's next run."""
+    return _guard(vk.edit_macro, name, old_string, new_string, edits=_edits_arg(edits),
+                  expected_sha256=expected_sha256)
 
 
 @mcp.tool
@@ -696,7 +730,7 @@ def create_hotkey_module(
     Calling this with an EXISTING name replaces that module in place rather than
     erroring, the same way create_workflow does — but it wraps ahk_body in a
     fresh generated header, so it is for regenerating a module from a bare body.
-    To CHANGE an existing module, use edit_hotkey_module (one exact-match splice,
+    To CHANGE an existing module, use edit_hotkey_module (exact-match splices,
     cheapest) or update_hotkey_module (the whole file read_hotkey_module
     returned, written verbatim) — feeding read_hotkey_module's output back in
     here would nest a second generated header inside the first. Do NOT
@@ -707,7 +741,11 @@ def create_hotkey_module(
     quarantined. The overwritten code is NOT echoed back — a replace reports
     previous_body_sha256 / length / first lines and banks the full text,
     retrievable via read_hotkey_module(name, previous=True) if you need to undo.
-    Only a brand-new module returns voice_pairing steps.
+    Only a brand-new module returns voice_pairing steps; their last line says
+    how to change the spoken phrase later (in Voice Access: "show voice
+    shortcuts", edit the phrase or add a second one on the same keys) — the
+    key, the module and VoiceKit stay as they are. Returns body_sha256 —
+    pass it as expected_sha256 on the first edit, no read needed.
 
     isolate=False code is load-checked on its own and then again inside
     VoiceKit on the reload: if it clashes with something already loaded there
@@ -771,31 +809,40 @@ def read_hotkey_module(
     """Return a hotkey module's current code. For an isolated module (the
     default) this is the body that actually runs — the half holding the steps.
     Read before changing a module, so you edit what's there instead of
-    rewriting it from memory: then edit_hotkey_module (one exact-match splice)
+    rewriting it from memory: then edit_hotkey_module (exact-match splices)
     or update_hotkey_module (pass the whole changed file back, verbatim). Don't
     feed this text to create_hotkey_module — that wraps it in a second
-    generated header. previous=True reads the replace-undo snapshot instead —
-    the full text a replace or update no longer echoes back."""
+    generated header. body_sha256 is the content hash to pass as
+    expected_sha256 to the edit/update, which then refuses if someone else
+    changed the file in between. previous=True reads the replace-undo
+    snapshot instead — the full text a replace or update no longer echoes
+    back."""
     return _guard(vk.read_hotkey_module, name, previous)
 
 
 @mcp.tool
 def edit_hotkey_module(
     name: Annotated[str, "The hotkey module to edit, e.g. 'Toggle Timer'."],
-    old_string: Annotated[str, "Exact text to find in the module's current code. Must match "
-                          "exactly once — include enough surrounding lines to be unique. "
-                          "Whitespace must match exactly."],
-    new_string: Annotated[str, "The replacement text."],
+    old_string: Annotated[Optional[str], _SPLICE_OLD] = None,
+    new_string: Annotated[Optional[str], "The replacement text."] = None,
+    edits: Annotated[Optional[list[SpliceEdit]], _EDITS_TEXT] = None,
+    expected_sha256: Annotated[Optional[str], "read_hotkey_module's body_sha256. " + _SHA_TEXT] = None,
 ) -> dict:
     """Splice-edit a hotkey module in place — same semantics as a file Edit
     tool. This is the cheap way to fix one function: a create_hotkey_module
     replace resends the whole body, an edit sends only the changed lines.
-    Read the current code with read_hotkey_module first, then splice. For an
-    isolated module (the default) the change is live immediately — the body
-    runs fresh on each press, no reload. The edited file is load-checked and
-    the edit rolled back if it wouldn't parse, so a typo'd splice never
-    bricks anything. Undo = call again with the two strings swapped."""
-    return _guard(vk.edit_hotkey_module, name, old_string, new_string)
+    Read the current code with read_hotkey_module first, then splice — one
+    change (old_string/new_string) or several that only load together
+    (edits=[...], one load check). For an isolated module (the default) the
+    change is live immediately — the body runs fresh on each press, no
+    reload. The edited text is load-checked as a copy and only then moved
+    into place, so a press never runs a half-edited or broken file and a
+    typo'd splice never bricks anything. Returns the new body_sha256 (pass it
+    as expected_sha256 next time to catch someone else's edit in between).
+    Undo = call again with the two strings swapped (a batch: edits=undo_edits,
+    from the reply)."""
+    return _guard(vk.edit_hotkey_module, name, old_string, new_string,
+                  edits=_edits_arg(edits), expected_sha256=expected_sha256)
 
 
 @mcp.tool
@@ -807,9 +854,10 @@ def update_hotkey_module(
                     "#Include and BodySingleInstance lines, the body needs them. "
                     "An in-process module's code must still define its registered "
                     "^!+<key>:: combo."],
+    expected_sha256: Annotated[Optional[str], "read_hotkey_module's body_sha256. " + _SHA_TEXT] = None,
 ) -> dict:
     """Replace a hotkey module's code in full — read_hotkey_module's write
-    half, for rewrites too broad for edit_hotkey_module's single splice.
+    half, for rewrites too broad for edit_hotkey_module's splices.
     Unlike create_hotkey_module (which wraps what you pass in a fresh
     generated header), nothing is re-wrapped: `code` IS the new file, so
     read → change → update round-trips exactly (saved as UTF-8 with LF line
@@ -819,11 +867,12 @@ def update_hotkey_module(
     still define that combo — a '^!+<key>::' hotkey line (any modifier order)
     or a Hotkey("^!+<key>", ...) call, outside a comment — or the write is
     refused (the Voice Access pairing is hand-made and would silently die).
-    The new code is load-checked and rolled back byte-exact on failure; the
-    overwritten file is banked for undo. An isolated body is live on the next
+    The new code is load-checked as a copy before it replaces the file, so a
+    failure leaves the file untouched; the overwritten file is banked for
+    undo. Returns the new body_sha256. An isolated body is live on the next
     press with no reload; an in-process module reloads the resident master
     (and is rolled back if VoiceKit won't load with it)."""
-    return _guard(vk.update_hotkey_module, name, code)
+    return _guard(vk.update_hotkey_module, name, code, expected_sha256=expected_sha256)
 
 
 @mcp.tool
@@ -984,6 +1033,20 @@ def dump_uia_tree(
                            "contains it are listed. The walk still covers everything, so a match "
                            "keeps its real indent depth."] = None,
     max_lines: Annotated[int, "Cap on output lines (default 300, max 2000)."] = 300,
+    root_id: Annotated[Optional[str], "Start the dump at the element with this automation id "
+                       "instead of the whole window (max_depth then counts from it). The "
+                       "result's 'root' names the element used; one that isn't there is an "
+                       "error."] = None,
+    root_name: Annotated[Optional[str], "Start the dump at the first element whose name is "
+                         "exactly this (when there's no automation id to use; with root_id "
+                         "too, the element that has both)."] = None,
+    positions: Annotated[bool, "True: each line ends ' @x,y wxh' (screen pixels) or ' @none' "
+                         "(no rectangle — offscreen or virtualized)."] = False,
+    visible_only: Annotated[bool, "True: list only elements a click could reach — with a "
+                            "rectangle, not IsOffscreen, not clipped away by a scrolling "
+                            "panel or their window, and on a monitor. A line filter like "
+                            "name_filter — the walk, counts and fingerprint are "
+                            "unchanged."] = False,
 ) -> dict:
     """A window's UI Automation tree as an indented text outline — control
     types, accessible names, automation ids. Read-only and side-effect-free.
@@ -1004,12 +1067,16 @@ def dump_uia_tree(
     that completed: a time_hit walk has none (not reproducible), and with
     budget_hit it covers only the nodes visited. The walk doesn't stop at
     max_lines, so an unfiltered dump of a big page can take seconds (up to
-    the 15 s cap); lower max_depth for a quick look.
+    the 15 s cap); lower max_depth for a quick look. To look at ONE part of
+    a page (a panel, a list, a message) start at it with root_id /
+    root_name, and add positions=True to see where each element sits and
+    visible_only=True to leave out what is scrolled away.
     Long-run helpers for module bodies live in lib/UIA.ahk — UiaFocused,
     UiaFind, UiaFindEdit, UiaDumpTree (its &stats carries the same numbers),
     UiaTreeFingerprint and friends; every find takes an optional &why that
     says why it came back empty."""
-    return _guard(vk.dump_uia_tree, window, max_depth, name_filter, max_lines)
+    return _guard(vk.dump_uia_tree, window, max_depth, name_filter, max_lines,
+                  root_id, root_name, bool(positions), bool(visible_only))
 
 
 # ---------------------------------------------------------------------------
@@ -1238,6 +1305,20 @@ def run_ahk_snippet(
                          "run_process instead — no cmd /c inside an AHK string; for longer "
                          "work, run_process(background=True) + read_job."] = 15,
     unmask: Annotated[bool | str | list[str], _UNMASK_TEXT] = False,
+    include_module: Annotated[Optional[str], "A hotkey module's name: its FUNCTIONS and "
+                              "CLASSES are included too (the isolated body, or the module "
+                              "file of an isolate=False module), so you can call them without "
+                              "its startup code running. Everything else in it — top-level "
+                              "statements, hotkeys, labels, directives — becomes a blank line "
+                              "(line numbers stay the real file's; an error in it names the "
+                              "real file and line). Globals its top-level code would set are "
+                              "unset: 'included_module' lists them (unset_globals) — assign "
+                              "them in your code first. Class static initializers still run "
+                              "at load (static_initializers). A_ScriptDir / A_ScriptFullPath / "
+                              "A_ScriptName / A_LineFile in its code are the REAL body's, so a "
+                              "path built from them points where the body's does (a write "
+                              "lands there too); A_WorkingDir is a temp folder. There is no "
+                              "whole-file mode: that would run the automation."] = None,
 ) -> dict:
     """Run a one-off AutoHotkey v2 snippet in a throwaway process — diagnostics
     without the registry. No bridge key, no module file, no Voice Access
@@ -1246,7 +1327,10 @@ def run_ahk_snippet(
     element's name', 'does this UiaFind match anything?'. For the two commonest
     probes, inspect_focus and dump_uia_tree need no code at all. NOTE: the code
     really runs on the user's desktop — it can type and click like any module,
-    so keep snippets read-only unless the user asked for action.
+    so keep snippets read-only unless the user asked for action. It runs for
+    at most timeout_s seconds, and that is capped at this server's per-call
+    limit (the number is stated under timeout_s; a larger value is clamped
+    and the reply says so).
 
     Errors never vanish: an uncaught runtime error exits 3 with the message
     and failing snippet line in 'output' (in sequence with your Out() lines)
@@ -1274,8 +1358,12 @@ def run_ahk_snippet(
     like every response; unmask=[tokens] shows just those names in clear
     (audited). Masking stops
     incidental leakage only — text a snippet deliberately Out()s (a document's
-    contents) is sent as is."""
-    return _guard(vk.run_ahk_snippet, code, timeout_s, _unmask=unmask)
+    contents) is sent as is.
+
+    Testing a module's pieces: include_module='Karbon File' plus code that
+    calls one of its functions (read-only ones first) — no copy-and-cut of
+    the body file needed."""
+    return _guard(vk.run_ahk_snippet, code, timeout_s, include_module, _unmask=unmask)
 
 
 @mcp.tool
@@ -1375,6 +1463,39 @@ def stop_job(
     (checked against the process's start time, so a reused pid is never
     hit)."""
     return _guard(vk.stop_job, job_id, grace_s)
+
+
+@mcp.tool
+def ensure_python_env(
+    env: Annotated[str, "A short name for the environment, e.g. 'pdf' — letters, digits, "
+                   "'_', '-', '.'. It is the folder tools\\python\\<env>\\ in the VoiceKit "
+                   "folder, and what a body passes to VkPythonExe(env)."],
+    packages: Annotated[Optional[list[str]], "Requirement specs to have installed: a package "
+                        "name with optional [extras] and version specifiers — 'pypdf', "
+                        "'pypdf>=5', 'requests[socks]==2.32.3'. URLs, file paths, VCS links, "
+                        "markers and pip options are refused. Omit to just make the "
+                        "environment."] = None,
+    upgrade: Annotated[bool, "True: pip install --upgrade even what is already satisfied "
+                       "(needs the network; never read-only)."] = False,
+    wait_s: Annotated[Optional[int], "How long to wait for an install before handing it back "
+                      "as a background job (default and 0: as long as the cap allows). " +
+                      _CAP_TEXT] = None,
+) -> dict:
+    """Give a hotkey module Python packages without touching VoiceKit's own
+    Python: makes (or reuses) a virtual environment at
+    <VoiceKit>\\tools\\python\\<env>\\ from the base interpreter this server
+    runs on, and pip-installs the given specs into it. Returns python (the
+    environment's python.exe), installed (name==version of each requested
+    package), ok / state ('ready', 'installing', 'incomplete', 'failed') and
+    how_to_use — AutoHotkey for a body: py := VkPythonExe('<env>')
+    (lib\\_Common.ahk; "" when the environment is missing) then RunWait the
+    script with it. Read-only when everything is already satisfied (one
+    check, no pip). An install runs as a background job: if it outlasts the
+    wait the reply carries job_id — read_job shows pip's progress, stop_job
+    cancels it, and calling again afterwards only checks. Installing runs
+    code from the package index with the user's privileges — install only
+    what the user's task needs."""
+    return _guard(vk.ensure_python_env, env, packages, bool(upgrade), wait_s)
 
 
 @mcp.tool
@@ -1494,7 +1615,10 @@ def read_module_status(
     misleads: a fresh-looking line from a body that died hours ago reads as
     progress, and a running body with no line reads as nothing happening. Poll
     this instead of scheduling something to notice a long run finishing.
-    Read-only."""
+    A body that is alive but sitting on a dialog — AutoHotkey's error dialog
+    above all, the usual cause of 'the hotkey hung': every press of its key is
+    ignored meanwhile — carries 'dialog' {title, text, kind, failing_line} and
+    a note saying so; stop_module ends it. Read-only."""
     return _guard(vk.read_module_status, name)
 
 
@@ -1504,7 +1628,9 @@ def list_running() -> dict:
     time, how long, and the latest BodyStatus line each has published. The
     lifecycle view: press_hotkey starts a body, this shows it running,
     stop_module ends it. A long harvest that died shows up by being ABSENT
-    here while its status line in list_automations goes stale. Read-only."""
+    here while its status line in list_automations goes stale. A body alive
+    but sitting on a dialog (an error dialog above all — its key is ignored
+    meanwhile) carries 'dialog' and the top note names it. Read-only."""
     return _guard(vk.list_running)
 
 
