@@ -949,6 +949,7 @@ StepDialog(existing := "") {
     btnOK.OnEvent("Click", OK)
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
+    d.OnEvent("Escape", (*) => d.Destroy())
 
     ; The module dropdown: every isolated module, plus the one an edited step
     ; already names (even if it has gone since — it is kept, not swapped).
@@ -1039,6 +1040,7 @@ SaveNameDialog(defaultName := "") {
     btnOK.OnEvent("Click", OK)
     btnCancel.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())
+    d.OnEvent("Escape", (*) => d.Destroy())
 
     ThemeShowModal(d, g)
     return result
@@ -1935,7 +1937,7 @@ SaveWorkflow(closeAfter := false) {
     }
     macroFile := root "\macros\" base ".ahk"
     if (FileExist(macroFile) && !IsWorkflowStub(macroFile)) {
-        MsgBox("A hand-written macro named '" base "' already exists. Pick another name.", "Workflow Studio", "Owner" g.Hwnd)
+        MsgBox("Another automation named '" base "' already exists. Pick another name.", "Workflow Studio", "Owner" g.Hwnd)
         return
     }
 
@@ -1964,9 +1966,9 @@ SaveWorkflow(closeAfter := false) {
     ClearAutosave()          ; the take is safely persisted now
     RefreshWorkflowList(disp)
     if !resave                       ; first save: teach the phrases it just gained
-        MsgBox("Saved.`n`nRun it once:   open " disp
-            . "`nRepeat it:     open loop " disp "   (then click Stop Looping to end)"
-            . "`n`n(First time only: give Windows a few seconds to index the new Start Menu entries.)", "Workflow Studio", "Owner" g.Hwnd)
+        MsgBox("Saved.`n`nTo run it, say:   open " disp
+            . "`nTo repeat it over and over, say:   open loop " disp "   (click Stop Looping to end)"
+            . "`n`n(First time only: give Windows a few seconds to learn the new phrases.)", "Workflow Studio", "Owner" g.Hwnd)
     else if !closeAfter
         SB("Saved '" disp "' — " steps.Length " steps. Say `"open " disp "`" to run it.")
     if !closeAfter
@@ -1984,7 +1986,7 @@ DeleteWorkflow(*) {
         SB("Pick a saved workflow in the dropdown first.")
         return
     }
-    if (MsgBox("Delete workflow '" sel "'?`n`nRemoves its steps file, its macro, and its Start Menu entries (including the loop one).",
+    if (MsgBox("Delete workflow '" sel "'?`n`nThis removes the workflow and its voice phrases (open " sel " and open loop " sel "). It can't be undone.",
         "Workflow Studio", "YesNo Icon! Owner" g.Hwnd) != "Yes")
         return
     base := ddlMap[sel]

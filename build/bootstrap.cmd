@@ -13,7 +13,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Expand-Archive -Li
 if errorlevel 1 goto :xfail
 if not exist "%TMPX%\Install-VoiceKit.cmd" goto :xfail
 call "%TMPX%\Install-VoiceKit.cmd"
-exit /b %ERRORLEVEL%
+set "RC=%ERRORLEVEL%"
+rem VoiceKit now runs from its installed folder, so the unpacked copy is spare.
+rmdir /s /q "%TMPX%" 2>nul
+exit /b %RC%
 
 :xfail
 echo   Install FAILED while extracting the payload.

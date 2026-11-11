@@ -251,18 +251,29 @@ connection is down) is not masked either.
 
 ## Setup
 
-Requires **Python 3.10+** and VoiceKit's **AutoHotkey v2** (the server shells out
-to `AutoHotkey64.exe` to validate/reload). From this `mcp\` folder:
+**Double-click `Setup-MCP.bat`** in this `mcp\` folder (in an installed copy:
+`%LOCALAPPDATA%\Programs\VoiceKit\mcp`). That is the whole setup:
 
-```
-Setup-MCP.bat
-```
+1. It finds Python 3.10+ (and offers to install it through winget if there is
+   none).
+2. It creates `.venv` and installs `fastmcp` and `openpyxl`.
+3. It **connects VoiceKit to Claude Desktop and Claude Code** if they are on
+   the PC (`connect_claude.py`): Claude Desktop's config is backed up beside
+   itself and gets one `voicekit` entry, every other setting kept; Claude Code
+   is added with `claude mcp add --scope user`. A client that is already
+   connected is left alone, so running it again is safe (and is how you add
+   `openpyxl` to an old `.venv`).
 
-That creates `.venv`, installs `fastmcp` and `openpyxl` (for Excel batch
-sources), and prints your exact paths. (Manual equivalent: `python -m venv .venv
-&& .venv\Scripts\activate && pip install -r requirements.txt`.) A `.venv` made
-before Excel sources existed needs `openpyxl` added once:
-`.venv\Scripts\python.exe -m pip install openpyxl`.
+Then restart Claude Desktop (quit it from the tray, not just the window) or
+start a new Claude Code session.
+
+The server uses the `AutoHotkey64.exe` bundled beside `VoiceKit.ahk` when the
+installer put one there, else AutoHotkey v2 under Program Files; `VOICEKIT_AHK`
+overrides both.
+
+The rest of this section is the by-hand equivalent, for another MCP client or
+when the automatic step couldn't write a config. (Manual environment: `python
+-m venv .venv && .venv\Scripts\activate && pip install -r requirements.txt`.)
 
 ### Register with Claude Code
 
@@ -288,10 +299,9 @@ note the **doubled backslashes** (JSON):
 
 Restart Claude Desktop; the tools appear under the 🔨 menu.
 
-If VoiceKit lives somewhere other than `C:\Automations\VoiceKit`, set the env var
-`VOICEKIT_ROOT` (and `VOICEKIT_AHK` if AutoHotkey isn't at the default path) in the
-MCP config, or just adjust the paths above — the server self-locates from its own
-folder by default.
+If VoiceKit lives somewhere other than `C:\Automations\VoiceKit`, adjust the
+paths above — the server finds the rest from its own folder (`VOICEKIT_ROOT`
+and `VOICEKIT_AHK` exist as overrides for unusual setups).
 
 ## Try it
 

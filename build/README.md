@@ -30,9 +30,17 @@ double-click `Install-VoiceKit.cmd`.
 **EXE:** send `VoiceKit-Setup.exe` → they double-click it. Because it's
 unsigned, Windows SmartScreen shows a one-time *More info → Run anyway*.
 
+**One line (no SmartScreen prompt):** they press Win+R and paste the command
+at the top of `install.ps1`. It downloads the newest release's
+`VoiceKit-Setup.zip` and runs the same `Install-VoiceKit.cmd`. The script is
+fetched from the `master` branch (`build/install.ps1`), so it works once this
+folder is merged there and a release carries the zip.
+
 Either way it installs to `%LOCALAPPDATA%\Programs\VoiceKit`, runs from the
-bundled interpreter, and starts VoiceKit (a welcome screen walks them through
-Voice Access and auto-start). Then they say *open voice kit*.
+bundled interpreter, lists VoiceKit under Settings → Apps → Installed apps
+(uninstall = the shipped `Uninstall.bat`), and starts VoiceKit (a welcome
+screen walks them through Voice Access and auto-start, then opens the home
+window). Then they say *open voice kit* — or double-click the tray icon.
 
 ## Files
 
@@ -42,6 +50,7 @@ Voice Access and auto-start). Then they say *open voice kit*.
 | `Build-Installer.cmd` / `Build-Exe.cmd` | double-click wrappers |
 | `Install-VoiceKit.cmd` | the installer that ships **inside** the zip |
 | `bootstrap.cmd` | the `.exe`'s post-extract step; delegates to `Install-VoiceKit.cmd` |
+| `install.ps1` | the one-line web installer (`irm … \| iex`); downloads the latest release zip and delegates to `Install-VoiceKit.cmd` |
 
 The build packages **git-tracked files plus your uncommitted edits to them**, then
 drops dev-only files (`build\`, `CLAUDE.md`, `docs\`, `tests\`, `.gitignore`,

@@ -131,8 +131,9 @@ foreach ($must in 'VoiceKit.ahk', 'VoiceKitLauncher.ahk', 'AutoHotkey64.exe',
                   'macros\WorkflowStudio.ahk', 'macros\RecordMySteps.ahk', 'macros\SplitPages.ahk',
                   'hotkeys\_index.default.ahk', 'bridge-map.default.txt', 'hotkeys\Snippets.default.ahk',
                   'hotkeys\RecordMySteps.hotkey.ahk',
-                  'templates\ai-template.ahk', 'Install-VoiceKit.cmd', 'VERSION',
-                  'mcp\server.py', 'mcp\voicekit_writer.py', 'mcp\privacy.py') {
+                  'templates\ai-template.ahk', 'Install-VoiceKit.cmd', 'Uninstall.bat', 'VERSION',
+                  'mcp\server.py', 'mcp\voicekit_writer.py', 'mcp\privacy.py',
+                  'mcp\Setup-MCP.bat', 'mcp\connect_claude.py', 'mcp\requirements.txt') {
     if (-not (Test-Path -LiteralPath (Join-Path $stage $must))) {
         Remove-Item -LiteralPath $stage -Recurse -Force
         throw "Staged package is missing '$must'. Aborting so a broken installer isn't shipped."

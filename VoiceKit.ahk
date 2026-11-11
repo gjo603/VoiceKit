@@ -20,7 +20,8 @@
 ; a direct launch with it missing still starts (no modules) and seeds below.
 #Include "*i %A_ScriptDir%\hotkeys\_index.ahk"
 
-A_IconTip := "VoiceKit — say `"open voice kit`""
+A_IconTip := "VoiceKit — say `"open voice kit`", or double-click"
+BuildTrayMenu()
 
 ; A module that throws must not leave a modal dialog sitting in front of
 ; the user, and must not look like VoiceKit has hung. Installed before
@@ -56,6 +57,43 @@ ReportQuarantine()
 ^!+n:: RunAhk(A_ScriptDir "\macros\NewAutomation.ahk")
 ^!+r:: ReloadMasterNotify(A_ScriptDir)   ; load-checks first; parks a module that won't load
 ^!+e:: Run('explorer.exe "' A_ScriptDir '"')
+
+; ------------------------------------------------------------
+; The tray icon is the way in when voice isn't available (mic
+; muted, Voice Access off, a PC that can't run it): double-click
+; opens the home window. AutoHotkey's stock menu is replaced —
+; its "Reload Script" skipped the load check every reload must
+; go through, and "Edit Script" / "Open" mean nothing to a user.
+; Window Spy stays: the README sends people to it.
+; ------------------------------------------------------------
+BuildTrayMenu() {
+    m := A_TrayMenu
+    m.Delete()
+    m.Add("Open VoiceKit", (*) => RunAhk(A_ScriptDir "\macros\VoiceKitHome.ahk"))
+    m.Add("New Automation", (*) => RunAhk(A_ScriptDir "\macros\NewAutomation.ahk"))
+    m.Add()
+    m.Add("Open VoiceKit Folder", (*) => Run('explorer.exe "' A_ScriptDir '"'))
+    m.Add("Window Spy", TrayWindowSpy)
+    m.Add()
+    m.Add("Reload VoiceKit", (*) => ReloadMasterNotify(A_ScriptDir))
+    m.Add("Exit VoiceKit", (*) => ExitApp())
+    m.Default := "Open VoiceKit"
+}
+
+; AutoHotkey's Window Spy ships beside a full install (UX\WindowSpy.ahk);
+; the bundled single-exe copy has none, so say so instead of failing mute.
+TrayWindowSpy(*) {
+    SplitPath(A_AhkPath, , &ahkDir)
+    for spy in [ahkDir "\UX\WindowSpy.ahk", ahkDir "\..\UX\WindowSpy.ahk", ahkDir "\WindowSpy.ahk"] {
+        if FileExist(spy) {
+            RunAhk(spy)
+            return
+        }
+    }
+    MsgBox("Window Spy comes with the full AutoHotkey install, which this PC doesn't have."
+        . "`n`nYou rarely need it: Workflow Studio's `"Grab a Window`" button fills in a window's identity for you.",
+        "VoiceKit", "Iconi 262144")
+}
 
 ; ------------------------------------------------------------
 ; An uncaught error in a hotkey thread normally opens a modal
@@ -187,7 +225,7 @@ ShowWelcome() {
     w.SetFont("s10 bold")
     w.AddText("xm y+18", "1.  Voice Access")
     w.SetFont("s10 norm")
-    vaStatus := w.AddText("xm+16 y+6 w430", "Checking…")
+    vaStatus := w.AddText("xm+16 y+6 w430 r2", "Checking…")
     btnVA := w.AddButton("xm+16 y+8 w210 h32", "Turn On Voice Access")
 
     w.SetFont("s10 bold")
@@ -202,13 +240,23 @@ ShowWelcome() {
     w.SetFont("s13 bold")
     phraseCtrl := w.AddText("xm+16 y+2", "“open voice kit”")
     w.SetFont("s9 norm")
-    tail := w.AddText("xm+16 y+6 w430", "Give Windows a few seconds to index the new Start Menu entries first.")
+    tail := w.AddText("xm+16 y+6 w430 r3", "Give Windows a few seconds to learn the new phrase first. "
+        . "No voice right now? Double-click the VoiceKit icon near the clock instead. "
+        . "Finish opens the VoiceKit window so you can look around.")
 
     w.SetFont("s10")
     btnDone := w.AddButton("xm y+22 w160 h36 Default", "Finish")
 
     UpdateVA(*) {
         running := ProcessExist("voiceaccess.exe")
+        ; Voice Access arrived with Windows 11 22H2 (build 22621). On an older
+        ; Windows the button could never work, so say what does instead.
+        if (!running && VerCompare(A_OSVersion, "10.0.22621") < 0) {
+            vaStatus.Text := "○  This version of Windows doesn't have Voice Access (it needs Windows 11). "
+                . "Keyboard hotkeys, snippets and the tray icon still work."
+            btnVA.Enabled := false
+            return
+        }
         vaStatus.Text := running
             ? "●  Voice Access is running — you can talk to Windows."
             : "○  Voice Access is off. Turn it on, then talk to Windows."
@@ -230,6 +278,9 @@ ShowWelcome() {
             MakeAhkShortcut(A_Startup "\VoiceKit.lnk", A_ScriptDir "\VoiceKitLauncher.ahk")
         SetTimer(UpdateVA, 0)
         w.Destroy()
+        ; Land somewhere: without this the first run ended on an empty
+        ; desktop, with nothing to do if the spoken phrase didn't work yet.
+        try RunAhk(A_ScriptDir "\macros\VoiceKitHome.ahk")
     }
     btnVA.OnEvent("Click", TurnOnVA)
     btnDone.OnEvent("Click", Finish)

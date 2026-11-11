@@ -36,11 +36,18 @@ import privacy
 # Locations (self-locating; overridable by env for tests / odd installs)
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(os.environ.get("VOICEKIT_ROOT", Path(__file__).resolve().parent.parent))
-AHK_EXE = os.environ.get(
-    "VOICEKIT_AHK",
-    os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
-                 "AutoHotkey", "v2", "AutoHotkey64.exe"),
-)
+def _default_ahk_exe() -> str:
+    """The interpreter VoiceKit itself runs on: the one the installer bundles
+    beside VoiceKit.ahk when it is there (an installed copy has no AutoHotkey
+    under Program Files at all), else the system-wide v2 install."""
+    bundled = REPO_ROOT / "AutoHotkey64.exe"
+    if bundled.is_file():
+        return str(bundled)
+    return os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                        "AutoHotkey", "v2", "AutoHotkey64.exe")
+
+
+AHK_EXE = os.environ.get("VOICEKIT_AHK") or _default_ahk_exe()
 # (Path accessors that derive from REPO_ROOT live with the health helpers
 # below and are functions, not constants, so tests can retarget REPO_ROOT.)
 VOICE_MACROS = Path(os.environ.get(

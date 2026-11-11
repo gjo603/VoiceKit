@@ -1,42 +1,67 @@
 @echo off
-setlocal
+setlocal enableextensions
 cd /d "%~dp0"
 
 echo.
-echo  VoiceKit MCP server setup
-echo  =========================
+echo  Connect VoiceKit to Claude
+echo  ==========================
+echo.
+echo  This lets Claude (Desktop or Claude Code) build and run VoiceKit
+echo  automations for you. It needs Python 3.10 or newer.
 echo.
 
-python --version >nul 2>nul
-if errorlevel 1 (
-    echo  Python is not on PATH. Install Python 3.10+ from https://python.org
-    echo  (tick "Add python.exe to PATH"), then run this again.
-    pause
-    exit /b 1
-)
+rem Find a real Python 3.10+: "python" first, then the "py" launcher. (The
+rem Microsoft Store stub answers to "python" but fails the version test.)
+set "PY="
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul
+if not errorlevel 1 set "PY=python"
+if defined PY goto :havepy
+py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul
+if not errorlevel 1 set "PY=py -3"
+if defined PY goto :havepy
 
-echo  Creating a virtual environment in .venv ...
-python -m venv .venv
-call ".venv\Scripts\activate.bat"
-echo  Installing FastMCP and openpyxl ...
-python -m pip install --quiet --upgrade pip
-python -m pip install --quiet -r requirements.txt
-if errorlevel 1 ( echo  pip install failed. & pause & exit /b 1 )
+echo  Python 3.10+ was not found on this PC.
+where winget >nul 2>nul
+if errorlevel 1 goto :nopy
+choice /C YN /M "  Install Python now (through winget)"
+if errorlevel 2 goto :nopy
+winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
+echo.
+echo  Python is installed. Close this window and run Setup-MCP.bat again
+echo  (a new window is needed for Windows to see it).
+pause
+exit /b 1
 
-echo  Verifying ...
-python -c "import fastmcp, openpyxl, voicekit_writer; print('  fastmcp', fastmcp.__version__, '/ openpyxl', openpyxl.__version__, 'OK')"
+:nopy
+echo  Install it from https://www.python.org/downloads/ (tick "Add python.exe
+echo  to PATH" in its installer), then run this again.
+pause
+exit /b 1
+
+:havepy
+if exist ".venv\Scripts\python.exe" goto :install
+echo  Setting up (one time)...
+%PY% -m venv .venv
+if not exist ".venv\Scripts\python.exe" ( echo  Could not create the Python environment. & pause & exit /b 1 )
+
+:install
+echo  Installing what the server needs...
+".venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check -r requirements.txt
+if errorlevel 1 ( echo  The install failed - check your internet connection and run this again. & pause & exit /b 1 )
+".venv\Scripts\python.exe" -c "import fastmcp, openpyxl, voicekit_writer"
+if errorlevel 1 ( echo  The server did not pass its self-check. & pause & exit /b 1 )
 
 echo.
-echo  Done. Register the server with your client(s):
+echo  Connecting to Claude...
 echo.
-echo  --- Claude Code (run this in a terminal) ---
-echo     claude mcp add voicekit -- "%~dp0.venv\Scripts\python.exe" "%~dp0server.py"
+".venv\Scripts\python.exe" connect_claude.py
+
 echo.
-echo  --- Claude Desktop ---
-echo     Edit  %%APPDATA%%\Claude\claude_desktop_config.json  and add the
-echo     "voicekit" block shown in mcp\README.md (use the paths printed above).
+echo  Done. Then just ask Claude, for example:
+echo    "Make a VoiceKit workflow that opens Notepad and types my address."
 echo.
-echo     command : %~dp0.venv\Scripts\python.exe
-echo     args    : %~dp0server.py
+echo  Using another MCP client? Point it at:
+echo    command : %~dp0.venv\Scripts\python.exe
+echo    args    : %~dp0server.py
 echo.
 pause

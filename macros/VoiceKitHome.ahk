@@ -71,12 +71,25 @@ if parked.Length
         . (parked.Length = 1 ? "it wouldn't" : "they wouldn't") " load: " JoinList(parked, ", ")
         . (FileExist(SafeModeFlag(root)) ? "  (safe mode after repeated crashes)" : "")
         . "  — fix the file, then uncomment its line in hotkeys\_index.ahk and reload with Ctrl+Alt+Shift+R.")
+else if !HasOwnAutomations()
+    SB("Nothing of your own yet — click New Automation (or say “click new automation”) to make your first one. The rows below come with VoiceKit.")
 else
     SB(items.Length " automations. Say any phrase in the list — or select a row for Run, Edit, Delete, or Hotkey (a Ctrl+Alt+Shift key for when you can't use your voice).")
 
 ; ============================================================
 ;  Data
 ; ============================================================
+; True once the list holds something the user made by voice-phrase
+; (a workflow, an "open something" macro or an AI action) — what a
+; brand-new install doesn't have yet.
+HasOwnAutomations() {
+    global items
+    for it in items
+        if (it.kind = "workflow" || it.kind = "macro" || it.kind = "ai")
+            return true
+    return false
+}
+
 ReloadItems() {
     global items
     items := CollectItems()
@@ -235,7 +248,8 @@ RefreshLV() {
     lv.ModifyCol(3, 125)
     lv.ModifyCol(4, 285)     ; 730 total — inside the client area even with a scrollbar
     if (q != "")
-        SB(rowItems.Length " match" (rowItems.Length = 1 ? "" : "es") ".")
+        SB(rowItems.Length ? rowItems.Length " match" (rowItems.Length = 1 ? "" : "es") "."
+            : "Nothing matches — clear the search box, or click New Automation to make it.")
 }
 
 Selected() {
@@ -433,7 +447,7 @@ HotkeySelected(*) {
     switch it.kind {
         case "hotkey":
             SB(it.key != "" ? "That's already a key — press Ctrl+Alt+Shift+" it.key " any time."
-                : "That's already a hotkey module.")
+                : "That one is already a hotkey.")
         case "snippet":
             SB("Snippets are typed, not keyed — typing  " it.baseName "  anywhere expands it.")
         default:
@@ -449,7 +463,7 @@ HotkeyDialog(it) {
     for k in BridgeFreeKeys(root "\bridge-map.txt")
         keys.Push(k)
     if (keys.Length = 0) {
-        MsgBox("No free Ctrl+Alt+Shift keys are left — remove one first (bridge-map.txt lists them all).",
+        MsgBox("All the Ctrl+Alt+Shift keys are in use. Select an automation that has one, click Hotkey, and remove it first.",
             "VoiceKit", "Icon! Owner" g.Hwnd)
         return
     }
@@ -528,7 +542,7 @@ DeleteSelected(*) {
         SB("This snippet is a code block — click Edit and remove its whole block by hand.")
         return
     }
-    if (MsgBox("Delete “" it.say "”?`n`nThis removes its files and Start Menu entries.",
+    if (MsgBox("Delete “" it.say "”?`n`nThis removes it and its voice phrase. It can't be undone.",
         "VoiceKit", "YesNo Icon! Owner" g.Hwnd) != "Yes")
         return
     ; The recipes live in lib\_Common.ahk, shared with the Studio and kept in

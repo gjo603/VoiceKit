@@ -55,6 +55,24 @@ rem first launch and every voice-launched macro would then trip a Windows
 rem security-warning prompt. Unblock-File clears it before anything runs.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath $env:VK_T -Recurse -File | Unblock-File" >nul 2>&1
 
+rem List VoiceKit under Settings > Apps > Installed apps, so it can be removed
+rem the way every other program is (per-user key: no admin). Skipped for a
+rem VK_TARGET install, which is a test copy and must not claim the entry.
+if defined VK_TARGET goto :registered
+set "VK_VER="
+if exist "%TARGET%\VERSION" set /p VK_VER=<"%TARGET%\VERSION"
+if not defined VK_VER set "VK_VER=0.0.0"
+set "UKEY=HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\VoiceKit"
+reg add "%UKEY%" /v DisplayName /d "VoiceKit" /f >nul 2>&1
+reg add "%UKEY%" /v DisplayVersion /d "%VK_VER%" /f >nul 2>&1
+reg add "%UKEY%" /v Publisher /d "VoiceKit" /f >nul 2>&1
+reg add "%UKEY%" /v InstallLocation /d "%TARGET%" /f >nul 2>&1
+reg add "%UKEY%" /v DisplayIcon /d "%TARGET%\AutoHotkey64.exe" /f >nul 2>&1
+reg add "%UKEY%" /v UninstallString /d "\"%TARGET%\Uninstall.bat\"" /f >nul 2>&1
+reg add "%UKEY%" /v NoModify /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "%UKEY%" /v NoRepair /t REG_DWORD /d 1 /f >nul 2>&1
+:registered
+
 if defined VK_NOLAUNCH goto :nolaunch
 
 rem Start through the launcher, never VoiceKit.ahk directly: it load-checks
@@ -63,8 +81,8 @@ rem leave the machine with no hotkeys and no snippets at all.
 echo   Starting VoiceKit...
 start "" "%TARGET%\AutoHotkey64.exe" "%TARGET%\VoiceKitLauncher.ahk"
 echo.
-echo   Done. Turn on Voice Access, then say:  open voice kit
-echo   (Give Windows a few seconds to index the new Start Menu entries.)
+echo   Done. A welcome window is opening - it walks you through the rest.
+echo   No voice yet? Double-click the green "H" icon near the clock.
 echo.
 exit /b 0
 

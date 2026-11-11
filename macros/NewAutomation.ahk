@@ -61,8 +61,8 @@ ChooseType() {
     MakeCard("Open Something", "An app, file, folder, or website — ready instantly, no code. Say “open <name>”.", 1)
     MakeCard("Record My Steps", "Do the thing once while VoiceKit watches, then replay it any time by voice.", 2, "Default")
     MakeCard("Type Text For Me", "A short abbreviation (like /sig) that expands into full text wherever you type.", 3)
-    MakeCard("AI Text Action", "Your own AI command: select text anywhere, speak the phrase, the answer replaces it.", 4)
-    MakeCard("Draft With AI", "Describe the automation in plain words — AI drafts the steps, you review and save.", 5)
+    MakeCard("AI Text Action", "Your own AI command: select text anywhere, speak the phrase, the answer replaces it. Optional — needs an AI key.", 4)
+    MakeCard("Draft With AI", "Describe the automation in plain words — AI drafts the steps, you review and save. Optional — needs an AI key.", 5)
     MakeCard("Always-On Hotkey", "Advanced: a Ctrl+Alt+Shift key that's always live; pair a voice phrase to it once.", 6)
 
     g.SetFont("s10")
@@ -86,7 +86,8 @@ ValidNewName(raw, ownerHwnd) {
     phrase := CleanPhrase(raw)
     base := StrReplace(phrase, " ")
     if (base = "" || IsReservedName(base)) {
-        MsgBox("'" Trim(raw) "' isn't a usable name (empty after cleanup, or a reserved Windows name). Pick another.",
+        MsgBox(base = "" ? "Give it a name made of letters or numbers — that's the phrase you'll say."
+            : "Windows reserves the name '" Trim(raw) "' for itself. Pick another.",
             "New Automation", "Icon! Owner" ownerHwnd)
         return ""
     }
@@ -632,7 +633,7 @@ NewHotkeyModule(root) {
     ; the complaint that put this here.
     freeKeys := BridgeFreeKeys(root "\bridge-map.txt")
     if !freeKeys.Length {
-        MsgBox("No free Ctrl+Alt+Shift keys are left — retire one in bridge-map.txt first.",
+        MsgBox("All the Ctrl+Alt+Shift keys are in use. Say “open voice kit”, pick a hotkey you no longer need, and delete it first.",
             "New Automation", "Icon! 262144")
         return
     }
@@ -763,7 +764,7 @@ PairingDialog(phrase, key) {
     d.AddText("xm y+8 w460", "1.  Say:  “show voice shortcuts”")
     d.AddText("xm y+4 w460", "2.  Create new shortcut  →  When I say:  " phrase)
     d.AddText("xm y+4 w460", "3.  Action: Press keys  →  Ctrl + Alt + Shift + " key)
-    tail := d.AddText("xm y+12 w460", "The pairing is recorded in bridge-map.txt — your recreate list for a new machine.")
+    tail := d.AddText("xm y+12 w460", "VoiceKit keeps a list of your keys and phrases (bridge-map.txt), so you can set them up again on a new PC.")
     btn := d.AddButton("xm y+16 w130 h34 Default", "Done")
     btn.OnEvent("Click", (*) => d.Destroy())
     d.OnEvent("Close", (*) => d.Destroy())

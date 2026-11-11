@@ -8,6 +8,47 @@ names).
 
 ---
 
+### 2026-11-10 — Easier install, and a first run that doesn't dead-end
+
+A simplicity / user-experience pass with the install path as the first
+priority; built on branch `easier-install`.
+
+- **One-line install with no SmartScreen prompt** — `build\install.ps1`
+  (Win+R, paste one `irm … | iex` line): downloads the latest release's
+  `VoiceKit-Setup.zip` and runs the same `Install-VoiceKit.cmd`. Fetched from
+  `master`, so it is live once that branch has it.
+- **VoiceKit is in Windows' installed-apps list** — `Install-VoiceKit.cmd`
+  writes the per-user `Uninstall\VoiceKit` key (skipped for a `VK_TARGET` test
+  install); its Uninstall runs the shipped `Uninstall.bat`.
+- **Uninstall now sticks.** `Uninstall.bat` stopped only the process whose
+  command line held `VoiceKit.ahk`, by force — not a clean exit, so the
+  watchdog (never stopped) restarted VoiceKit about 20 s later. It now stops
+  every AutoHotkey process run out of its own folder, removes the apps-list
+  entry, and offers (second question, never in a git checkout) to delete the
+  folder too.
+- **The MCP server works on an installed copy.** `voicekit_writer.AHK_EXE`
+  looked only under Program Files, which an installed copy (bundled
+  interpreter) doesn't have; it now prefers `AutoHotkey64.exe` beside
+  `VoiceKit.ahk`. `VOICEKIT_AHK` still overrides.
+- **`mcp\Setup-MCP.bat` finishes the job** — finds Python (`python`, then
+  `py -3`; offers winget), reuses an existing `.venv`, and runs the new
+  `mcp\connect_claude.py`, which registers the server with Claude Desktop
+  (config backed up, other settings kept, invalid JSON left alone) and Claude
+  Code (`claude mcp add --scope user`). Already-connected clients are skipped.
+- **A tray menu** (`BuildTrayMenu` in `VoiceKit.ahk`): Open VoiceKit (the
+  default — double-click), New Automation, Open VoiceKit Folder, Window Spy,
+  Reload VoiceKit (through `ReloadMasterNotify`; the stock "Reload Script"
+  skipped the preflight), Exit VoiceKit.
+- **Welcome window**: says so on a Windows without Voice Access, names the
+  tray icon as the no-voice way in, and Finish opens the home window.
+- **Plainer words**: the empty-name / reserved-name message, the "no free
+  keys" messages, delete confirmations, the first-save message, the AI cards
+  ("Optional — needs an AI key"), Home's empty-search and brand-new-install
+  status lines; Escape closes the Studio's Add Step and Save dialogs.
+- **README**: four overlapping install sections became one.
+
+---
+
 ### 2026-10-14 — "Karbon File" feedback (a 1,500-line Chrome body built live over MCP)
 
 An agent spent two days building a hotkey module that files Karbon email

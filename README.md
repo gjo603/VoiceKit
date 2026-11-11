@@ -2,48 +2,35 @@
 
 A small system, not a pile of macros. Voice Access does exactly one job: turn speech into a trigger. AutoHotkey v2 does everything else. Two phrases carry the whole thing: **"open voice kit"** (the home window — everything you can say, searchable, with Run / Edit / Delete) and **"open new automation"** (pick what should happen, answer one dialog, and VoiceKit writes the automation itself — no code by default).
 
-## Install in one click
+## Install
 
-**[⬇ Download VoiceKit-Setup.exe](https://github.com/gjo603/VoiceKit/releases/latest/download/VoiceKit-Setup.exe)** — then double-click the download. That's the whole install: it unpacks itself, installs VoiceKit, and starts it. Nothing else is needed (AutoHotkey is bundled).
+Nothing needs to be installed first — AutoHotkey is bundled — and no admin rights are needed. Pick either way:
 
-- Windows shows a one-time SmartScreen prompt because the file is unsigned: click **More info → Run anyway**.
-- Prefer a zip? **[Download VoiceKit-Setup.zip](https://github.com/gjo603/VoiceKit/releases/latest/download/VoiceKit-Setup.zip)**, extract it, and double-click `Install-VoiceKit.cmd` inside.
-- **Updating later:** use the same links again — they always point at the newest release, and updating preserves your automations, snippets, hotkeys, and settings.
+**Download and double-click.** **[⬇ Download VoiceKit-Setup.exe](https://github.com/gjo603/VoiceKit/releases/latest/download/VoiceKit-Setup.exe)**, then open the download. Windows shows a one-time blue "Windows protected your PC" box because the file is unsigned: click **More info → Run anyway**.
 
-After installing, start **Voice Access** (Win+Ctrl+S) and say **"open voice kit"**.
+**Or paste one line (no warning box).** Press **Win+R**, paste this, press Enter:
 
-## Got the bundled installer? (VoiceKit-Setup.zip / .exe)
+```
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/gjo603/VoiceKit/master/build/install.ps1 | iex"
+```
 
-If someone sent you **VoiceKit-Setup.zip**, you need nothing else installed:
+Either way a **welcome window** opens: it turns on Voice Access for you, sets VoiceKit to start with Windows, and opens the home window. From then on, say **"open voice kit"** — or double-click the VoiceKit icon near the clock when you can't use your voice.
 
-1. Right-click the zip → **Extract All**.
-2. Open the extracted folder and **double-click `Install-VoiceKit.cmd`**. It installs VoiceKit and starts it.
-3. **Start Voice Access** (Win+Ctrl+S) and say **"open voice kit"** to check it worked.
+- **Needs:** Windows 11 (22H2 or newer) for Voice Access. On Windows 10 everything except the voice part works (keyboard hotkeys, snippets, the tray icon).
+- **Updating:** install again the same way. Your automations, snippets, hotkeys and settings are kept.
+- **Uninstalling:** Settings → Apps → Installed apps → VoiceKit → Uninstall (or double-click `Uninstall.bat` in the VoiceKit folder). It asks before deleting anything you made.
+- **Was sent a zip?** Extract `VoiceKit-Setup.zip` ([download](https://github.com/gjo603/VoiceKit/releases/latest/download/VoiceKit-Setup.zip)) and double-click `Install-VoiceKit.cmd` inside.
+- **Want Claude to build automations for you?** After installing, double-click `mcp\Setup-MCP.bat` in the VoiceKit folder (right-click the tray icon → Open VoiceKit Folder). See "Create automations with Claude" below.
 
-(Sent a single **VoiceKit-Setup.exe** instead? Just double-click it — Windows may show a one-time "More info → Run anyway".) The rest of this page is for setting up from the source folder.
+<details>
+<summary>Running from the source folder instead (developers)</summary>
 
-## Quick setup (from the source folder)
+1. Clone this repository to a permanent home, e.g. `C:\Automations\VoiceKit`.
+2. Double-click `Setup.bat`. It installs AutoHotkey v2 through winget if needed and starts VoiceKit. (By hand: install AutoHotkey **v2** from https://www.autohotkey.com, then double-click `VoiceKitLauncher.ahk`.)
 
-1. Clone or download this folder to a permanent home, e.g. `C:\Automations\VoiceKit`.
-2. **Double-click `Setup.bat`.** It installs AutoHotkey v2 (via winget) if needed, creates Start Menu entries, and launches VoiceKit.
-3. **Start Voice Access** (Win+Ctrl+S, or Settings → Accessibility → Speech). Requires Windows 11 22H2+ with recent updates for voice shortcuts.
-4. Test: say **"open new automation"**. If the chooser window appears, you're done.
+Your own lists — `bridge-map.txt`, `hotkeys\_index.ahk` and `hotkeys\Snippets.ahk` — are made on first start from the shipped `*.default` copies beside them and are never overwritten by an update (a newer version only *adds* any hotkey it ships), so git ignores them. Moving from another PC? Re-create the Voice Access shortcuts listed in `bridge-map.txt`. `templates\examples\` has sample automations to copy from.
 
-If you have bridge hotkeys from your old machine, re-create the Voice Access shortcuts listed in `bridge-map.txt`.
-
-Your own lists — `bridge-map.txt`, `hotkeys\_index.ahk` (the module manifest) and `hotkeys\Snippets.ahk` — are made on first start from the shipped `*.default` copies beside them, and are never overwritten by an update (a newer version only *adds* any hotkey it ships). They hold your personal wiring, so git ignores them. `templates\examples\` has a few sample automations to copy from.
-
-## Manual setup (if Setup.bat doesn't work)
-
-1. **Install AutoHotkey v2** from https://www.autohotkey.com — pick **v2** (v1 is deprecated; never install it). Accept the default install, which makes `.ahk` files run with v2.
-2. **Double-click `VoiceKitLauncher.ahk`** (it load-checks everything, then starts `VoiceKit.ahk`). First run installs voice-launchable entries into your Start Menu (`Voice Macros` group) and shows a short welcome screen: it tells you whether Voice Access is on (with a button to turn it on), keeps "start when I sign in" ticked, and teaches the first phrase.
-3. **Start Voice Access** (Win+Ctrl+S, or Settings → Accessibility → Speech). Requires Windows 11 22H2+ with recent updates for voice shortcuts.
-
-Test: say **"open new automation"**. If the chooser window appears, you're done. (Give Windows a few seconds to index new Start Menu entries the first time.)
-
-## Uninstalling
-
-**Double-click `Uninstall.bat`.** It stops the VoiceKit tray app, removes the `Voice Macros` Start Menu group and the login shortcut, and resets the first-run flag. It does **not** delete this folder or remove AutoHotkey — do those yourself if you want them gone. To reinstall afterward, run your installer again (`Install-VoiceKit.cmd` for the bundled package, or `Setup.bat` from a source folder). (Voice Access shortcuts you paired for bridge hotkeys are managed inside Voice Access; remove them there.)
+</details>
 
 ## How triggering works — two paths
 
